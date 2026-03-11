@@ -1,15 +1,13 @@
 # pdf-compress
 
-A simple, fully offline PDF compressor. No Ghostscript, no online tools, no files leaving your machine. Just Python.
-
-Built for compressing lecture notes, datasheets, and documents before uploading to GitHub, Claude, or anywhere else with a file size limit.
+A simple, fully offline PDF compressor with a desktop GUI. No Ghostscript, no online tools, no files leaving your machine.
 
 ---
 
 ## Requirements
 
 - [Python 3.8+](https://www.python.org/downloads/) — tick **"Add to PATH"** during install
-- Two Python libraries (installed once):
+- Two Python libraries:
 
 ```bash
 pip install pikepdf pillow
@@ -19,76 +17,58 @@ pip install pikepdf pillow
 
 ## Usage
 
-### Windows — Drag and Drop
+### GUI (recommended)
 
-Put `compress_pdf.py` and `compress_pdf.bat` in the same folder.  
-Drag any PDF (or multiple PDFs) onto `compress_pdf.bat`. Done.
+Double-click `compress_pdf.bat` to open the app, or drag a PDF onto it to open with that file pre-loaded.
 
-To change the default quality, open `compress_pdf.bat` in Notepad and edit the `QUALITY=3` line.
-
----
+1. Click the file area to select a PDF
+2. Adjust the quality slider (1–5)
+3. Optionally change the output path
+4. Hit **Compress PDF**
 
 ### Command Line
 
 ```bash
-# Compress a single file (outputs input_compressed.pdf)
 python compress_pdf.py document.pdf
-
-# Set quality level
 python compress_pdf.py document.pdf -q 1   # smallest
 python compress_pdf.py document.pdf -q 5   # best quality
-
-# Custom output name
-python compress_pdf.py document.pdf -o document_small.pdf
-
-# Batch compress multiple files
-python compress_pdf.py *.pdf
-python compress_pdf.py file1.pdf file2.pdf file3.pdf
+python compress_pdf.py *.pdf               # batch
 ```
 
 ---
 
 ## Quality Levels
 
-| Level | DPI | JPEG Quality | Best For |
-|-------|-----|--------------|----------|
-| `-q 1` | 72  | 30% | Absolute smallest, rough images |
-| `-q 2` | 96  | 50% | Small file, acceptable quality |
-| `-q 3` | 120 | 65% | **Default** — good for lecture notes & docs |
-| `-q 4` | 150 | 80% | Good quality, moderate compression |
-| `-q 5` | 200 | 90% | Light compression, near-original quality |
-
-> If compression doesn't reduce file size (e.g. the PDF is already optimised), the original is kept untouched.
+| Level | DPI | JPEG | Best For |
+|-------|-----|------|----------|
+| 1 | 72  | 30% | Absolute smallest |
+| 2 | 96  | 50% | Small, acceptable quality |
+| 3 | 120 | 65% | **Default** — lecture notes & docs |
+| 4 | 150 | 80% | Good quality, moderate savings |
+| 5 | 200 | 90% | Light compression |
 
 ---
 
 ## How It Works
 
-The script does two things:
+1. **Recompresses embedded images** at lower JPEG quality and downscales above the DPI threshold.
+2. **Compresses PDF streams** — removes redundant internal data.
 
-1. **Recompresses embedded images** at a lower JPEG quality and downscales them if they're above the target DPI threshold. This is usually where the bulk of the size is in lecture slides and scanned documents.
-
-2. **Compresses PDF streams** using pikepdf's built-in stream compression and object stream generation, which removes redundant internal data.
-
-Text, fonts, and vector graphics are left completely untouched — only raster images are affected.
+Text, fonts, and vectors are untouched. If compression doesn't reduce the file size, the original is kept.
 
 ---
 
-## Dependencies
+## Files
 
-| Package | Purpose |
-|---------|---------|
-| [pikepdf](https://pikepdf.readthedocs.io/) | Read, modify, and save PDF structure |
-| [Pillow](https://python-pillow.org/) | Recompress and resize embedded images |
-
-Install both at once:
-
-```bash
-pip install pikepdf pillow
-```
+| File | Purpose |
+|------|---------|
+| `pdf_compress_gui.py` | Desktop GUI application |
+| `compress_pdf.py` | Command-line version |
+| `compress_pdf.bat` | Launcher (double-click or drag PDF onto it) |
+| `requirements.txt` | `pip install -r requirements.txt` |
 
 ---
 
 ## License
 
-MIT — do whatever you want with it.
+MIT
