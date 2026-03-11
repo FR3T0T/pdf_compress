@@ -1,2 +1,2 @@
-pikepdf>=8.0.0
+-e pikepdf>=8.0.0
 Pillow>=10.0.0

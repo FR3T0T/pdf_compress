@@ -4,7 +4,20 @@ PDF Compress — Desktop GUI
 Requires: pip install pikepdf pillow
 """
 
-import io, os, sys, threading, tkinter as tk
+# ── DPI fix — MUST run before tkinter import ───────────────────────
+import sys, os
+if sys.platform == "win32":
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+import io, threading, subprocess, tempfile
+import tkinter as tk
 from tkinter import filedialog, ttk
 
 try:
@@ -16,438 +29,543 @@ except ImportError:
     mb.showerror("Missing dependencies", "Run this first:\n\npip install pikepdf pillow")
     sys.exit(1)
 
-# ── Palette ────────────────────────────────────────────────────────
-BG       = "#0c0c0d"
-CARD     = "#141416"
-BORDER   = "#222226"
-BORDER2  = "#2e2e34"
-GOLD     = "#c9a84c"
-GOLD_HV  = "#e0bc6a"
-GOLD_DIM = "#7a6230"
-TEXT     = "#f0ede8"
-SUB      = "#6b6b72"
-SUB2     = "#9a9aa4"
-GREEN    = "#4caf7d"
-RED      = "#e05c5c"
-AMBER    = "#e8a84c"
 
-F_TITLE  = ("Segoe UI", 22, "bold")
-F_LABEL  = ("Segoe UI", 9)
-F_BOLD   = ("Segoe UI", 10, "bold")
-F_MONO   = ("Consolas", 10)
-F_SM     = ("Segoe UI", 8)
-F_MED    = ("Segoe UI", 11)
-F_LARGE  = ("Segoe UI", 14, "bold")
+# ── Palette — muted, warm neutrals ────────────────────────────────
+BG       = "#111113"
+SURFACE  = "#19191c"
+BORDER   = "#27272b"
+ACCENT   = "#a08a5e"
+ACCENT2  = "#c4a96a"
+ACCENT_D = "#6b5f42"
+TEXT     = "#e8e6e1"
+TEXT2    = "#9b9a97"
+TEXT3    = "#5c5c5f"
+GREEN    = "#5ea07a"
+RED      = "#c45c5c"
+AMBER    = "#c4a24c"
+
+# ── Font family ────────────────────────────────────────────────────
+_F = "Segoe UI" if sys.platform == "win32" else "SF Pro Display" if sys.platform == "darwin" else "Cantarell"
 
 
-def fmt_size(b):
-    if b < 1024: return f"{b} B"
+# ── Utility ────────────────────────────────────────────────────────
+
+def fmt(b):
+    if b < 1024:    return f"{b} B"
     if b < 1048576: return f"{b/1024:.1f} KB"
     return f"{b/1048576:.2f} MB"
 
 
-def quality_to_settings(pct):
-    """Convert 0–100% → jpeg quality and max_dpi"""
+def q_label(pct):
+    if pct < 15: return "Minimum"
+    if pct < 35: return "Low"
+    if pct < 65: return "Medium"
+    if pct < 85: return "High"
+    return "Maximum"
+
+
+def q_settings(pct):
     jpeg = max(10, min(95, int(pct * 0.85 + 10)))
     dpi  = max(48, min(220, int(pct * 1.72 + 48)))
     return jpeg, dpi
 
 
-def estimate_size(original, pct):
-    ratio = 0.15 + (pct / 100) * 0.75
-    return int(original * ratio)
+# ── Compression engine ─────────────────────────────────────────────
 
-
-def quality_label(pct):
-    if pct < 20:  return "Minimum"
-    if pct < 40:  return "Low"
-    if pct < 60:  return "Medium"
-    if pct < 80:  return "High"
-    return "Maximum"
-
-
-def compress_images_in_pdf(pdf, jpeg_quality, max_dpi):
+def count_images(pdf):
+    n = 0
     for page in pdf.pages:
         if "/Resources" not in page: continue
-        resources = page["/Resources"]
-        if "/XObject" not in resources: continue
-        xobjects = resources["/XObject"]
-        for key in list(xobjects.keys()):
-            xobj = xobjects[key]
-            if xobj.get("/Subtype") != "/Image": continue
+        res = page["/Resources"]
+        if "/XObject" not in res: continue
+        for k in res["/XObject"]:
+            if res["/XObject"][k].get("/Subtype") == "/Image":
+                n += 1
+    return n
+
+
+def compress_images(pdf, jpeg_quality, max_dpi, cb=None):
+    total = count_images(pdf)
+    cur = 0
+    for page in pdf.pages:
+        if "/Resources" not in page: continue
+        res = page["/Resources"]
+        if "/XObject" not in res: continue
+        xo = res["/XObject"]
+        for key in list(xo.keys()):
+            if xo[key].get("/Subtype") != "/Image": continue
+            cur += 1
             try:
-                raw = bytes(xobj.read_raw_bytes())
-                img = Image.open(io.BytesIO(raw))
+                img = Image.open(io.BytesIO(bytes(xo[key].read_raw_bytes())))
                 w, h = img.size
-                scale = min(1.0, (max_dpi * 10) / max(w, h))
-                if scale < 1.0:
-                    img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
-                if img.mode in ("RGBA","P","LA"): img = img.convert("RGB")
-                elif img.mode != "RGB": img = img.convert("RGB")
+                s = min(1.0, (max_dpi * 10) / max(w, h))
+                if s < 1.0:
+                    img = img.resize((int(w*s), int(h*s)), Image.LANCZOS)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
                 buf.seek(0)
-                xobjects[key] = pikepdf.Stream(pdf, buf.read())
-                xobjects[key]["/Type"]             = pikepdf.Name("/XObject")
-                xobjects[key]["/Subtype"]          = pikepdf.Name("/Image")
-                xobjects[key]["/ColorSpace"]       = pikepdf.Name("/DeviceRGB")
-                xobjects[key]["/BitsPerComponent"] = 8
-                xobjects[key]["/Width"]            = img.width
-                xobjects[key]["/Height"]           = img.height
-                xobjects[key]["/Filter"]           = pikepdf.Name("/DCTDecode")
+                xo[key] = pikepdf.Stream(pdf, buf.read())
+                xo[key]["/Type"]             = pikepdf.Name("/XObject")
+                xo[key]["/Subtype"]          = pikepdf.Name("/Image")
+                xo[key]["/ColorSpace"]       = pikepdf.Name("/DeviceRGB")
+                xo[key]["/BitsPerComponent"] = 8
+                xo[key]["/Width"]            = img.width
+                xo[key]["/Height"]           = img.height
+                xo[key]["/Filter"]           = pikepdf.Name("/DCTDecode")
             except Exception:
-                continue
+                pass
+            if cb:
+                cb(cur, total)
+    return cur, total
 
 
-# ── Custom Widgets ──────────────────────────────────────────────────
+def do_compress(input_path, output_path, jpeg, dpi, cb=None):
+    orig = os.path.getsize(input_path)
+    d = os.path.dirname(output_path) or "."
+    fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=d)
+    try:
+        os.close(fd)
+        with pikepdf.open(input_path) as pdf:
+            compress_images(pdf, jpeg, dpi, cb)
+            pdf.remove_unreferenced_resources()
+            pdf.save(tmp, compress_streams=True,
+                     object_stream_mode=pikepdf.ObjectStreamMode.generate)
+        comp = os.path.getsize(tmp)
+        if comp >= orig:
+            os.remove(tmp)
+            return orig, orig, True
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        os.rename(tmp, output_path)
+        return orig, comp, False
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
-class PercentSlider(tk.Canvas):
-    """A custom slider that returns 0–100 and draws itself nicely."""
+
+# ═══════════════════════════════════════════════════════════════════
+#  Custom slider
+# ═══════════════════════════════════════════════════════════════════
+
+class Slider(tk.Canvas):
     def __init__(self, parent, value=60, on_change=None, **kw):
-        super().__init__(parent, height=36, bg=CARD,
+        super().__init__(parent, height=28, bg=SURFACE,
                          highlightthickness=0, cursor="hand2", **kw)
-        self.value     = value
-        self.on_change = on_change
-        self.dragging  = False
+        self.val = value
+        self.cb  = on_change
         self.bind("<Configure>",       self._draw)
-        self.bind("<ButtonPress-1>",   self._press)
-        self.bind("<B1-Motion>",       self._drag)
-        self.bind("<ButtonRelease-1>", self._release)
-
-    def _x_from_val(self, w):
-        pad = 14
-        return pad + (self.value / 100) * (w - 2*pad)
-
-    def _val_from_x(self, x, w):
-        pad = 14
-        return max(0, min(100, round((x - pad) / (w - 2*pad) * 100)))
+        self.bind("<ButtonPress-1>",   self._click)
+        self.bind("<B1-Motion>",       self._move)
 
     def _draw(self, *_):
         self.delete("all")
         w = self.winfo_width()
-        if w < 2: return
-        cx = self._x_from_val(w)
-        track_y = 18
-        pad = 14
+        if w < 20: return
+        pad, y = 8, 14
+        x = pad + (self.val / 100) * (w - 2 * pad)
 
-        # Track background
-        self.create_rounded_rect(pad, track_y-3, w-pad, track_y+3, 3, fill=BORDER2, outline="")
-        # Track fill
-        self.create_rounded_rect(pad, track_y-3, cx, track_y+3, 3, fill=GOLD_DIM, outline="")
-        # Thumb shadow
-        self.create_oval(cx-11, track_y-11, cx+11, track_y+11, fill="#000000", outline="", stipple="gray50")
+        # Track
+        self.create_line(pad, y, w - pad, y, fill=BORDER, width=2, capstyle="round")
+        # Fill
+        if x > pad + 1:
+            self.create_line(pad, y, x, y, fill=ACCENT_D, width=2, capstyle="round")
         # Thumb
-        self.create_oval(cx-10, track_y-10, cx+10, track_y+10, fill=GOLD, outline="")
-        # Thumb inner
-        self.create_oval(cx-4, track_y-4, cx+4, track_y+4, fill=BG, outline="")
+        self.create_oval(x-7, y-7, x+7, y+7, fill=ACCENT, outline="")
+        self.create_oval(x-3, y-3, x+3, y+3, fill=BG, outline="")
 
-    def create_rounded_rect(self, x1, y1, x2, y2, r, **kw):
-        self.create_arc(x1, y1, x1+2*r, y1+2*r, start=90,  extent=90,  style="pieslice", **kw)
-        self.create_arc(x2-2*r, y1, x2, y1+2*r, start=0,   extent=90,  style="pieslice", **kw)
-        self.create_arc(x1, y2-2*r, x1+2*r, y2, start=180, extent=90,  style="pieslice", **kw)
-        self.create_arc(x2-2*r, y2-2*r, x2, y2, start=270, extent=90,  style="pieslice", **kw)
-        self.create_rectangle(x1+r, y1, x2-r, y2, **kw)
-        self.create_rectangle(x1, y1+r, x2, y2-r, **kw)
+    def _click(self, e):
+        self._set(e.x)
 
-    def _press(self, e):
-        self.dragging = True
-        self._update(e.x)
+    def _move(self, e):
+        self._set(e.x)
 
-    def _drag(self, e):
-        if self.dragging: self._update(e.x)
-
-    def _release(self, e):
-        self.dragging = False
-
-    def _update(self, x):
+    def _set(self, x):
         w = self.winfo_width()
-        new_val = self._val_from_x(x, w)
-        if new_val != self.value:
-            self.value = new_val
+        pad = 8
+        v = max(0, min(100, round((x - pad) / (w - 2 * pad) * 100)))
+        if v != self.val:
+            self.val = v
             self._draw()
-            if self.on_change:
-                self.on_change(new_val)
+            if self.cb:
+                self.cb(v)
 
-    def set(self, val):
-        self.value = int(val)
+    def set(self, v):
+        self.val = int(v)
         self._draw()
 
 
-class Card(tk.Frame):
-    def __init__(self, parent, **kw):
-        super().__init__(parent, bg=CARD,
-                         highlightbackground=BORDER,
-                         highlightthickness=1, **kw)
+# ═══════════════════════════════════════════════════════════════════
+#  File row
+# ═══════════════════════════════════════════════════════════════════
+
+class FileRow(tk.Frame):
+    def __init__(self, parent, path, on_remove, **kw):
+        super().__init__(parent, bg=SURFACE, **kw)
+        self.filepath = path
+        self.grid_columnconfigure(1, weight=1)
+
+        self.icon = tk.Label(self, text="·", font=(_F, 10), bg=SURFACE, fg=TEXT3, width=2)
+        self.icon.grid(row=0, column=0, rowspan=2, padx=(12, 4), pady=6)
+
+        name = os.path.basename(path)
+        tk.Label(
+            self, text=name if len(name) < 48 else name[:45] + "…",
+            font=(_F, 9), bg=SURFACE, fg=TEXT, anchor="w",
+        ).grid(row=0, column=1, sticky="w", padx=0, pady=(6, 0))
+
+        sz = os.path.getsize(path)
+        self.status = tk.Label(self, text=fmt(sz), font=(_F, 8), bg=SURFACE, fg=TEXT3, anchor="w")
+        self.status.grid(row=1, column=1, sticky="w", padx=0, pady=(0, 6))
+
+        self.rm_btn = tk.Button(
+            self, text="×", font=(_F, 9), bg=SURFACE, fg=TEXT3,
+            relief="flat", bd=0, cursor="hand2", activebackground=BORDER,
+            command=lambda: on_remove(self),
+        )
+        self.rm_btn.grid(row=0, column=2, rowspan=2, padx=(4, 10), pady=6)
+
+        tk.Frame(self, bg=BORDER, height=1).grid(row=2, column=0, columnspan=3, sticky="ew")
+
+    def set_working(self):
+        self.icon.config(text="◌", fg=ACCENT)
+        self.status.config(text="Compressing…", fg=ACCENT)
+        self.rm_btn.config(state="disabled")
+
+    def set_progress(self, cur, tot):
+        self.status.config(text=f"Image {cur}/{tot}")
+
+    def set_done(self, orig, comp, skip):
+        self.rm_btn.config(state="normal")
+        if skip:
+            self.icon.config(text="–", fg=AMBER)
+            self.status.config(text=f"{fmt(orig)} · already optimized", fg=AMBER)
+        else:
+            pct = (1 - comp / orig) * 100
+            self.icon.config(text="✓", fg=GREEN)
+            self.status.config(text=f"{fmt(orig)} → {fmt(comp)}  ·  {pct:.1f}% smaller", fg=GREEN)
+
+    def set_error(self, msg):
+        self.rm_btn.config(state="normal")
+        self.icon.config(text="×", fg=RED)
+        self.status.config(text=msg[:55], fg=RED)
 
 
-# ── Main App ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+#  App
+# ═══════════════════════════════════════════════════════════════════
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, initial_files=None):
         super().__init__()
         self.title("PDF Compress")
         self.configure(bg=BG)
-        self.resizable(False, False)
 
-        self.input_path  = None
-        self.output_path = None
-        self.quality_pct = 60
-        self.orig_size   = 0
+        self.rows    = []
+        self.quality = 60
+        self.out_dir = None
+        self.running = False
 
         self._build()
-        self.update_idletasks()
-        self.geometry(f"480x700+{(self.winfo_screenwidth()-480)//2}+{(self.winfo_screenheight()-700)//2}")
 
-    # ── Build ────────────────────────────────────────────────────────
+        w, h = 480, 620
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(400, 480)
+
+        if initial_files:
+            self.after(150, lambda: self._add(initial_files))
 
     def _build(self):
-        root = tk.Frame(self, bg=BG)
-        root.pack(fill="both", expand=True, padx=20, pady=20)
+        pad = 24
 
-        # ── Header
-        hdr = tk.Frame(root, bg=BG)
-        hdr.pack(fill="x", pady=(0, 4))
-        tk.Label(hdr, text="PDF Compress", font=F_TITLE,
-                 bg=BG, fg=TEXT).pack(side="left")
-        tk.Label(hdr, text="  offline", font=F_LABEL,
-                 bg=BG, fg=GOLD).pack(side="left", pady=(8, 0))
+        # ── Header ──
+        hdr = tk.Frame(self, bg=BG)
+        hdr.pack(fill="x", padx=pad, pady=(pad, 0))
+        tk.Label(hdr, text="PDF Compress", font=(_F, 14), bg=BG, fg=TEXT).pack(side="left")
+        tk.Label(hdr, text="offline", font=(_F, 8), bg=BG, fg=ACCENT_D).pack(side="left", padx=(8, 0), pady=(3, 0))
 
-        tk.Label(root, text="No files leave your machine. No internet required.",
-                 font=F_LABEL, bg=BG, fg=SUB).pack(anchor="w")
+        tk.Label(self, text="No files leave your machine",
+                 font=(_F, 8), bg=BG, fg=TEXT3).pack(anchor="w", padx=pad, pady=(2, 0))
 
-        self._gap(root, 14)
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=pad, pady=(12, 0))
 
-        # ── File picker card
-        self.file_card = Card(root, cursor="hand2")
-        self.file_card.pack(fill="x")
-        self.file_card.bind("<Button-1>", lambda e: self._pick_file())
+        # ── File area ──
+        self.file_area = tk.Frame(self, bg=BG)
+        self.file_area.pack(fill="both", expand=True, padx=pad, pady=(12, 0))
 
-        fc_inner = tk.Frame(self.file_card, bg=CARD)
-        fc_inner.pack(fill="x", padx=18, pady=18)
-        fc_inner.bind("<Button-1>", lambda e: self._pick_file())
+        # Drop zone
+        self.drop = tk.Frame(self.file_area, bg=SURFACE,
+                             highlightbackground=BORDER, highlightthickness=1)
+        self.drop_c = tk.Frame(self.drop, bg=SURFACE)
+        self.drop_c.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(self.drop_c, text="+", font=(_F, 20), bg=SURFACE, fg=ACCENT_D).pack()
+        tk.Label(self.drop_c, text="Select PDFs", font=(_F, 10), bg=SURFACE, fg=TEXT).pack(pady=(2, 0))
+        tk.Label(self.drop_c, text="or drag onto .bat to launch with files",
+                 font=(_F, 8), bg=SURFACE, fg=TEXT3).pack(pady=(2, 0))
+        for w in [self.drop, self.drop_c] + list(self.drop_c.winfo_children()):
+            w.configure(cursor="hand2")
+            w.bind("<Button-1>", lambda e: self._browse())
 
-        self.file_icon = tk.Label(fc_inner, text="＋", font=("Segoe UI", 26),
-                                  bg=CARD, fg=GOLD, cursor="hand2")
-        self.file_icon.pack()
-        self.file_icon.bind("<Button-1>", lambda e: self._pick_file())
+        # Scrollable list
+        self.list_wrap = tk.Frame(self.file_area, bg=SURFACE,
+                                  highlightbackground=BORDER, highlightthickness=1)
+        self.list_cv = tk.Canvas(self.list_wrap, bg=SURFACE, highlightthickness=0, bd=0)
+        self.list_sb = tk.Scrollbar(self.list_wrap, orient="vertical", command=self.list_cv.yview)
+        self.list_in = tk.Frame(self.list_cv, bg=SURFACE)
+        self.list_in.bind("<Configure>",
+                          lambda e: self.list_cv.configure(scrollregion=self.list_cv.bbox("all")))
+        self.list_cv.create_window((0, 0), window=self.list_in, anchor="nw", tags="win")
+        self.list_cv.configure(yscrollcommand=self.list_sb.set)
+        self.list_cv.pack(side="left", fill="both", expand=True)
+        self.list_sb.pack(side="right", fill="y")
+        self.list_cv.bind("<Configure>",
+                          lambda e: self.list_cv.itemconfig("win", width=e.width))
 
-        self.file_name_lbl = tk.Label(fc_inner, text="Click to select a PDF",
-                                      font=F_MED, bg=CARD, fg=TEXT, cursor="hand2")
-        self.file_name_lbl.pack(pady=(6, 2))
-        self.file_name_lbl.bind("<Button-1>", lambda e: self._pick_file())
+        def _wheel(e):
+            self.list_cv.yview_scroll(-1 * (e.delta // 120), "units")
+        self.list_cv.bind("<MouseWheel>", _wheel)
+        self.list_in.bind("<MouseWheel>", _wheel)
 
-        self.file_meta_lbl = tk.Label(fc_inner, text="",
-                                      font=F_LABEL, bg=CARD, fg=SUB, cursor="hand2")
-        self.file_meta_lbl.pack()
-        self.file_meta_lbl.bind("<Button-1>", lambda e: self._pick_file())
+        self._show_drop()
 
-        self._gap(root, 10)
+        # ── Count ──
+        self.count_lbl = tk.Label(self, text="", font=(_F, 8), bg=BG, fg=TEXT3, anchor="w")
+        self.count_lbl.pack(fill="x", padx=pad, pady=(8, 0))
 
-        # ── Info row (size + pages)
-        self.info_card = Card(root)
-        self.info_card.pack(fill="x")
-        self.info_row = tk.Frame(self.info_card, bg=CARD)
-        self.info_row.pack(fill="x", padx=18, pady=14)
+        # ── Quality ──
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=pad, pady=(8, 0))
 
-        self.col_orig  = self._stat_col(self.info_row, "ORIGINAL SIZE", "—")
-        tk.Frame(self.info_row, bg=BORDER, width=1).pack(side="left", fill="y", padx=16)
-        self.col_est   = self._stat_col(self.info_row, "EST. OUTPUT", "—")
-        tk.Frame(self.info_row, bg=BORDER, width=1).pack(side="left", fill="y", padx=16)
-        self.col_pages = self._stat_col(self.info_row, "PAGES", "—")
-        tk.Frame(self.info_row, bg=BORDER, width=1).pack(side="left", fill="y", padx=16)
-        self.col_save  = self._stat_col(self.info_row, "EST. SAVING", "—")
+        qf = tk.Frame(self, bg=BG)
+        qf.pack(fill="x", padx=pad, pady=(12, 0))
 
-        self._gap(root, 10)
+        qt = tk.Frame(qf, bg=BG)
+        qt.pack(fill="x")
+        tk.Label(qt, text="Quality", font=(_F, 9), bg=BG, fg=TEXT2).pack(side="left")
+        self.q_det = tk.Label(qt, text="", font=(_F, 8), bg=BG, fg=TEXT3)
+        self.q_det.pack(side="right")
+        self.q_val = tk.Label(qt, text="", font=(_F, 9), bg=BG, fg=ACCENT)
+        self.q_val.pack(side="right", padx=(0, 12))
 
-        # ── Quality card
-        q_card = Card(root)
-        q_card.pack(fill="x")
-        q_inner = tk.Frame(q_card, bg=CARD)
-        q_inner.pack(fill="x", padx=18, pady=(16, 18))
+        self.slider = Slider(qf, value=60, on_change=self._on_q)
+        self.slider.pack(fill="x", pady=(6, 0))
 
-        # Quality header row
-        qh = tk.Frame(q_inner, bg=CARD)
-        qh.pack(fill="x", pady=(0, 10))
-        tk.Label(qh, text="QUALITY", font=("Segoe UI", 8, "bold"),
-                 bg=CARD, fg=SUB).pack(side="left")
+        tf = tk.Frame(qf, bg=BG)
+        tf.pack(fill="x", pady=(2, 0))
+        for t in ["Smallest", "", "", "", "Best quality"]:
+            tk.Label(tf, text=t, font=(_F, 7), bg=BG, fg=TEXT3).pack(side="left", expand=True)
 
-        self.pct_frame = tk.Frame(qh, bg=CARD)
-        self.pct_frame.pack(side="right")
-        self.pct_lbl = tk.Label(self.pct_frame, text="60", font=("Segoe UI", 20, "bold"),
-                                bg=CARD, fg=GOLD)
-        self.pct_lbl.pack(side="left")
-        tk.Label(self.pct_frame, text="%", font=("Segoe UI", 12),
-                 bg=CARD, fg=GOLD_DIM).pack(side="left", pady=(6, 0))
-        self.quality_name_lbl = tk.Label(self.pct_frame, text="  Medium",
-                                         font=F_LABEL, bg=CARD, fg=SUB2)
-        self.quality_name_lbl.pack(side="left", pady=(8, 0))
+        self._upd_q()
 
-        # Slider
-        self.slider = PercentSlider(q_inner, value=60, on_change=self._on_quality,
-                                    width=420)
-        self.slider.pack(fill="x", pady=(0, 8))
+        # ── Output ──
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=pad, pady=(10, 0))
 
-        # Tick labels
-        ticks = tk.Frame(q_inner, bg=CARD)
-        ticks.pack(fill="x")
-        for lbl in ["0%", "25%", "50%", "75%", "100%"]:
-            tk.Label(ticks, text=lbl, font=F_SM, bg=CARD,
-                     fg=SUB).pack(side="left", expand=True)
+        of = tk.Frame(self, bg=BG)
+        of.pack(fill="x", padx=pad, pady=(10, 0))
+        tk.Label(of, text="Output", font=(_F, 9), bg=BG, fg=TEXT2).pack(side="left")
+        self.out_lbl = tk.Label(of, text="Same folder as input", font=(_F, 8), bg=BG, fg=TEXT3)
+        self.out_lbl.pack(side="left", padx=(10, 0))
+        tk.Button(of, text="Reset", font=(_F, 7), bg=BG, fg=TEXT3, relief="flat", bd=0,
+                  cursor="hand2", activebackground=BG, command=self._reset_out).pack(side="right")
+        tk.Button(of, text="Change", font=(_F, 7), bg=BORDER, fg=TEXT2, relief="flat", bd=0,
+                  cursor="hand2", padx=8, pady=2, activebackground=BORDER,
+                  command=self._pick_out).pack(side="right", padx=(0, 6))
 
-        self._gap(root, 10)
+        # ── Action bar ──
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=pad, pady=(10, 0))
 
-        # ── Output row
-        out_card = Card(root)
-        out_card.pack(fill="x")
-        out_inner = tk.Frame(out_card, bg=CARD)
-        out_inner.pack(fill="x", padx=18, pady=12)
-        tk.Label(out_inner, text="OUTPUT", font=("Segoe UI", 8, "bold"),
-                 bg=CARD, fg=SUB).pack(side="left")
-        self.out_lbl = tk.Label(out_inner, text="Select a file first",
-                                font=F_LABEL, bg=CARD, fg=SUB2)
-        self.out_lbl.pack(side="left", padx=10)
-        self.btn_change = tk.Button(out_inner, text="Change", font=F_SM,
-                                    bg=BORDER2, fg=SUB2, relief="flat",
-                                    activebackground=BORDER, activeforeground=TEXT,
-                                    cursor="hand2", bd=0, padx=10, pady=4,
-                                    command=self._pick_output)
-        self.btn_change.pack(side="right")
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=pad, pady=(12, 0))
 
-        self._gap(root, 14)
+        self.btn_add = tk.Button(bar, text="+ Add", font=(_F, 9), bg=BORDER, fg=TEXT,
+                                 relief="flat", bd=0, padx=12, pady=6, cursor="hand2",
+                                 activebackground=BORDER, activeforeground=TEXT,
+                                 command=self._browse)
+        self.btn_add.pack(side="left")
 
-        # ── Compress button
-        self.btn = tk.Button(root, text="Compress PDF",
-                             font=("Segoe UI", 12, "bold"),
-                             bg=GOLD, fg="#0a0a0b",
-                             activebackground=GOLD_HV,
-                             activeforeground="#0a0a0b",
-                             relief="flat", cursor="hand2",
-                             bd=0, pady=15,
-                             command=self._run, state="disabled")
-        self.btn.pack(fill="x")
+        self.btn_clr = tk.Button(bar, text="Clear", font=(_F, 8), bg=BG, fg=TEXT3,
+                                 relief="flat", bd=0, padx=8, pady=6, cursor="hand2",
+                                 activebackground=BG, command=self._clear)
+        self.btn_clr.pack(side="left", padx=(6, 0))
 
-        # ── Progress
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("P.Horizontal.TProgressbar",
-                        troughcolor=BORDER, background=GOLD, thickness=3)
-        self.prog = ttk.Progressbar(root, mode="indeterminate",
-                                    style="P.Horizontal.TProgressbar")
+        self.btn_go = tk.Button(bar, text="Compress", font=(_F, 10), bg=ACCENT, fg="#0a0a0b",
+                                relief="flat", bd=0, padx=20, pady=7, cursor="hand2",
+                                activebackground=ACCENT2, activeforeground="#0a0a0b",
+                                command=self._run, state="disabled")
+        self.btn_go.pack(side="right")
 
-        # ── Result label
-        self.result_lbl = tk.Label(root, text="", font=F_LABEL,
-                                   bg=BG, fg=GREEN, wraplength=440, justify="center")
-        self.result_lbl.pack(pady=(10, 0))
+        self.btn_open = tk.Button(bar, text="Open folder", font=(_F, 8), bg=BG, fg=TEXT3,
+                                  relief="flat", bd=0, padx=8, pady=6, cursor="hand2",
+                                  activebackground=BG, command=self._open_folder)
 
-    # ── Helpers ──────────────────────────────────────────────────────
+        # ── Progress ──
+        sty = ttk.Style(self)
+        sty.theme_use("clam")
+        sty.configure("A.Horizontal.TProgressbar", troughcolor=BORDER, background=ACCENT, thickness=3)
+        self.prog = ttk.Progressbar(self, mode="determinate", maximum=100,
+                                    style="A.Horizontal.TProgressbar")
 
-    def _gap(self, parent, h):
-        tk.Frame(parent, bg=BG, height=h).pack(fill="x")
+        # ── Result ──
+        self.result = tk.Label(self, text="", font=(_F, 8), bg=BG, fg=GREEN, wraplength=440)
+        self.result.pack(padx=pad, pady=(6, pad))
 
-    def _stat_col(self, parent, title, value):
-        f = tk.Frame(parent, bg=CARD)
-        f.pack(side="left", expand=True)
-        tk.Label(f, text=title, font=("Segoe UI", 7, "bold"),
-                 bg=CARD, fg=SUB).pack()
-        lbl = tk.Label(f, text=value, font=("Segoe UI", 13, "bold"),
-                       bg=CARD, fg=TEXT)
-        lbl.pack()
-        return lbl
+    # ── View ─────────────────────────────────────────────────────
 
-    # ── Events ───────────────────────────────────────────────────────
+    def _show_drop(self):
+        self.list_wrap.pack_forget()
+        self.drop.pack(fill="both", expand=True)
 
-    def _pick_file(self):
-        path = filedialog.askopenfilename(
-            title="Select PDF",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
-        )
-        if not path: return
-        self.input_path = path
-        base, ext = os.path.splitext(path)
-        self.output_path = f"{base}_compressed{ext}"
-        self.orig_size   = os.path.getsize(path)
+    def _show_list(self):
+        self.drop.pack_forget()
+        self.list_wrap.pack(fill="both", expand=True)
 
-        try:
-            with pikepdf.open(path) as pdf:
-                pages = len(pdf.pages)
-        except Exception:
-            pages = "?"
+    def _upd_count(self):
+        n = len(self.rows)
+        if not n:
+            self.count_lbl.config(text="")
+        else:
+            total = sum(os.path.getsize(r.filepath) for r in self.rows)
+            self.count_lbl.config(text=f"{n} file{'s' if n != 1 else ''}  ·  {fmt(total)}")
 
-        name = os.path.basename(path)
-        self.file_name_lbl.config(text=name if len(name) < 42 else name[:39]+"…")
-        self.file_meta_lbl.config(text=f"{fmt_size(self.orig_size)}  ·  {pages} pages  ·  Click to change")
-        self.file_icon.config(text="✓", fg=GREEN)
+    # ── Files ────────────────────────────────────────────────────
 
-        self.col_orig.config(text=fmt_size(self.orig_size))
-        self.col_pages.config(text=str(pages))
-        self._refresh_estimate()
+    def _browse(self):
+        if self.running: return
+        paths = filedialog.askopenfilenames(title="Select PDFs",
+                                            filetypes=[("PDF", "*.pdf"), ("All", "*.*")])
+        if paths:
+            self._add(list(paths))
 
-        self.out_lbl.config(text=os.path.basename(self.output_path))
-        self.btn.config(state="normal")
-        self.result_lbl.config(text="")
+    def _add(self, paths):
+        have = {r.filepath for r in self.rows}
+        new = [p for p in paths if p.lower().endswith(".pdf") and os.path.isfile(p) and p not in have]
+        if not new: return
+        if not self.rows:
+            self._show_list()
+        for p in new:
+            row = FileRow(self.list_in, p, on_remove=self._remove)
+            row.pack(fill="x")
+            self.rows.append(row)
+        self._upd_count()
+        self.btn_go.config(state="normal")
+        self.result.config(text="")
+        self.btn_open.pack_forget()
 
-    def _pick_output(self):
-        if not self.input_path: return
-        path = filedialog.asksaveasfilename(
-            title="Save compressed PDF as",
-            defaultextension=".pdf",
-            filetypes=[("PDF files", "*.pdf")],
-            initialfile=os.path.basename(self.output_path),
-            initialdir=os.path.dirname(self.input_path),
-        )
-        if path:
-            self.output_path = path
-            self.out_lbl.config(text=os.path.basename(path))
+    def _remove(self, row):
+        if self.running: return
+        row.pack_forget(); row.destroy()
+        self.rows.remove(row)
+        if not self.rows:
+            self._show_drop()
+            self.btn_go.config(state="disabled")
+        self._upd_count()
 
-    def _on_quality(self, val):
-        self.quality_pct = int(val)
-        self.pct_lbl.config(text=str(self.quality_pct))
-        self.quality_name_lbl.config(text=f"  {quality_label(self.quality_pct)}")
-        self._refresh_estimate()
+    def _clear(self):
+        if self.running: return
+        for r in list(self.rows):
+            r.pack_forget(); r.destroy()
+        self.rows.clear()
+        self._show_drop()
+        self.btn_go.config(state="disabled")
+        self._upd_count()
+        self.result.config(text="")
+        self.btn_open.pack_forget()
 
-    def _refresh_estimate(self):
-        if not self.orig_size: return
-        est  = estimate_size(self.orig_size, self.quality_pct)
-        save = self.orig_size - est
-        pct  = save / self.orig_size * 100
-        self.col_est.config(text=fmt_size(est))
-        self.col_save.config(text=f"~{pct:.0f}%", fg=GREEN if pct > 10 else SUB2)
+    # ── Output ───────────────────────────────────────────────────
+
+    def _pick_out(self):
+        d = filedialog.askdirectory(title="Output folder")
+        if d:
+            self.out_dir = d
+            self.out_lbl.config(text=d if len(d) < 40 else "…" + d[-37:])
+
+    def _reset_out(self):
+        self.out_dir = None
+        self.out_lbl.config(text="Same folder as input")
+
+    def _open_folder(self):
+        if not self.rows: return
+        folder = self.out_dir or os.path.dirname(self.rows[0].filepath)
+        if sys.platform == "win32":    os.startfile(folder)
+        elif sys.platform == "darwin": subprocess.Popen(["open", folder])
+        else:                          subprocess.Popen(["xdg-open", folder])
+
+    # ── Quality ──────────────────────────────────────────────────
+
+    def _on_q(self, v):
+        self.quality = int(v)
+        self._upd_q()
+
+    def _upd_q(self):
+        jpeg, dpi = q_settings(self.quality)
+        self.q_val.config(text=f"{self.quality}%  {q_label(self.quality)}")
+        self.q_det.config(text=f"{dpi} DPI · JPEG {jpeg}%")
+
+    # ── Compression ──────────────────────────────────────────────
 
     def _run(self):
-        if not self.input_path or not self.output_path: return
-        self.btn.config(state="disabled", text="Compressing…")
-        self.prog.pack(fill="x", pady=(8, 0))
-        self.prog.start(8)
-        self.result_lbl.config(text="", fg=SUB)
-        threading.Thread(target=self._worker, daemon=True).start()
+        if self.running or not self.rows: return
+        self.running = True
+        self.btn_go.config(state="disabled", text="Compressing…")
+        self.btn_add.config(state="disabled")
+        self.btn_clr.config(state="disabled")
+        self.btn_open.pack_forget()
+        self.result.config(text="")
+        self.prog.pack(fill="x", padx=24, pady=(2, 0))
+        self.prog["value"] = 0
+        jpeg, dpi = q_settings(self.quality)
+        threading.Thread(target=self._work, args=(jpeg, dpi), daemon=True).start()
 
-    def _worker(self):
-        jpeg, dpi = quality_to_settings(self.quality_pct)
-        orig = os.path.getsize(self.input_path)
-        try:
-            with pikepdf.open(self.input_path) as pdf:
-                compress_images_in_pdf(pdf, jpeg, dpi)
-                pdf.save(self.output_path,
-                         compress_streams=True,
-                         object_stream_mode=pikepdf.ObjectStreamMode.generate)
-            new = os.path.getsize(self.output_path)
-            if new >= orig:
-                os.remove(self.output_path)
-                self.after(0, self._done,
-                           "File is already well optimised — no reduction possible.", AMBER)
+    def _work(self, jpeg, dpi):
+        nf = len(self.rows)
+        to = tc = 0
+        nk = ns = 0
+        for i, row in enumerate(self.rows):
+            if self.out_dir:
+                nm, ext = os.path.splitext(os.path.basename(row.filepath))
+                out = os.path.join(self.out_dir, f"{nm}_compressed{ext}")
             else:
-                pct = (1 - new/orig) * 100
-                msg = f"✓  {fmt_size(orig)}  →  {fmt_size(new)}  ({pct:.1f}% smaller)\nSaved to: {self.output_path}"
-                self.after(0, self._done, msg, GREEN)
-        except Exception as e:
-            self.after(0, self._done, f"Error: {e}", RED)
+                b, ext = os.path.splitext(row.filepath)
+                out = f"{b}_compressed{ext}"
+            self.after(0, row.set_working)
 
-    def _done(self, msg, color):
-        self.prog.stop()
+            def cb(cur, tot, _r=row, _i=i):
+                self.after(0, _r.set_progress, cur, tot)
+                fp = (_i / nf) * 100 + (cur / max(tot, 1)) * (100 / nf)
+                self.after(0, lambda v=fp: self.prog.configure(value=min(100, v)))
+
+            try:
+                o, c, skip = do_compress(row.filepath, out, jpeg, dpi, cb)
+                to += o; tc += c
+                if skip: ns += 1
+                else:    nk += 1
+                self.after(0, row.set_done, o, c, skip)
+            except Exception as e:
+                self.after(0, row.set_error, str(e))
+        self.after(0, self._done, to, tc, nk, ns)
+
+    def _done(self, to, tc, nk, ns):
+        self.running = False
         self.prog.pack_forget()
-        self.btn.config(state="normal", text="Compress PDF")
-        self.result_lbl.config(text=msg, fg=color)
+        self.btn_go.config(state="normal", text="Compress")
+        self.btn_add.config(state="normal")
+        self.btn_clr.config(state="normal")
+        sv = to - tc
+        parts = []
+        if nk:  parts.append(f"{nk} compressed")
+        if ns:  parts.append(f"{ns} already optimized")
+        if sv > 0 and to > 0:
+            parts.append(f"saved {fmt(sv)} ({sv/to*100:.0f}%)")
+        self.result.config(text="  ·  ".join(parts), fg=GREEN if nk else AMBER)
+        self.count_lbl.config(text="  ·  ".join(parts))
+        self.btn_open.pack(side="right", padx=(6, 0))
 
+
+# ── Entry ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    App().mainloop()
+    init = [f for f in sys.argv[1:] if f.lower().endswith(".pdf") and os.path.isfile(f)]
+    App(initial_files=init or None).mainloop()
