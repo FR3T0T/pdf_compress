@@ -1,31 +1,34 @@
 @echo off
-set SCRIPT=%~dp0pdf_compress_gui.py
+:: PDF Compress — double-click to open, or drag PDFs onto this file.
+:: Uses pythonw (no console window). Falls back to python if needed.
 
-:: Try "python" first, then "py" launcher
-python --version >nul 2>&1
+set SCRIPT=%~dp0app.py
+
+:: Try pythonw first (no console window)
+where pythonw >nul 2>&1
 if %errorlevel% == 0 (
-    python "%SCRIPT%" %*
-    if %errorlevel% neq 0 (
-        echo.
-        echo ERROR: Script failed. See message above.
-        pause
-    )
+    start "" pythonw "%SCRIPT%" %*
     exit /b
 )
 
-py --version >nul 2>&1
+:: Try py launcher with windowless flag
+where py >nul 2>&1
 if %errorlevel% == 0 (
-    py "%SCRIPT%" %*
-    if %errorlevel% neq 0 (
-        echo.
-        echo ERROR: Script failed. See message above.
-        pause
-    )
+    start "" py -w "%SCRIPT%" %*
+    exit /b
+)
+
+:: Fallback to python (console stays open on error)
+where python >nul 2>&1
+if %errorlevel% == 0 (
+    python "%SCRIPT%" %*
+    if %errorlevel% neq 0 pause
     exit /b
 )
 
 echo.
-echo Python not found. Please install it from https://www.python.org/downloads/
-echo Make sure to tick "Add python.exe to PATH" during install.
+echo  Python not found.
+echo  Install from https://www.python.org/downloads/
+echo  Tick "Add python.exe to PATH" during install.
 echo.
 pause

@@ -1,2 +1,3 @@
--e pikepdf>=8.0.0
+pikepdf>=8.0.0
 Pillow>=10.0.0
+PySide6>=6.5.0

@@ -1,60 +1,63 @@
-# pdf-compress
+# PDF Compress
 
-A simple, fully offline PDF compressor with a desktop GUI. No Ghostscript, no online tools, no files leaving your machine.
+Fully offline PDF compressor with DPI-aware image recompression. No Ghostscript, no cloud services, no accounts, no tracking.
 
 ---
 
-## Requirements
-
-- [Python 3.8+](https://www.python.org/downloads/) — tick **"Add to PATH"** during install
-- Two Python libraries:
+## Install
 
 ```bash
-pip install pikepdf pillow
+pip install pikepdf pillow PySide6
 ```
 
 ---
 
 ## Usage
 
-### GUI (recommended)
+**GUI** — double-click `compress_pdf.bat` or `python app.py`. Drag and drop PDFs onto the window.
 
-Double-click `compress_pdf.bat` to open the app, or drag a PDF onto it to open with that file pre-loaded.
-
-1. Click the file area to select a PDF
-2. Adjust the quality slider (1–5)
-3. Optionally change the output path
-4. Hit **Compress PDF**
-
-### Command Line
-
-```bash
-python compress_pdf.py document.pdf
-python compress_pdf.py document.pdf -q 1   # smallest
-python compress_pdf.py document.pdf -q 5   # best quality
-python compress_pdf.py *.pdf               # batch
-```
+**CLI** — `python compress_pdf.py document.pdf -p standard`
 
 ---
 
-## Quality Levels
+## Keyboard shortcuts
 
-| Level | DPI | JPEG | Best For |
-|-------|-----|------|----------|
-| 1 | 72  | 30% | Absolute smallest |
-| 2 | 96  | 50% | Small, acceptable quality |
-| 3 | 120 | 65% | **Default** — lecture notes & docs |
-| 4 | 150 | 80% | Good quality, moderate savings |
-| 5 | 200 | 90% | Light compression |
+| Shortcut | Action |
+|----------|--------|
+| Ctrl+O | Add files |
+| Ctrl+Enter | Compress |
+| Escape | Clear files |
+| Ctrl+T | Toggle light/dark theme |
+| Ctrl+, | About |
 
 ---
 
-## How It Works
+## Quality presets
 
-1. **Recompresses embedded images** at lower JPEG quality and downscales above the DPI threshold.
-2. **Compresses PDF streams** — removes redundant internal data.
+| Preset | DPI | JPEG | Use case |
+|--------|-----|------|----------|
+| Screen | 72 | 35% | On-screen viewing only |
+| E-book | 120 | 55% | Tablets, laptops, e-readers |
+| Standard | 150 | 65% | Lecture notes, reports, datasheets |
+| High quality | 200 | 80% | Good prints, detailed diagrams |
+| Prepress | 300 | 90% | Professional printing |
 
-Text, fonts, and vectors are untouched. If compression doesn't reduce the file size, the original is kept.
+Your last-used preset and theme are remembered between sessions.
+
+---
+
+## How it works
+
+1. Parses the PDF content stream to find each image's transformation matrix
+2. Calculates true rendered DPI from the matrix (not just pixel dimensions)
+3. Downscales only images that exceed the target DPI
+4. Preserves grayscale images as single-channel JPEG
+5. Skips tiny images (logos, icons, thumbnails)
+6. Detects already-compressed images to avoid generation loss
+7. Compresses PDF streams and removes unreferenced resources
+8. Writes to a temp file first — a crash never corrupts your original
+
+Text, fonts, and vector graphics are never modified.
 
 ---
 
@@ -62,13 +65,13 @@ Text, fonts, and vectors are untouched. If compression doesn't reduce the file s
 
 | File | Purpose |
 |------|---------|
-| `pdf_compress_gui.py` | Desktop GUI application |
-| `compress_pdf.py` | Command-line version |
-| `compress_pdf.bat` | Launcher (double-click or drag PDF onto it) |
-| `requirements.txt` | `pip install -r requirements.txt` |
+| `app.py` | PySide6 desktop GUI |
+| `engine.py` | Compression engine |
+| `compress_pdf.py` | Command-line interface |
+| `compress_pdf.bat` | Windows launcher (no console) |
 
 ---
 
 ## License
 
-MIT
+MIT — Frederik © 2026
