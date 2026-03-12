@@ -74,4 +74,4 @@ Text, fonts, and vector graphics are never modified.
 
 ## License
 
-MIT — Frederik © 2026
+MIT — FR3T0T © 2026
