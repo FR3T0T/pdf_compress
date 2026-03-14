@@ -7,10 +7,11 @@ Usage:
     python compress_pdf.py input.pdf
     python compress_pdf.py input.pdf -p standard
     python compress_pdf.py *.pdf -o compressed/
+    python compress_pdf.py input.pdf --linearize
 
 Presets:
-    screen    —  72 DPI, JPEG 35  (smallest file)
-    ebook     — 120 DPI, JPEG 55  (tablets/laptops)
+    screen    —  72 DPI, JPEG 35  (smallest file, strips metadata)
+    ebook     — 120 DPI, JPEG 55  (tablets/laptops, strips metadata)
     standard  — 150 DPI, JPEG 65  (default — lecture notes, docs)
     high      — 200 DPI, JPEG 80  (good prints)
     prepress  — 300 DPI, JPEG 90  (professional printing)
@@ -20,7 +21,10 @@ import argparse
 import os
 import sys
 
-from engine import PRESETS, PRESET_ORDER, compress_pdf, fmt_size
+from engine import (
+    PRESETS, PRESET_ORDER, compress_pdf, fmt_size,
+    EncryptedPDFError,
+)
 
 
 def progress_bar(current, total, status):
@@ -52,6 +56,10 @@ def main():
         help="Output path (file for single input, directory for batch)",
     )
     parser.add_argument(
+        "--linearize", action="store_true",
+        help="Produce web-optimized (linearized) PDF",
+    )
+    parser.add_argument(
         "--no-pause", action="store_true",
         help="Don't wait for Enter at exit",
     )
@@ -64,14 +72,17 @@ def main():
             print(f"ERROR: For batch, -o must be an existing directory.")
             sys.exit(1)
 
-    print(f"\n  Preset  : {preset.name}")
+    meta_note = "  (strips metadata)" if preset.strip_metadata else ""
+    print(f"\n  Preset  : {preset.name}{meta_note}")
     print(f"  DPI     : {preset.target_dpi}")
     print(f"  JPEG    : {preset.jpeg_quality}%")
+    if args.linearize:
+        print(f"  Output  : linearized (web-optimized)")
     print(f"  {'─' * 42}")
 
     total_saved = 0
     total_orig = 0
-    n_ok = n_skip = 0
+    n_ok = n_skip = n_err = 0
 
     for path in args.inputs:
         if not os.path.isfile(path):
@@ -91,8 +102,11 @@ def main():
         print(f"\n  {os.path.basename(path)}")
 
         try:
-            result = compress_pdf(path, out, preset_key=args.preset,
-                                  on_progress=progress_bar)
+            result = compress_pdf(
+                path, out, preset_key=args.preset,
+                on_progress=progress_bar,
+                linearize=args.linearize,
+            )
             total_orig += result.original_size
             s = result.stats
 
@@ -108,19 +122,31 @@ def main():
 
             if s.images_total > 0:
                 parts = []
-                if s.images_recompressed: parts.append(f"{s.images_recompressed} recompressed")
-                if s.images_downscaled:   parts.append(f"{s.images_downscaled} downscaled")
-                if s.images_skipped_tiny: parts.append(f"{s.images_skipped_tiny} tiny (kept)")
+                if s.images_recompressed:    parts.append(f"{s.images_recompressed} recompressed")
+                if s.images_downscaled:      parts.append(f"{s.images_downscaled} downscaled")
+                if s.images_skipped_tiny:    parts.append(f"{s.images_skipped_tiny} tiny (kept)")
                 if s.images_skipped_quality: parts.append(f"{s.images_skipped_quality} already compressed (kept)")
+                if s.images_skipped_bomb:    parts.append(f"{s.images_skipped_bomb} skipped (too large)")
+                if s.images_with_mask_composited:
+                    parts.append(f"{s.images_with_mask_composited} transparency composited")
                 if parts:
                     print(f"    Images: {', '.join(parts)}")
 
+        except EncryptedPDFError as e:
+            n_err += 1
+            print(f"    SKIPPED: {e}")
+
         except Exception as e:
+            n_err += 1
             print(f"    ERROR: {e}")
 
-    if n_ok + n_skip > 1:
+    if n_ok + n_skip + n_err > 1:
         print(f"\n  {'─' * 42}")
-        print(f"  Summary: {n_ok} compressed, {n_skip} skipped")
+        parts = []
+        if n_ok:   parts.append(f"{n_ok} compressed")
+        if n_skip: parts.append(f"{n_skip} skipped")
+        if n_err:  parts.append(f"{n_err} failed")
+        print(f"  Summary: {', '.join(parts)}")
         if total_orig > 0 and total_saved > 0:
             pct = total_saved / total_orig * 100
             print(f"  Total saved: {fmt_size(total_saved)} ({pct:.0f}%)")

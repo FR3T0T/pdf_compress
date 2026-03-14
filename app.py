@@ -25,12 +25,12 @@ from PySide6.QtWidgets import (
 
 from engine import (
     PRESETS, PRESET_ORDER, Preset, analyze_pdf, PDFAnalysis,
-    compress_pdf, Result, fmt_size,
+    compress_pdf, Result, fmt_size, EncryptedPDFError,
 )
 
 import subprocess
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -64,11 +64,11 @@ class Theme:
 
 LIGHT = Theme(
     name="light",
-    bg="#f7f6f3",          # warm off-white
+    bg="#f7f6f3",
     surface="#ffffff",
     surface2="#f0efec",
     border="#e2e0db",
-    accent="#8a7750",       # warm bronze
+    accent="#8a7750",
     accent_h="#a08a5e",
     accent_m="#c4b896",
     text="#1a1a1a",
@@ -205,7 +205,7 @@ def build_stylesheet(t: Theme) -> str:
 class Signals(QObject):
     progress = Signal(int, int, int, str)
     file_done = Signal(int, object)
-    all_done = Signal(float)  # elapsed seconds
+    all_done = Signal(float)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -217,7 +217,7 @@ class SizeBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(6)
-        self.ratio = 1.0       # compressed / original (0..1)
+        self.ratio = 1.0
         self.color_fg = LIGHT.bar_fg
         self.color_bg = LIGHT.bar_bg
 
@@ -233,14 +233,12 @@ class SizeBar(QWidget):
         w, h = self.width(), self.height()
         r = h / 2
 
-        # Background (full bar = original size)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(self.color_bg))
         path_bg = QPainterPath()
         path_bg.addRoundedRect(QRectF(0, 0, w, h), r, r)
         p.drawPath(path_bg)
 
-        # Foreground (compressed portion)
         fw = max(h, w * self.ratio)
         p.setBrush(QColor(self.color_fg))
         path_fg = QPainterPath()
@@ -303,7 +301,6 @@ class PresetCard(QFrame):
             )
             nc = t.text2
             dc = t.text3
-        # Update label colors directly
         if hasattr(self, 'name_lbl'):
             self.name_lbl.setStyleSheet(f"color: {nc}; border: none; background: transparent;")
             self.desc_lbl.setStyleSheet(f"color: {dc}; border: none; background: transparent;")
@@ -331,7 +328,6 @@ class FileRow(QFrame):
         layout.setContentsMargins(12, 8, 8, 8)
         layout.setSpacing(4)
 
-        # Top: name + remove button
         top = QHBoxLayout()
         top.setSpacing(0)
 
@@ -349,16 +345,13 @@ class FileRow(QFrame):
 
         layout.addLayout(top)
 
-        # Status text
         self.status_lbl = QLabel("")
         self.status_lbl.setFont(QFont(FONT, 8))
         layout.addWidget(self.status_lbl)
 
-        # Size bar
         self.bar = SizeBar()
         layout.addWidget(self.bar)
 
-        # Bottom border
         self.border_line = QFrame()
         self.border_line.setFixedHeight(1)
         layout.addWidget(self.border_line)
@@ -380,6 +373,17 @@ class FileRow(QFrame):
         if self.completed:
             return
         t = self._theme
+
+        # Handle encrypted PDFs
+        if self.analysis.is_encrypted:
+            self.status_lbl.setText(
+                f"{fmt_size(self.analysis.file_size)}  ·  "
+                "Password-protected — cannot compress"
+            )
+            self.status_lbl.setStyleSheet(f"color: {t.red}; background: transparent;")
+            self.bar.set_ratio(1.0, fg=t.red, bg=t.bar_bg)
+            return
+
         preset = PRESETS[preset_key]
         a = self.analysis
         est = a.estimate_output(preset)
@@ -423,7 +427,6 @@ class FileRow(QFrame):
             self.bar.set_ratio(1.0, fg=t.amber, bg=t.bar_bg)
         else:
             ratio = result.compressed_size / result.original_size
-            s = result.stats
             parts = [
                 f"{fmt_size(result.original_size)} → {fmt_size(result.compressed_size)}",
                 f"{result.saved_pct:.1f}% smaller",
@@ -436,7 +439,7 @@ class FileRow(QFrame):
         self.completed = True
         self.rm_btn.setEnabled(True)
         t = self._theme
-        self.status_lbl.setText(f"Error: {msg[:60]}")
+        self.status_lbl.setText(f"Error: {msg[:80]}")
         self.status_lbl.setStyleSheet(f"color: {t.red}; background: transparent;")
         self.bar.set_ratio(1.0, fg=t.red, bg=t.bar_bg)
 
@@ -473,7 +476,8 @@ class AboutDialog(QDialog):
         desc = QLabel(
             "Fully offline PDF compression.\n"
             "DPI-aware image recompression with\n"
-            "grayscale preservation and smart skipping.\n\n"
+            "grayscale preservation, transparency handling,\n"
+            "and decompression bomb protection.\n\n"
             "No files leave your machine.\n"
             "No account required. No tracking."
         )
@@ -513,7 +517,6 @@ class SummaryDialog(QDialog):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
 
-        # Header
         n_ok = sum(1 for r in results if isinstance(r, Result) and not r.skipped)
         n_skip = sum(1 for r in results if isinstance(r, Result) and r.skipped)
         total_orig = sum(r.original_size for r in results if isinstance(r, Result))
@@ -531,7 +534,6 @@ class SummaryDialog(QDialog):
         title.setStyleSheet(f"color: {t.text};")
         layout.addWidget(title)
 
-        # Stats row
         stats_parts = []
         if total_saved > 0 and total_orig > 0:
             pct = total_saved / total_orig * 100
@@ -542,7 +544,6 @@ class SummaryDialog(QDialog):
         stats.setStyleSheet(f"color: {t.text2};")
         layout.addWidget(stats)
 
-        # Table
         table = QTableWidget()
         table.setColumnCount(4)
         table.setHorizontalHeaderLabels(["File", "Original", "Compressed", "Saving"])
@@ -579,7 +580,6 @@ class SummaryDialog(QDialog):
                 item3.setForeground(QColor(t.green))
             table.setItem(i, 3, item3)
 
-            # Right-align size columns
             for col in [1, 2, 3]:
                 item = table.item(i, col)
                 if item:
@@ -587,7 +587,6 @@ class SummaryDialog(QDialog):
 
         layout.addWidget(table, 1)
 
-        # Close button
         close = QPushButton("Close")
         close.setObjectName("primary")
         close.setCursor(Qt.PointingHandCursor)
@@ -653,22 +652,18 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(420, 520)
         self.setAcceptDrops(True)
 
-        # State
         self.rows: list[FileRow] = []
         self.preset_key = "standard"
         self.out_dir = None
         self.running = False
         self._results = []
 
-        # Settings
         self.settings = QSettings("PDFCompress", "PDFCompress")
         self._load_settings()
 
-        # Theme
         saved_theme = self.settings.value("theme", "light")
         self.theme = LIGHT if saved_theme == "light" else DARK
 
-        # Signals
         self.signals = Signals()
         self.signals.progress.connect(self._on_progress)
         self.signals.file_done.connect(self._on_file_done)
@@ -728,7 +723,6 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(28, 24, 28, 20)
         root.setSpacing(0)
-        M = 28
 
         # ── Header row ──
         hdr = QHBoxLayout()
@@ -928,7 +922,6 @@ class MainWindow(QMainWindow):
         t = self.theme
         QApplication.instance().setStyleSheet(build_stylesheet(t))
 
-        # Update custom widgets that don't pick up QSS automatically
         self.theme_btn.setText("☀" if t.name == "dark" else "☾")
         self.title_lbl.setStyleSheet(f"color: {t.text};")
         self.subtitle_lbl.setStyleSheet(f"color: {t.text3};")
@@ -964,15 +957,30 @@ class MainWindow(QMainWindow):
         if not n:
             self.summary_lbl.setText("")
             return
-        total = sum(r.analysis.file_size for r in self.rows)
+
+        # Filter out encrypted files from estimates
+        compressible = [r for r in self.rows if not r.analysis.is_encrypted]
+        encrypted = n - len(compressible)
+
+        if not compressible:
+            self.summary_lbl.setText(
+                f"{n} file{'s' if n != 1 else ''}  ·  all password-protected"
+            )
+            return
+
+        total = sum(r.analysis.file_size for r in compressible)
         preset = PRESETS[self.preset_key]
-        est = sum(r.analysis.estimate_output(preset) for r in self.rows)
+        est = sum(r.analysis.estimate_output(preset) for r in compressible)
         pct = (1 - est / total) * 100 if total > 0 else 0
-        total_img = sum(r.analysis.image_count for r in self.rows)
-        self.summary_lbl.setText(
-            f"{n} file{'s' if n != 1 else ''}  ·  {fmt_size(total)}  →  "
-            f"~{fmt_size(est)}  ·  ~{pct:.0f}% est. saving  ·  {total_img} images"
-        )
+        total_img = sum(r.analysis.image_count for r in compressible)
+
+        parts = [f"{n} file{'s' if n != 1 else ''}"]
+        if encrypted:
+            parts.append(f"{encrypted} locked")
+        parts.append(f"{fmt_size(total)}  →  ~{fmt_size(est)}")
+        parts.append(f"~{pct:.0f}% est. saving")
+        parts.append(f"{total_img} images")
+        self.summary_lbl.setText("  ·  ".join(parts))
 
     # ── Files ────────────────────────────────────────────────────
 
@@ -1063,7 +1071,8 @@ class MainWindow(QMainWindow):
 
     def _update_q_detail(self):
         p = PRESETS[self.preset_key]
-        self.q_detail.setText(f"{p.target_dpi} DPI  ·  JPEG {p.jpeg_quality}%")
+        meta = "  ·  strips metadata" if p.strip_metadata else ""
+        self.q_detail.setText(f"{p.target_dpi} DPI  ·  JPEG {p.jpeg_quality}%{meta}")
 
     # ── About ────────────────────────────────────────────────────
 
@@ -1098,6 +1107,12 @@ class MainWindow(QMainWindow):
         t0 = time.time()
 
         for i, row in enumerate(self.rows):
+            # Skip encrypted files in the worker
+            if row.analysis.is_encrypted:
+                self.signals.file_done.emit(
+                    i, EncryptedPDFError("Password-protected — skipped"))
+                continue
+
             if self.out_dir:
                 nm, ext = os.path.splitext(os.path.basename(row.filepath))
                 out = os.path.join(self.out_dir, f"{nm}_compressed{ext}")
@@ -1134,7 +1149,10 @@ class MainWindow(QMainWindow):
 
     def _on_file_done(self, fi, result):
         row = self.rows[fi]
-        if isinstance(result, Exception):
+        if isinstance(result, EncryptedPDFError):
+            row.set_error(str(result))
+            self._results.append(result)
+        elif isinstance(result, Exception):
             row.set_error(str(result))
             self._results.append(result)
         else:
@@ -1155,22 +1173,24 @@ class MainWindow(QMainWindow):
         results = [r for r in self._results if isinstance(r, Result)]
         n_ok = sum(1 for r in results if not r.skipped)
         n_skip = sum(1 for r in results if r.skipped)
+        n_err = sum(1 for r in self._results if isinstance(r, Exception))
         total_saved = sum(r.saved_bytes for r in results)
         total_orig = sum(r.original_size for r in results)
 
         parts = []
         if n_ok:   parts.append(f"{n_ok} compressed")
         if n_skip: parts.append(f"{n_skip} already optimized")
+        if n_err:  parts.append(f"{n_err} failed")
         if total_saved > 0 and total_orig > 0:
             parts.append(f"saved {fmt_size(total_saved)} ({total_saved/total_orig*100:.0f}%)")
         parts.append(f"{elapsed:.1f}s")
 
-        self.result_lbl.setStyleSheet(f"color: {t.green if n_ok else t.amber};")
+        color = t.green if n_ok else (t.amber if n_skip else t.red)
+        self.result_lbl.setStyleSheet(f"color: {color};")
         self.result_lbl.setText("  ·  ".join(parts))
         self.summary_lbl.setText("  ·  ".join(parts))
         self.btn_open.setVisible(True)
 
-        # Show summary dialog for batch (2+ files)
         if len(results) >= 2:
             QTimer.singleShot(300, lambda: SummaryDialog(
                 results, elapsed, self.theme, self
