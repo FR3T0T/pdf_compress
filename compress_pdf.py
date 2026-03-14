@@ -8,6 +8,8 @@ Usage:
     python compress_pdf.py input.pdf -p standard
     python compress_pdf.py *.pdf -o compressed/
     python compress_pdf.py input.pdf --linearize
+    python compress_pdf.py input.pdf --gs
+    python compress_pdf.py input.pdf --backup
 
 Presets:
     screen    —  72 DPI, JPEG 35  (smallest file, strips metadata)
@@ -23,7 +25,8 @@ import sys
 
 from engine import (
     PRESETS, PRESET_ORDER, compress_pdf, fmt_size,
-    EncryptedPDFError,
+    EncryptedPDFError, FileTooLargeError, InvalidPDFError,
+    setup_file_logging, validate_pdf_magic,
 )
 
 
@@ -60,10 +63,26 @@ def main():
         help="Produce web-optimized (linearized) PDF",
     )
     parser.add_argument(
+        "--gs", action="store_true",
+        help="Use Ghostscript for additional optimization (font subsetting)",
+    )
+    parser.add_argument(
+        "--backup", action="store_true",
+        help="Create .backup copy before overwriting",
+    )
+    parser.add_argument(
         "--no-pause", action="store_true",
         help="Don't wait for Enter at exit",
     )
+    parser.add_argument(
+        "--log", action="store_true",
+        help="Enable file logging for diagnostics",
+    )
     args = parser.parse_args()
+
+    if args.log:
+        log_file = setup_file_logging()
+        print(f"  Logging to: {log_file}")
 
     preset = PRESETS[args.preset]
 
@@ -78,6 +97,8 @@ def main():
     print(f"  JPEG    : {preset.jpeg_quality}%")
     if args.linearize:
         print(f"  Output  : linearized (web-optimized)")
+    if args.gs:
+        print(f"  GS      : enabled (font subsetting)")
     print(f"  {'─' * 42}")
 
     total_saved = 0
@@ -87,6 +108,13 @@ def main():
     for path in args.inputs:
         if not os.path.isfile(path):
             print(f"\n  SKIP: {path} — not found")
+            continue
+
+        # Validate PDF magic bytes
+        if not validate_pdf_magic(path):
+            n_err += 1
+            print(f"\n  {os.path.basename(path)}")
+            print(f"    SKIPPED: Not a valid PDF file (missing %PDF- header)")
             continue
 
         if args.output:
@@ -106,9 +134,16 @@ def main():
                 path, out, preset_key=args.preset,
                 on_progress=progress_bar,
                 linearize=args.linearize,
+                use_ghostscript=args.gs,
+                backup_on_overwrite=args.backup,
             )
             total_orig += result.original_size
             s = result.stats
+
+            if result.pdfa_conformance:
+                print(f"    Detected: {result.pdfa_conformance}")
+                if result.pdfa_warning:
+                    print(f"    WARNING: metadata stripping breaks {result.pdfa_conformance} compliance")
 
             if result.skipped:
                 n_skip += 1
@@ -119,6 +154,8 @@ def main():
                 print(f"    {fmt_size(result.original_size)} → {fmt_size(result.compressed_size)}"
                       f"  ({result.saved_pct:.1f}% smaller)")
                 print(f"    Saved to: {result.output_path}")
+                if result.backup_path:
+                    print(f"    Backup: {result.backup_path}")
 
             if s.images_total > 0:
                 parts = []
@@ -129,10 +166,22 @@ def main():
                 if s.images_skipped_bomb:    parts.append(f"{s.images_skipped_bomb} skipped (too large)")
                 if s.images_with_mask_composited:
                     parts.append(f"{s.images_with_mask_composited} transparency composited")
+                if s.images_kept_lossless:
+                    parts.append(f"{s.images_kept_lossless} kept lossless")
+                if s.images_converted_bw:
+                    parts.append(f"{s.images_converted_bw} converted B&W")
                 if parts:
                     print(f"    Images: {', '.join(parts)}")
 
         except EncryptedPDFError as e:
+            n_err += 1
+            print(f"    SKIPPED: {e}")
+
+        except InvalidPDFError as e:
+            n_err += 1
+            print(f"    SKIPPED: {e}")
+
+        except FileTooLargeError as e:
             n_err += 1
             print(f"    SKIPPED: {e}")
 

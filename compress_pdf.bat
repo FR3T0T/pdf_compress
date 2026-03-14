@@ -2,7 +2,7 @@
 :: PDF Compress — double-click to open, or drag PDFs onto this file.
 :: Uses pythonw (no console window). Falls back to python if needed.
 
-set SCRIPT=%~dp0app.py
+set "SCRIPT=%~dp0app.py"
 
 :: Try pythonw first (no console window)
 where pythonw >nul 2>&1
