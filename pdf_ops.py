@@ -9,6 +9,9 @@ from typing import Callable
 
 import math
 
+import re
+
+import fitz  # PyMuPDF
 import pikepdf
 
 log = logging.getLogger(__name__)
@@ -115,6 +118,61 @@ def merge_pdfs(
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  TOC / Bookmarks
+# ═══════════════════════════════════════════════════════════════════
+
+_UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def get_toc(input_path: str) -> list[dict]:
+    """Extract the table of contents (bookmarks/outlines) from a PDF.
+
+    Uses PyMuPDF's ``doc.get_toc()`` which returns
+    ``[[level, title, page_number], ...]`` (1-indexed pages).
+
+    Each entry is augmented with *end_page* — the last page that belongs
+    to that entry (computed from the next entry at the same or higher level,
+    or the document's last page).
+
+    Returns:
+        List of dicts ``{level, title, page, end_page}`` sorted by page.
+        Empty list if the PDF has no bookmarks.
+    """
+    doc = fitz.open(input_path)
+    raw_toc = doc.get_toc()  # [[level, title, page], ...]
+    num_pages = doc.page_count
+    doc.close()
+
+    if not raw_toc:
+        return []
+
+    entries: list[dict] = []
+    for i, (level, title, page) in enumerate(raw_toc):
+        # Find end page: next entry at same or higher (lower number) level
+        end_page = num_pages
+        for j in range(i + 1, len(raw_toc)):
+            if raw_toc[j][0] <= level:
+                end_page = raw_toc[j][2] - 1
+                break
+
+        entries.append({
+            "level": level,
+            "title": title.strip(),
+            "page": page,
+            "end_page": max(end_page, page),  # ensure at least 1 page
+        })
+
+    return entries
+
+
+def _sanitize_title(title: str) -> str:
+    """Sanitize a chapter title for use as a filename component."""
+    clean = _UNSAFE_FILENAME_RE.sub('_', title)
+    clean = clean.strip('. _')
+    return clean[:80] or 'untitled'
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Split
 # ═══════════════════════════════════════════════════════════════════
 
@@ -142,6 +200,7 @@ def split_pdf(
     mode: str = "all",
     ranges: str | None = None,
     every_n: int = 1,
+    chapters: list[dict] | None = None,
     name_template: str = "{name}_page_{start}",
     cancel: threading.Event | None = None,
 ) -> SplitResult:
@@ -150,20 +209,26 @@ def split_pdf(
     Args:
         input_path: Source PDF path.
         output_dir: Directory for output files.
-        mode: "all" (one page per file), "ranges" (custom ranges), "every_n".
+        mode: "all" | "ranges" | "every_n" | "chapters".
         ranges: Range string like "1-3, 5, 8-10" (for mode="ranges").
         every_n: Pages per output file (for mode="every_n").
-        name_template: Output naming template. Supports {name}, {start}, {end}.
+        chapters: List of {title, start_page, end_page} dicts (for mode="chapters").
+        name_template: Output naming template. Supports {name}, {start}, {end}, {title}.
         cancel: Threading event for cancellation.
 
     Returns:
         SplitResult with output file paths.
     """
+    if not output_dir:
+        output_dir = os.path.dirname(os.path.abspath(input_path))
     src = pikepdf.open(input_path)
     num_pages = len(src.pages)
     base_name = os.path.splitext(os.path.basename(input_path))[0]
 
     # Build page groups: list of (start, end) 1-indexed inclusive
+    # For chapters mode, also build a parallel titles list
+    chapter_titles: list[str] = []
+
     if mode == "all":
         groups = [(i, i) for i in range(1, num_pages + 1)]
     elif mode == "ranges":
@@ -177,6 +242,15 @@ def split_pdf(
         for start in range(1, num_pages + 1, every_n):
             end = min(start + every_n - 1, num_pages)
             groups.append((start, end))
+    elif mode == "chapters":
+        if not chapters:
+            raise ValueError("Chapters list required for 'chapters' mode")
+        groups = []
+        for ch in chapters:
+            s = int(ch["start_page"])
+            e = int(ch["end_page"])
+            groups.append((s, e))
+            chapter_titles.append(_sanitize_title(ch.get("title", "")))
     else:
         raise ValueError(f"Unknown split mode: {mode}")
 
@@ -184,12 +258,17 @@ def split_pdf(
     output_paths = []
     pages_per_output = []
 
-    for start, end in groups:
+    for idx, (start, end) in enumerate(groups):
         if cancel and cancel.is_set():
             src.close()
             raise InterruptedError("Split cancelled")
 
-        out_name = name_template.format(name=base_name, start=start, end=end) + ".pdf"
+        title = chapter_titles[idx] if idx < len(chapter_titles) else ""
+        out_name = name_template.format(
+            name=base_name, filename=base_name,  # {name} and {filename} both work
+            start=start, end=end, n=start,        # {start}/{end}/{n} all work
+            title=title,
+        ) + ".pdf"
         out_path = os.path.join(output_dir, out_name)
 
         dest = pikepdf.Pdf.new()

@@ -124,6 +124,38 @@ def invalid_file(tmp_path):
 
 
 @pytest.fixture
+def pdf_with_toc(tmp_path):
+    """A 10-page PDF with bookmarks (outlines) for chapter-aware splitting.
+
+    Bookmark structure:
+        Chapter 1 (pages 1-3)
+        Chapter 2 (pages 4-7)
+        Chapter 3 (pages 8-10)
+    """
+    path = str(tmp_path / "with_toc.pdf")
+    pdf = pikepdf.Pdf.new()
+
+    for _ in range(10):
+        page = pikepdf.Page(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Page"),
+            MediaBox=[0, 0, 612, 792],
+        ))
+        pdf.pages.append(page)
+
+    # Build outline (bookmarks) using pikepdf's outline helpers
+    with pdf.open_outline() as outline:
+        outline.root.extend([
+            pikepdf.OutlineItem("Chapter 1", 0),   # page index 0 = page 1
+            pikepdf.OutlineItem("Chapter 2", 3),   # page index 3 = page 4
+            pikepdf.OutlineItem("Chapter 3", 7),   # page index 7 = page 8
+        ])
+
+    pdf.save(path)
+    pdf.close()
+    return path
+
+
+@pytest.fixture
 def sample_image(tmp_path):
     """A small PNG image file on disk."""
     path = str(tmp_path / "test_image.png")

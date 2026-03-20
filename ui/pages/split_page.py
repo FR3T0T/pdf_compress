@@ -12,10 +12,11 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QFileDialog, QProgressBar, QLineEdit, QComboBox, QMessageBox,
+    QTreeWidget, QTreeWidgetItem,
 )
 
 from engine import fmt_size
-from pdf_ops import split_pdf, SplitResult
+from pdf_ops import get_toc, split_pdf, SplitResult
 from ..theme import Theme, FONT
 from ..widgets import DropZone
 from ..batch_helpers import (
@@ -47,6 +48,7 @@ class SplitPage(BasePage):
         self._file_size = 0
 
         self._split_start_time = 0.0
+        self._toc_entries: list[dict] = []
 
         self.signals = _SplitSignals()
         self.signals.done.connect(self._on_done)
@@ -111,7 +113,7 @@ class SplitPage(BasePage):
         mode_row.addWidget(mode_lbl)
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Every page", "Page ranges", "Every N pages"])
+        self.mode_combo.addItems(["Every page", "Page ranges", "Every N pages", "By chapters"])
         self.mode_combo.setFont(QFont(FONT, 9))
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         mode_row.addWidget(self.mode_combo, 1)
@@ -132,6 +134,19 @@ class SplitPage(BasePage):
 
         self.range_lbl.setVisible(False)
         self.range_input.setVisible(False)
+
+        # ── Chapter tree (shown when mode = By chapters) ──
+        self.chapter_tree = QTreeWidget()
+        self.chapter_tree.setHeaderLabels(["Chapter", "Pages"])
+        self.chapter_tree.setFont(QFont(FONT, 9))
+        self.chapter_tree.setVisible(False)
+        self.chapter_tree.setMaximumHeight(240)
+        root.addWidget(self.chapter_tree)
+
+        self.no_chapters_lbl = QLabel("No bookmarks found. Use page ranges instead.")
+        self.no_chapters_lbl.setFont(QFont(FONT, 9))
+        self.no_chapters_lbl.setVisible(False)
+        root.addWidget(self.no_chapters_lbl)
 
         # ── Output directory ──
         root.addSpacing(8)
@@ -229,8 +244,9 @@ class SplitPage(BasePage):
         self.result_lbl.setText("")
         self.btn_open.setVisible(False)
 
-        # Probe page count
+        # Probe page count and fetch TOC
         signals = self.signals
+        page = self
 
         def _probe():
             try:
@@ -241,6 +257,11 @@ class SplitPage(BasePage):
                 signals.info.emit(count)
             except Exception:
                 signals.info.emit(0)
+
+            try:
+                page._toc_entries = get_toc(path)
+            except Exception:
+                page._toc_entries = []
 
         threading.Thread(target=_probe, daemon=True).start()
 
@@ -270,6 +291,40 @@ class SplitPage(BasePage):
             self.range_lbl.setText("Pages per file:")
             self.range_input.setPlaceholderText("e.g. 5")
 
+        # Chapters mode
+        is_chapters = index == 3
+        if is_chapters:
+            self._populate_chapter_tree()
+        self.chapter_tree.setVisible(is_chapters and len(self._toc_entries) > 0)
+        self.no_chapters_lbl.setVisible(is_chapters and len(self._toc_entries) == 0)
+
+    def _populate_chapter_tree(self):
+        self.chapter_tree.clear()
+        for entry in self._toc_entries:
+            item = QTreeWidgetItem()
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.Checked)
+            item.setText(0, entry["title"])
+            page_range = f"{entry['page']}\u2013{entry['end_page']} ({entry['end_page'] - entry['page'] + 1}p)"
+            item.setText(1, page_range)
+            item.setData(0, Qt.UserRole, entry)
+            self.chapter_tree.addTopLevelItem(item)
+        self.chapter_tree.resizeColumnToContents(0)
+        self.chapter_tree.resizeColumnToContents(1)
+
+    def _get_selected_chapters(self) -> list[dict]:
+        selected = []
+        for i in range(self.chapter_tree.topLevelItemCount()):
+            item = self.chapter_tree.topLevelItem(i)
+            if item.checkState(0) == Qt.Checked:
+                entry = item.data(0, Qt.UserRole)
+                selected.append({
+                    "title": entry["title"],
+                    "start_page": entry["page"],
+                    "end_page": entry["end_page"],
+                })
+        return selected
+
     # ── Output ────────────────────────────────────────────────────
 
     def _pick_output(self):
@@ -297,9 +352,10 @@ class SplitPage(BasePage):
             return
 
         mode_idx = self.mode_combo.currentIndex()
-        mode = ["all", "ranges", "every_n"][mode_idx]
+        mode = ["all", "ranges", "every_n", "chapters"][mode_idx]
         ranges_str = None
         every_n = 1
+        chapters = None
 
         if mode == "ranges":
             ranges_str = self.range_input.text().strip()
@@ -313,6 +369,11 @@ class SplitPage(BasePage):
                     raise ValueError
             except ValueError:
                 QMessageBox.warning(self, "Input needed", "Enter a valid number of pages.")
+                return
+        elif mode == "chapters":
+            chapters = self._get_selected_chapters()
+            if not chapters:
+                QMessageBox.warning(self, "Input needed", "Select at least one chapter.")
                 return
 
         output_dir = self._output_dir or os.path.dirname(self._input_path)
@@ -330,11 +391,15 @@ class SplitPage(BasePage):
         cancel = self._cancel_event
         signals = self.signals
 
+        name_template = "{name}_{title}" if mode == "chapters" else "{name}_page_{start}"
+
         def _worker():
             try:
                 result = split_pdf(
                     path, output_dir,
                     mode=mode, ranges=ranges_str, every_n=every_n,
+                    chapters=chapters,
+                    name_template=name_template,
                     cancel=cancel,
                 )
                 signals.done.emit(result)

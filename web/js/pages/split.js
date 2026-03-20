@@ -2,9 +2,9 @@
    PDF Toolkit - Split Page (Premium)
 
    Features: single-file split with multiple modes (all pages, page ranges,
-   every N pages), file analysis with page count display, output folder +
-   naming template, settings persistence, keyboard shortcuts, progress with
-   cancellation, results summary.
+   every N pages, by chapters/bookmarks), file analysis with page count
+   display, output folder + naming template, settings persistence, keyboard
+   shortcuts, progress with cancellation, results summary.
    ========================================================================== */
 
 "use strict";
@@ -33,6 +33,17 @@ function SplitPage() {
     let _everyNRow = null;
     let _everyNInput = null;
 
+    // DOM refs — chapters
+    let _chaptersRow = null;
+    let _chaptersList = null;
+    let _noChaptersMsg = null;
+    let _selectAllBtn = null;
+    let _deselectAllBtn = null;
+
+    // Chapter state
+    let _tocEntries = [];       // raw TOC from backend
+    let _tocFetched = false;    // whether we've already fetched TOC for current file
+
     // DOM refs — output
     let _outputDirInput = null;
     let _nameTemplateInput = null;
@@ -57,7 +68,7 @@ function SplitPage() {
         // ── Page header ──
         var header = createPageHeader({
             title: 'Split PDF',
-            subtitle: 'Split a PDF into individual pages or page ranges',
+            subtitle: 'Split a PDF into individual pages, page ranges, or chapters',
         });
         _el.appendChild(header.el);
 
@@ -69,6 +80,8 @@ function SplitPage() {
         });
         _dropZone.onFilesChanged(function (files) {
             _files = files;
+            _tocFetched = false;
+            _tocEntries = [];
             _updateUI();
             if (files.length > 0) _analyzeFile(files[0]);
         });
@@ -139,9 +152,10 @@ function SplitPage() {
         _modeSelect.style.width = '100%';
 
         var modes = [
-            { value: 'all',     text: 'All pages (one file per page)' },
-            { value: 'ranges',  text: 'Custom page ranges' },
-            { value: 'every_n', text: 'Every N pages' },
+            { value: 'all',      text: 'All pages (one file per page)' },
+            { value: 'ranges',   text: 'Custom page ranges' },
+            { value: 'every_n',  text: 'Every N pages' },
+            { value: 'chapters', text: 'By chapters (from bookmarks)' },
         ];
         for (var mi = 0; mi < modes.length; mi++) {
             var opt = document.createElement('option');
@@ -189,6 +203,40 @@ function SplitPage() {
 
         _everyNRow.appendChild(everyNGroup);
         optCard.appendChild(_everyNRow);
+
+        // Chapters list (shown when mode=chapters)
+        _chaptersRow = document.createElement('div');
+        _chaptersRow.style.cssText = 'margin-top:var(--space-3); display:none;';
+
+        // Select all / Deselect all buttons
+        var chBtnRow = document.createElement('div');
+        chBtnRow.style.cssText = 'display:flex; gap:var(--space-2); margin-bottom:var(--space-2);';
+
+        _selectAllBtn = document.createElement('button');
+        _selectAllBtn.className = 'btn btn-secondary btn-sm';
+        _selectAllBtn.textContent = 'Select all';
+        _selectAllBtn.addEventListener('click', function () { _toggleAllChapters(true); });
+        chBtnRow.appendChild(_selectAllBtn);
+
+        _deselectAllBtn = document.createElement('button');
+        _deselectAllBtn.className = 'btn btn-secondary btn-sm';
+        _deselectAllBtn.textContent = 'Deselect all';
+        _deselectAllBtn.addEventListener('click', function () { _toggleAllChapters(false); });
+        chBtnRow.appendChild(_deselectAllBtn);
+
+        _chaptersRow.appendChild(chBtnRow);
+
+        _chaptersList = document.createElement('div');
+        _chaptersList.style.cssText = 'max-height:320px; overflow-y:auto; border:1px solid var(--color-border); border-radius:var(--radius-md); padding:var(--space-2);';
+        _chaptersRow.appendChild(_chaptersList);
+
+        _noChaptersMsg = document.createElement('div');
+        _noChaptersMsg.style.cssText = 'padding:var(--space-4); text-align:center; color:var(--color-text-3); font-size:var(--font-size-sm);';
+        _noChaptersMsg.textContent = 'No bookmarks found in this PDF. Use "Custom page ranges" mode instead.';
+        _noChaptersMsg.style.display = 'none';
+        _chaptersRow.appendChild(_noChaptersMsg);
+
+        optCard.appendChild(_chaptersRow);
 
         _el.appendChild(optCard);
 
@@ -247,7 +295,7 @@ function SplitPage() {
 
         var tmplHelp = document.createElement('div');
         tmplHelp.className = 'form-help';
-        tmplHelp.textContent = 'Use {filename} for original name, {n} for page number.';
+        tmplHelp.textContent = 'Use {filename} for original name, {n} for page number, {title} for chapter name.';
         tmplGroup.appendChild(tmplHelp);
 
         outputCard.appendChild(tmplGroup);
@@ -309,6 +357,13 @@ function SplitPage() {
         var mode = _modeSelect.value;
         _rangeRow.style.display = mode === 'ranges' ? '' : 'none';
         _everyNRow.style.display = mode === 'every_n' ? '' : 'none';
+        _chaptersRow.style.display = mode === 'chapters' ? '' : 'none';
+
+        // Auto-fetch TOC when switching to chapters mode
+        if (mode === 'chapters' && _files.length > 0 && !_tocFetched) {
+            _fetchToc(_files[0].path);
+        }
+
         _saveSettings();
     }
 
@@ -341,6 +396,99 @@ function SplitPage() {
         } catch (e) {
             console.warn('[SplitPage] analyzeFile failed:', e);
         }
+
+        // Pre-fetch TOC for this file (useful if user switches to chapters mode)
+        _fetchToc(file.path);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  Chapter / TOC helpers
+    // ══════════════════════════════════════════════════════════════
+
+    async function _fetchToc(filePath) {
+        try {
+            _tocEntries = await BridgeAPI.getToc(filePath);
+            _tocFetched = true;
+            _renderChaptersList();
+        } catch (e) {
+            console.warn('[SplitPage] getToc failed:', e);
+            _tocEntries = [];
+            _tocFetched = true;
+            _renderChaptersList();
+        }
+    }
+
+    function _renderChaptersList() {
+        _chaptersList.innerHTML = '';
+
+        if (!_tocEntries || _tocEntries.length === 0) {
+            _chaptersList.style.display = 'none';
+            _selectAllBtn.style.display = 'none';
+            _deselectAllBtn.style.display = 'none';
+            _noChaptersMsg.style.display = '';
+            return;
+        }
+
+        _chaptersList.style.display = '';
+        _selectAllBtn.style.display = '';
+        _deselectAllBtn.style.display = '';
+        _noChaptersMsg.style.display = 'none';
+
+        for (var i = 0; i < _tocEntries.length; i++) {
+            var entry = _tocEntries[i];
+            var row = document.createElement('label');
+            var indent = (entry.level - 1) * 20;
+            row.style.cssText = 'display:flex; align-items:center; gap:var(--space-2); padding:6px 8px; cursor:pointer; border-radius:var(--radius-sm); transition:background 0.15s;'
+                + 'padding-left:' + (8 + indent) + 'px;';
+            row.addEventListener('mouseenter', function () { this.style.background = 'var(--color-bg-hover, rgba(128,128,128,0.08))'; });
+            row.addEventListener('mouseleave', function () { this.style.background = ''; });
+
+            var cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = true;
+            cb.dataset.tocIndex = i;
+            cb.style.cssText = 'flex-shrink:0; width:16px; height:16px; cursor:pointer;';
+            row.appendChild(cb);
+
+            var titleSpan = document.createElement('span');
+            titleSpan.style.cssText = 'flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;'
+                + (entry.level === 1 ? ' font-weight:var(--font-weight-semibold); color:var(--color-text);' : ' color:var(--color-text-2); font-size:var(--font-size-sm);');
+            titleSpan.textContent = entry.title;
+            titleSpan.title = entry.title;
+            row.appendChild(titleSpan);
+
+            var pagesBadge = document.createElement('span');
+            var pageCount = entry.end_page - entry.page + 1;
+            pagesBadge.style.cssText = 'flex-shrink:0; font-size:var(--font-size-xs); color:var(--color-text-3); font-variant-numeric:tabular-nums; white-space:nowrap;';
+            pagesBadge.textContent = 'pp. ' + entry.page + '\u2013' + entry.end_page + ' (' + pageCount + ')';
+            row.appendChild(pagesBadge);
+
+            _chaptersList.appendChild(row);
+        }
+    }
+
+    function _toggleAllChapters(checked) {
+        var checkboxes = _chaptersList.querySelectorAll('input[type="checkbox"]');
+        for (var i = 0; i < checkboxes.length; i++) {
+            checkboxes[i].checked = checked;
+        }
+    }
+
+    function _getSelectedChapters() {
+        var selected = [];
+        var checkboxes = _chaptersList.querySelectorAll('input[type="checkbox"]');
+        for (var i = 0; i < checkboxes.length; i++) {
+            if (checkboxes[i].checked) {
+                var idx = parseInt(checkboxes[i].dataset.tocIndex, 10);
+                var entry = _tocEntries[idx];
+                selected.push({
+                    title: entry.title,
+                    start_page: entry.page,
+                    end_page: entry.end_page,
+                });
+            }
+        }
+        return selected;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -411,6 +559,18 @@ function SplitPage() {
             params.ranges = ranges;
         } else if (mode === 'every_n') {
             params.every_n = parseInt(_everyNInput.value, 10) || 1;
+        } else if (mode === 'chapters') {
+            var chapters = _getSelectedChapters();
+            if (chapters.length === 0) {
+                Toast.warning('Please select at least one chapter.');
+                return;
+            }
+            params.chapters = chapters;
+            // Override name template for chapters if user hasn't customized it
+            var tmpl = _nameTemplateInput.value;
+            if (!tmpl || tmpl === '{filename}_page_{n}' || tmpl === '{name}_page_{start}') {
+                params.name_template = '{filename}_{title}';
+            }
         }
 
         _busy = true;
@@ -446,11 +606,25 @@ function SplitPage() {
 
             if (data.success) {
                 var res = data.results || {};
-                Toast.success('PDF split successfully!');
+                var paths = res.output_paths || [];
+                var pageCounts = res.pages_per_output || [];
+                var outputDir = '';
+                if (paths.length > 0) {
+                    outputDir = BridgeAPI.dirname(paths[0]);
+                }
+                // Map path strings to result objects for the results panel
+                var fileList = paths.map(function (p, i) {
+                    return {
+                        name: BridgeAPI.basename(p),
+                        path: p,
+                        pages: pageCounts[i] || 0,
+                    };
+                });
+                Toast.success('Split into ' + fileList.length + ' file' + (fileList.length !== 1 ? 's' : '') + '!');
                 _results.show({
-                    files: res.files || [],
+                    files: fileList,
                     totalTime: res.elapsed || 0,
-                    outputDir: res.output_dir || _outputDirInput.value,
+                    outputDir: outputDir || _outputDirInput.value,
                 });
             } else {
                 Toast.error(data.message || 'Split failed.');

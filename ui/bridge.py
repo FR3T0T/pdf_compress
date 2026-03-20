@@ -71,6 +71,7 @@ from pdf_ops import (
     read_metadata,
     redact_text,
     repair_pdf,
+    get_toc,
     split_pdf,
     unlock_pdf,
     write_metadata,
@@ -485,6 +486,16 @@ class Bridge(QObject):
             return json.dumps({"success": False, "error": str(exc)},
                               ensure_ascii=False)
 
+    @Slot(str, result=str)
+    def getToc(self, path: str) -> str:
+        """Extract PDF table of contents / bookmarks. Returns JSON list."""
+        try:
+            entries = get_toc(path)
+            return json.dumps(entries, ensure_ascii=False)
+        except Exception as exc:
+            log.warning("getToc failed for %s: %s", path, exc)
+            return json.dumps([])
+
     @Slot(result=str)
     def getToolRegistry(self) -> str:
         """Return JSON tool definitions for the JS side."""
@@ -633,13 +644,17 @@ class Bridge(QObject):
         tool_key = p.get("toolKey", "split")
         cancel = self._make_cancel_event(tool_key)
 
+        input_path = p["inputPath"]
+        output_dir = p.get("outputDir") or os.path.dirname(os.path.abspath(input_path))
+
         def _work():
             return split_pdf(
-                input_path=p["inputPath"],
-                output_dir=p["outputDir"],
+                input_path=input_path,
+                output_dir=output_dir,
                 mode=p.get("mode", "all"),
                 ranges=p.get("ranges"),
                 every_n=p.get("everyN", 1),
+                chapters=p.get("chapters"),
                 name_template=p.get("nameTemplate", "{name}_page_{start}"),
                 cancel=cancel,
             )

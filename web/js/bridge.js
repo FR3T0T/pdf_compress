@@ -87,6 +87,16 @@ const BridgeAPI = {
     },
 
     /**
+     * Extract the table of contents (bookmarks/outlines) from a PDF.
+     * @param {string} path
+     * @returns {Promise<Object[]>}  Array of {level, title, page, end_page}
+     */
+    async getToc(path) {
+        const json = await App.bridge.getToc(path);
+        return JSON.parse(json);
+    },
+
+    /**
      * Check if a file is an .epdf encrypted container and get its metadata.
      * @param {string} path
      * @returns {Promise<Object>}  { isEpdf, cipher?, kdf?, originalFilename?, created? }
