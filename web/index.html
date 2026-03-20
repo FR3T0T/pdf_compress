@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Toolkit</title>
+
+    <!-- CSS Design System -->
+    <link rel="stylesheet" href="css/variables.css">
+    <link rel="stylesheet" href="css/base.css">
+    <link rel="stylesheet" href="css/layout.css">
+    <link rel="stylesheet" href="css/components.css">
+    <link rel="stylesheet" href="css/pages.css">
+    <link rel="stylesheet" href="css/animations.css">
+</head>
+<body>
+    <!-- App Shell -->
+    <div id="app" class="app">
+        <aside id="sidebar" class="sidebar">
+            <!-- Populated by app.js renderSidebar() -->
+        </aside>
+        <main id="main" class="main-content">
+            <div id="page-content" class="page-container">
+                <!-- Pages rendered here by router -->
+                <div class="page-loading">
+                    <div class="skeleton skeleton--card"></div>
+                    <div class="skeleton skeleton--text" style="width:60%"></div>
+                    <div class="skeleton skeleton--text" style="width:40%"></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Toast container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- QWebChannel bridge (built-in Qt resource) -->
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
+    <!-- App JavaScript (load order matters - no ES6 modules on file://) -->
+    <script src="js/icons.js"></script>
+    <script src="js/components.js"></script>
+    <script src="js/router.js"></script>
+    <script src="js/bridge.js"></script>
+    <script src="js/app.js"></script>
+
+    <!-- Page modules -->
+    <script src="js/pages/home.js"></script>
+    <script src="js/pages/compress.js"></script>
+    <script src="js/pages/merge.js"></script>
+    <script src="js/pages/split.js"></script>
+    <script src="js/pages/rotate.js"></script>
+    <script src="js/pages/protect.js"></script>
+    <script src="js/pages/unlock.js"></script>
+    <script src="js/pages/redact.js"></script>
+    <script src="js/pages/crop.js"></script>
+    <script src="js/pages/flatten.js"></script>
+    <script src="js/pages/nup.js"></script>
+    <script src="js/pages/watermark.js"></script>
+    <script src="js/pages/page-numbers.js"></script>
+    <script src="js/pages/metadata.js"></script>
+    <script src="js/pages/extract-images.js"></script>
+    <script src="js/pages/extract-text.js"></script>
+    <script src="js/pages/pdf-to-images.js"></script>
+    <script src="js/pages/images-to-pdf.js"></script>
+    <script src="js/pages/pdf-to-word.js"></script>
+    <script src="js/pages/repair.js"></script>
+    <script src="js/pages/compare.js"></script>
+</body>
+</html>

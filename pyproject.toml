@@ -1,0 +1,28 @@
+[project]
+name = "pdf-toolkit"
+version = "4.0.1"
+description = "Fully offline PDF toolkit with 20 professional tools"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "FR3T0T"}]
+
+dependencies = [
+    "pikepdf>=8.0.0",
+    "Pillow>=10.0.0",
+    "PySide6>=6.5.0",
+    "PyMuPDF>=1.23.0",
+    "argon2-cffi>=23.1.0",
+    "pycryptodome>=3.19.0",
+    "cryptography>=41.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+extras = ["numpy>=1.24.0", "python-docx>=0.8.11"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests that take a while (e.g. full compression)",
+    "integration: marks tests requiring real PDF I/O",
+]

@@ -27,8 +27,10 @@ DPI-aware image recompression with:
 """
 
 import ctypes
+import hashlib
 import io
 import logging
+import logging.handlers
 import math
 import os
 import platform
@@ -96,8 +98,6 @@ def setup_file_logging(log_dir: Optional[str] = None) -> str:
     return log_file
 
 
-import logging.handlers  # deferred to avoid circular at top
-
 # ── Decompression bomb protection ────────────────────────────────
 # PIL default is ~178M pixels. We enforce our own, tighter limit
 # to prevent OOM on malicious files.  200M pixels ≈ ~600 MB for RGB.
@@ -140,7 +140,12 @@ def _sanitize_path_for_subprocess(path: str) -> str:
     """
     Ensure a path is safe for use as a subprocess argument.
     Converts to absolute path and validates it doesn't start with '-'.
+    Rejects null bytes and other control characters.
     """
+    if "\x00" in path:
+        raise ValueError("Path contains null byte")
+    if any(ord(c) < 32 and c not in ('\n', '\r', '\t') for c in path):
+        raise ValueError("Path contains control characters")
     path = os.path.abspath(path)
     basename = os.path.basename(path)
     if basename.startswith("-"):
@@ -1333,6 +1338,9 @@ def compress_with_ghostscript(
         safe_input,
     ]
 
+    # Maximum wall-clock time for the Ghostscript process (5 minutes).
+    gs_timeout = 300
+
     try:
         _check_cancel(cancel)
 
@@ -1342,16 +1350,23 @@ def compress_with_ghostscript(
             stderr=subprocess.PIPE,
         )
 
-        # Poll for completion, checking cancellation
+        # Poll for completion, checking cancellation and enforcing timeout
+        elapsed = 0.0
         while True:
             try:
                 retcode = proc.wait(timeout=2.0)
                 break
             except subprocess.TimeoutExpired:
+                elapsed += 2.0
                 if cancel is not None and cancel.is_set():
                     proc.kill()
                     proc.wait()
                     raise CancelledError("Compression cancelled during Ghostscript pass")
+                if elapsed >= gs_timeout:
+                    proc.kill()
+                    proc.wait()
+                    log.warning("Ghostscript timed out after %d seconds", int(elapsed))
+                    return None
 
         if retcode != 0:
             stderr_out = ""
@@ -1647,7 +1662,6 @@ def _merge_duplicate_fonts(pdf: pikepdf.Pdf) -> int:
                         continue
                     try:
                         font_bytes = bytes(ff.read_raw_bytes())
-                        import hashlib
                         font_hash = hashlib.sha256(font_bytes).digest()
 
                         if font_hash in font_data_map:

@@ -1,0 +1,471 @@
+/* ==========================================================================
+   PDF Toolkit - Layout
+   App shell: sidebar navigation + main content area with transitions.
+   ========================================================================== */
+
+/* --- App Shell --- */
+
+.app {
+  display: flex;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background-color: var(--color-bg);
+}
+
+
+/* ==========================================================================
+   Sidebar
+   ========================================================================== */
+
+.sidebar {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: var(--sidebar-width-collapsed);
+  min-width: var(--sidebar-width-collapsed);
+  height: 100vh;
+  background-color: var(--color-sidebar-bg);
+  border-right: 1px solid var(--color-border);
+  transition: width var(--transition-slow), min-width var(--transition-slow);
+  overflow: hidden;
+  z-index: var(--z-sticky);
+  flex-shrink: 0;
+}
+
+.sidebar.expanded {
+  width: var(--sidebar-width-expanded);
+  min-width: var(--sidebar-width-expanded);
+}
+
+/* Subtle inner shadow on the right edge */
+.sidebar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 1px;
+  height: 100%;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    var(--color-shadow) 20%,
+    var(--color-shadow) 80%,
+    transparent
+  );
+  pointer-events: none;
+}
+
+
+/* --- Sidebar Header / Brand --- */
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  height: var(--header-height);
+  padding: 0 var(--space-4);
+  gap: var(--space-3);
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.sidebar-logo {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-md);
+  background: linear-gradient(135deg, var(--color-accent), var(--color-accent-hover));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: #fff;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-bold);
+  box-shadow: var(--shadow-accent);
+}
+
+.sidebar-brand {
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-text);
+  white-space: nowrap;
+  opacity: 0;
+  transform: translateX(-8px);
+  transition: opacity var(--transition-base), transform var(--transition-base);
+}
+
+.sidebar.expanded .sidebar-brand {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+
+/* --- Sidebar Toggle Button --- */
+
+.sidebar-toggle {
+  position: absolute;
+  top: 10px;
+  right: -13px;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-full);
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: var(--z-dropdown);
+  transition: all var(--transition-fast);
+  box-shadow: var(--shadow-sm);
+  color: var(--color-text-3);
+  font-size: var(--font-size-xs);
+}
+
+.sidebar-toggle:hover {
+  background-color: var(--color-accent-soft);
+  color: var(--color-accent);
+  border-color: var(--color-accent-muted);
+  box-shadow: var(--shadow-glow);
+}
+
+.sidebar-toggle svg,
+.sidebar-toggle .icon {
+  transition: transform var(--transition-base);
+}
+
+.sidebar.expanded .sidebar-toggle svg,
+.sidebar.expanded .sidebar-toggle .icon {
+  transform: rotate(180deg);
+}
+
+
+/* --- Sidebar Navigation --- */
+
+.sidebar-nav {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-2) var(--space-2);
+  gap: var(--space-0-5);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.sidebar-section-label {
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: var(--space-3) var(--space-2) var(--space-1);
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity var(--transition-base);
+}
+
+.sidebar.expanded .sidebar-section-label {
+  opacity: 1;
+}
+
+/* Collapsed: show a thin divider instead of label */
+.sidebar:not(.expanded) .sidebar-section-label {
+  height: 1px;
+  padding: 0;
+  margin: var(--space-2) var(--space-3);
+  background-color: var(--color-border);
+  overflow: hidden;
+  font-size: 0;
+}
+
+.sidebar-nav-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  height: 40px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--color-text-2);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+  text-decoration: none;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-medium);
+}
+
+.sidebar-nav-item .nav-icon {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: var(--font-size-lg);
+  transition: color var(--transition-fast);
+}
+
+.sidebar-nav-item .nav-label {
+  opacity: 0;
+  transform: translateX(-6px);
+  transition: opacity var(--transition-base), transform var(--transition-base);
+}
+
+.sidebar.expanded .sidebar-nav-item .nav-label {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.sidebar-nav-item:hover {
+  background-color: var(--color-surface-2);
+  color: var(--color-text);
+}
+
+.sidebar-nav-item.active {
+  background-color: var(--color-sidebar-active);
+  color: var(--color-accent);
+  font-weight: var(--font-weight-semibold);
+}
+
+.sidebar-nav-item.active .nav-icon {
+  color: var(--color-accent);
+}
+
+/* Active indicator bar */
+.sidebar-nav-item.active::before {
+  content: '';
+  position: absolute;
+  left: -2px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 20px;
+  background: linear-gradient(to bottom, var(--color-accent), var(--color-accent-hover));
+  border-radius: var(--radius-full);
+}
+
+/* Badge on nav item (e.g. count) */
+.sidebar-nav-item .nav-badge {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 var(--space-1-5);
+  background-color: var(--color-accent);
+  color: #fff;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  border-radius: var(--radius-full);
+  opacity: 0;
+  transition: opacity var(--transition-base);
+}
+
+.sidebar.expanded .sidebar-nav-item .nav-badge {
+  opacity: 1;
+}
+
+
+/* --- Sidebar Footer / Bottom Actions --- */
+
+.sidebar-footer {
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-2);
+  gap: var(--space-0-5);
+  border-top: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.sidebar-footer .sidebar-nav-item {
+  height: 36px;
+}
+
+
+/* --- Tooltip for collapsed sidebar --- */
+
+.sidebar:not(.expanded) .sidebar-nav-item {
+  position: relative;
+}
+
+.sidebar:not(.expanded) .sidebar-nav-item::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%) scale(0.92);
+  padding: var(--space-1) var(--space-2);
+  background-color: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-lg);
+  border: 1px solid var(--color-border);
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  z-index: var(--z-tooltip);
+  transition: opacity var(--transition-fast), transform var(--transition-fast);
+}
+
+.sidebar:not(.expanded) .sidebar-nav-item:hover::after {
+  opacity: 1;
+  transform: translateY(-50%) scale(1);
+}
+
+
+/* ==========================================================================
+   Main Content Area
+   ========================================================================== */
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.main-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: var(--header-height);
+  padding: 0 var(--content-padding);
+  border-bottom: 1px solid var(--color-border);
+  background-color: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  flex-shrink: 0;
+  z-index: var(--z-base);
+}
+
+.main-header-title {
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text);
+}
+
+.main-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.main-content {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--content-padding);
+}
+
+.main-content-inner {
+  width: 100%;
+  max-width: var(--content-max-width);
+  margin: 0 auto;
+}
+
+
+/* ==========================================================================
+   Page Transitions
+   ========================================================================== */
+
+.page {
+  animation: pageEnter var(--transition-slow) ease-out;
+}
+
+.page-enter {
+  animation: pageEnter var(--transition-slow) ease-out;
+}
+
+.page-exit {
+  animation: pageExit 200ms ease-in forwards;
+}
+
+@keyframes pageEnter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pageExit {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}
+
+
+/* ==========================================================================
+   Split / Panel Layouts
+   ========================================================================== */
+
+.split-layout {
+  display: flex;
+  gap: var(--content-padding);
+  height: 100%;
+}
+
+.split-layout .panel-left {
+  flex: 1;
+  min-width: 0;
+}
+
+.split-layout .panel-right {
+  width: 340px;
+  flex-shrink: 0;
+}
+
+/* Stack on narrow views (optional future use) */
+@media (max-width: 800px) {
+  .split-layout {
+    flex-direction: column;
+  }
+  .split-layout .panel-right {
+    width: 100%;
+  }
+}
+
+
+/* ==========================================================================
+   Status Bar (optional bottom bar)
+   ========================================================================== */
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 28px;
+  padding: 0 var(--space-4);
+  background-color: var(--color-surface);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-3);
+  flex-shrink: 0;
+}
+
+.status-bar-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.status-bar-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background-color: var(--color-green);
+}

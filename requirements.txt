@@ -1,4 +1,9 @@
 pikepdf>=8.0.0
 Pillow>=10.0.0
 PySide6>=6.5.0
-numpy>=1.24.0       # optional — improves photo/diagram detection accuracy
+PyMuPDF>=1.23.0      # PDF rendering, text extraction, page-to-image conversion
+numpy>=1.24.0        # optional — improves photo/diagram detection accuracy
+python-docx>=0.8.11  # optional — PDF to Word conversion
+argon2-cffi>=23.1.0  # Argon2id/Argon2d key derivation for enhanced encryption
+pycryptodome>=3.19.0 # AES-256-GCM cipher
+cryptography>=41.0.0 # ChaCha20-Poly1305, Camellia-256 ciphers

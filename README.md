@@ -1,8 +1,8 @@
-# PDF Compress
+# PDF Toolkit
 
-Fully offline PDF compressor with DPI-aware image recompression, smart format selection, font subsetting, duplicate font merging, content stream optimization, and PDF structure cleanup. No cloud services, no accounts, no tracking.
+Fully offline PDF toolkit with 20 professional tools — compress, merge, split, convert, protect, redact, watermark, and more. DPI-aware image recompression, AES-256 encryption, and PDF/A compliance. No cloud services, no accounts, no tracking.
 
-**v3.0.0**
+**v4.0.0**
 
 ---
 
@@ -12,23 +12,24 @@ Fully offline PDF compressor with DPI-aware image recompression, smart format se
 pip install -r requirements.txt
 ```
 
-Or manually:
+Or manually (core):
 
 ```bash
-pip install pikepdf pillow PySide6
+pip install pikepdf pillow PySide6 PyMuPDF argon2-cffi pycryptodome cryptography
 ```
 
 **Optional dependencies:**
 - [Ghostscript](https://www.ghostscript.com/releases/gsdnld.html) — font subsetting (auto-detected if on PATH)
 - [NumPy](https://numpy.org/) — improves photo vs diagram detection accuracy (`pip install numpy`)
+- [python-docx](https://python-docx.readthedocs.io/) — PDF to Word conversion (`pip install python-docx`)
 
 ---
 
 ## Usage
 
-**GUI** — double-click `compress_pdf.bat` or run `python app.py`. Drag and drop PDFs or folders onto the window.
+**GUI** — double-click `compress_pdf.bat` or run `python app.py`. Select any tool from the dashboard or sidebar.
 
-**CLI:**
+**CLI (compression only):**
 
 ```bash
 python compress_pdf.py document.pdf                   # default (standard preset)
@@ -42,19 +43,61 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 
 ---
 
+## Tools
+
+### Compress & Optimize
+- **Compress PDF** — reduce file size with smart image recompression
+
+### Merge & Split
+- **Merge PDFs** — combine multiple PDFs into one document
+- **Split PDF** — divide a PDF into separate files
+
+### Convert
+- **PDF to Images** — export pages as PNG or JPEG
+- **Images to PDF** — convert images into a PDF document
+- **PDF to Word** — extract text to a Word document
+
+### Security
+- **Protect PDF** — add password and set permissions (AES-256)
+- **Unlock PDF** — remove password protection
+- **Redact PDF** — permanently remove sensitive text
+- **Enhanced encryption** — custom `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 and Argon2id key derivation
+
+### Page Operations
+- **Rotate & Reorder** — rotate, reorder, or delete pages
+- **Crop Pages** — trim page margins
+- **Flatten PDF** — remove annotations and form fields
+- **N-up Layout** — arrange multiple pages per sheet
+
+### Content & Watermark
+- **Add Watermark** — overlay text or image watermark
+- **Add Page Numbers** — insert page numbering
+- **Edit Metadata** — view and edit PDF properties
+
+### Extract
+- **Extract Images** — pull all images from a PDF
+- **Extract Text** — export text content to a file
+
+### Repair & Analysis
+- **Repair PDF** — fix corrupted PDF files
+- **Compare PDFs** — find differences between two PDFs
+
+---
+
 ## Keyboard shortcuts (GUI)
 
 | Shortcut | Action |
 |----------|--------|
 | Ctrl+O | Add files |
 | Ctrl+Enter | Compress |
-| Escape | Clear files |
 | Ctrl+T | Toggle light/dark theme |
 | Ctrl+, | About |
+| Ctrl+Home | Dashboard |
+| Escape | Clear files |
 
 ---
 
-## Quality presets
+## Quality presets (compression)
 
 | Preset | Color DPI | Mono DPI | JPEG | Metadata | Use case |
 |--------|-----------|----------|------|----------|----------|
@@ -84,6 +127,8 @@ Each preset has per-image-type DPI targets (color, grayscale, monochrome). Your 
 - **Smart skip logic** — tiny images, already-compressed images, and images below the quality threshold are left untouched to avoid generation loss
 
 ### GUI features
+- **Dashboard home** — searchable grid of all 20 tools organized by category
+- **Sidebar navigation** — collapsible sidebar with quick access to all tools
 - **Light and dark themes** — toggle with Ctrl+T, preference remembered
 - **Space audit** — click the info button on any file to see a breakdown of images, fonts, and other content
 - **PDF/A detection** — badges on PDF/A-compliant files with warnings when metadata stripping would break compliance
@@ -147,7 +192,8 @@ Text and vector graphics are never modified.
 - **Decompression bomb protection** — images exceeding 200 million pixels are skipped
 - **Content stream size limit** — streams over 16 MB are skipped to prevent pathological parsing
 - **File size limit** — inputs over 2 GB are rejected
-- **Ghostscript sandboxing** — `-dSAFER` flag restricts file system access; `--` separator prevents argument injection; paths are sanitized
+- **Ghostscript sandboxing** — `-dSAFER` flag restricts file system access; `--` separator prevents argument injection; paths are sanitized; 5-minute process timeout
+- **Enhanced encryption** — `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 ciphers; Argon2id key derivation; AEAD authentication
 - **Encrypted PDF handling** — password-protected files prompt for credentials; passwords are cleared from memory after use
 - **Atomic file I/O** — temp file + `os.replace()`; original file is never corrupted on failure
 - **Backup system** — optional `.backup` copy with rotation before overwriting originals
@@ -163,10 +209,18 @@ Text and vector graphics are never modified.
 
 | File | Purpose |
 |------|---------|
-| `app.py` | PySide6 desktop GUI (v3.0.0) |
+| `app.py` | Application entry point and icon generation |
 | `engine.py` | Compression engine (shared by GUI and CLI) |
-| `compress_pdf.py` | Command-line interface |
+| `pdf_ops.py` | PDF operations (merge, split, protect, watermark, etc.) |
+| `epdf_crypto.py` | Enhanced encryption engine (.epdf format — ChaCha20, AES-256, Camellia) |
+| `compress_pdf.py` | Command-line interface for compression |
 | `compress_pdf.bat` | Windows launcher (no console window) |
+| `ui/` | GUI package — bridge, theme, dialogs |
+| `ui/web_shell.py` | Main window (QWebEngineView + QWebChannel) |
+| `ui/bridge.py` | Python-to-JavaScript communication bridge |
+| `ui/tool_registry.py` | Centralized tool definitions and categories |
+| `ui/pages/` | Individual tool pages (one per tool) |
+| `web/` | Frontend HTML, CSS, and JavaScript |
 | `requirements.txt` | Python dependencies |
 
 ---
