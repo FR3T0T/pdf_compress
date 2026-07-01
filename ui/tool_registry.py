@@ -70,6 +70,13 @@ def _tools() -> list[ToolDef]:
                 accepted_extensions=[".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]),
         ToolDef("pdf_to_word", "PDF to Word", "Extract text to a Word document",
                 "word", "convert", lambda s: PdfToWordPage(s)),
+        # Translate is rendered entirely by the web frontend
+        # (web/js/pages/translate.js); web shell never invokes page_factory.
+        ToolDef("translate", "Translate",
+                "Offline translation of PDF text and text in photos/scans",
+                "translate", "convert", lambda s: None,
+                accepted_extensions=[".pdf", ".png", ".jpg", ".jpeg",
+                                     ".tiff", ".bmp", ".gif"]),
 
         # ── Security ──
         ToolDef("protect", "Protect PDF", "Add password protection with standard or enhanced encryption",
@@ -109,6 +116,12 @@ def _tools() -> list[ToolDef]:
                 "repair", "repair", lambda s: RepairPage(s)),
         ToolDef("compare", "Compare PDFs", "Find differences between two PDFs",
                 "compare", "repair", lambda s: ComparePage(s)),
+        # Analyze Document is rendered entirely by the web frontend
+        # (web/js/pages/analyze.js); the web shell never invokes page_factory,
+        # so a no-op factory is correct here.
+        ToolDef("analyze", "Analyze Document",
+                "Privacy & security audit — find trackers, scripts, hidden data",
+                "shield", "repair", lambda s: None),
     ]
 
 

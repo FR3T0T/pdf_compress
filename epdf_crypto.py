@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════
 
 EPDF_MAGIC = b"EPDF\x00\x01\x00\x00"
-EPDF_VERSION = 1
+EPDF_VERSION = 2  # v2 authenticates the header as Associated Data (v1 still readable)
 
 CIPHERS = {
     "chacha20-poly1305": "ChaCha20-Poly1305 256-bit",
@@ -111,55 +111,60 @@ def _derive_key(password: str, salt: bytes, kdf: str = "argon2id",
 #  Cipher operations
 # ═══════════════════════════════════════════════════════════════════
 
-def _encrypt_chacha20(key: bytes, plaintext: bytes) -> tuple[bytes, bytes]:
-    """Encrypt with ChaCha20-Poly1305. Returns (nonce, ciphertext+tag)."""
+def _encrypt_chacha20(key: bytes, nonce: bytes, plaintext: bytes,
+                      aad: bytes | None) -> bytes:
+    """Encrypt with ChaCha20-Poly1305. Returns ciphertext+tag."""
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-    nonce = os.urandom(12)
-    cipher = ChaCha20Poly1305(key)
-    ct = cipher.encrypt(nonce, plaintext, None)
-    return nonce, ct
+    return ChaCha20Poly1305(key).encrypt(nonce, plaintext, aad)
 
 
-def _decrypt_chacha20(key: bytes, nonce: bytes, ciphertext: bytes) -> bytes:
+def _decrypt_chacha20(key: bytes, nonce: bytes, ciphertext: bytes,
+                      aad: bytes | None) -> bytes:
     """Decrypt with ChaCha20-Poly1305."""
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-    cipher = ChaCha20Poly1305(key)
     try:
-        return cipher.decrypt(nonce, ciphertext, None)
+        return ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
     except Exception as exc:
-        raise EPDFPasswordError("Decryption failed — wrong password or corrupted data") from exc
+        raise EPDFPasswordError("Decryption failed — wrong password or corrupted/tampered data") from exc
 
 
-def _encrypt_aes_gcm(key: bytes, plaintext: bytes) -> tuple[bytes, bytes]:
-    """Encrypt with AES-256-GCM. Returns (nonce, ciphertext+tag)."""
+def _encrypt_aes_gcm(key: bytes, nonce: bytes, plaintext: bytes,
+                     aad: bytes | None) -> bytes:
+    """Encrypt with AES-256-GCM. Returns ciphertext+tag (tag appended)."""
     from Crypto.Cipher import AES
-    nonce = os.urandom(12)
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    if aad:
+        cipher.update(aad)
     ct, tag = cipher.encrypt_and_digest(plaintext)
-    return nonce, ct + tag  # tag is 16 bytes appended
+    return ct + tag  # 16-byte tag appended
 
 
-def _decrypt_aes_gcm(key: bytes, nonce: bytes, ciphertext: bytes) -> bytes:
+def _decrypt_aes_gcm(key: bytes, nonce: bytes, ciphertext: bytes,
+                     aad: bytes | None) -> bytes:
     """Decrypt with AES-256-GCM."""
     from Crypto.Cipher import AES
     if len(ciphertext) < 16:
         raise EPDFDecryptionError("Ciphertext too short for AES-GCM")
     ct, tag = ciphertext[:-16], ciphertext[-16:]
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    if aad:
+        cipher.update(aad)
     try:
         return cipher.decrypt_and_verify(ct, tag)
     except Exception as exc:
-        raise EPDFPasswordError("Decryption failed — wrong password or corrupted data") from exc
+        raise EPDFPasswordError("Decryption failed — wrong password or corrupted/tampered data") from exc
 
 
-def _encrypt_camellia(key: bytes, plaintext: bytes) -> tuple[bytes, bytes]:
-    """Encrypt with Camellia-256-CBC + HMAC-SHA256. Returns (iv, ciphertext+hmac)."""
+def _encrypt_camellia(key: bytes, iv: bytes, plaintext: bytes,
+                      aad: bytes | None) -> bytes:
+    """Encrypt with Camellia-256-CBC + HMAC-SHA256 (encrypt-then-MAC).
+
+    The HMAC covers (aad + iv + ciphertext) so the header is authenticated
+    alongside the payload.  Returns ciphertext+hmac.
+    """
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.padding import PKCS7
 
-    iv = os.urandom(16)
-
-    # PKCS7 pad to 128-bit block size
     padder = PKCS7(128).padder()
     padded = padder.update(plaintext) + padder.finalize()
 
@@ -167,15 +172,14 @@ def _encrypt_camellia(key: bytes, plaintext: bytes) -> tuple[bytes, bytes]:
     encryptor = cipher.encryptor()
     ct = encryptor.update(padded) + encryptor.finalize()
 
-    # Encrypt-then-MAC: HMAC over (iv + ciphertext)
     auth_key = hashlib.sha256(key + b"camellia-auth").digest()
-    mac = hmac.new(auth_key, iv + ct, hashlib.sha256).digest()
+    mac = hmac.new(auth_key, (aad or b"") + iv + ct, hashlib.sha256).digest()
+    return ct + mac  # 32-byte HMAC appended
 
-    return iv, ct + mac  # 32-byte HMAC appended
 
-
-def _decrypt_camellia(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
-    """Decrypt with Camellia-256-CBC, verify HMAC-SHA256."""
+def _decrypt_camellia(key: bytes, iv: bytes, ciphertext: bytes,
+                      aad: bytes | None) -> bytes:
+    """Decrypt with Camellia-256-CBC, verify HMAC-SHA256 over header+iv+ct."""
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.padding import PKCS7
 
@@ -184,11 +188,10 @@ def _decrypt_camellia(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
 
     ct, received_mac = ciphertext[:-32], ciphertext[-32:]
 
-    # Verify MAC first (encrypt-then-MAC)
     auth_key = hashlib.sha256(key + b"camellia-auth").digest()
-    expected_mac = hmac.new(auth_key, iv + ct, hashlib.sha256).digest()
+    expected_mac = hmac.new(auth_key, (aad or b"") + iv + ct, hashlib.sha256).digest()
     if not hmac.compare_digest(received_mac, expected_mac):
-        raise EPDFPasswordError("Decryption failed — wrong password or corrupted data")
+        raise EPDFPasswordError("Decryption failed — wrong password or corrupted/tampered data")
 
     cipher = Cipher(algorithms.Camellia(key), modes.CBC(iv))
     decryptor = cipher.decryptor()
@@ -199,6 +202,14 @@ def _decrypt_camellia(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
         return unpadder.update(padded) + unpadder.finalize()
     except ValueError as exc:
         raise EPDFDecryptionError("Invalid padding after decryption") from exc
+
+
+#: Nonce/IV length per cipher
+_NONCE_LEN = {
+    "chacha20-poly1305": 12,
+    "aes-256-gcm":       12,
+    "camellia-256-cbc":  16,
+}
 
 
 # Dispatch tables
@@ -294,11 +305,13 @@ def epdf_encrypt(input_path: str, output_path: str, password: str,
     params = {**DEFAULT_KDF_PARAMS, **(kdf_params or {})}
     key = _derive_key(password, salt, kdf, params)
 
-    # Encrypt
-    encrypt_fn = _ENCRYPTORS[cipher]
-    nonce, encrypted = encrypt_fn(key, pdf_bytes)
+    # Generate nonce/IV up front so it can be recorded in the (authenticated)
+    # header before encryption.
+    nonce = os.urandom(_NONCE_LEN[cipher])
 
-    # Build metadata
+    # Build metadata + header FIRST, then bind the header as AAD so the
+    # cipher, KDF params, salt, and nonce cannot be tampered with or
+    # downgraded without failing authentication.
     metadata = {
         "version":           EPDF_VERSION,
         "cipher":            cipher,
@@ -311,6 +324,11 @@ def epdf_encrypt(input_path: str, output_path: str, password: str,
         "created":           datetime.now(timezone.utc).isoformat(),
     }
     meta_bytes = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
+    header = EPDF_MAGIC + struct.pack("<I", len(meta_bytes)) + meta_bytes
+
+    # Encrypt with the header as Associated Data
+    encrypt_fn = _ENCRYPTORS[cipher]
+    encrypted = encrypt_fn(key, nonce, pdf_bytes, header)
 
     # Atomic write
     out_dir = os.path.dirname(os.path.abspath(output_path))
@@ -318,9 +336,7 @@ def epdf_encrypt(input_path: str, output_path: str, password: str,
     os.close(fd)
     try:
         with open(tmp, "wb") as f:
-            f.write(EPDF_MAGIC)
-            f.write(struct.pack("<I", len(meta_bytes)))
-            f.write(meta_bytes)
+            f.write(header)
             f.write(encrypted)
         os.replace(tmp, output_path)
     except Exception:
@@ -358,19 +374,25 @@ def epdf_decrypt(input_path: str, output_path: str, password: str) -> dict:
 
     cipher = metadata.get("cipher")
     kdf = metadata.get("kdf", "argon2id")
+    version = int(metadata.get("version", 1))
 
     if cipher not in _DECRYPTORS:
         raise EPDFFormatError(f"Unsupported cipher in file: {cipher}")
 
-    # Read encrypted payload
+    # Read encrypted payload and reconstruct the exact header bytes (needed
+    # as Associated Data for v2 files).
     with open(input_path, "rb") as f:
         f.seek(8)  # skip magic
         meta_len = struct.unpack("<I", f.read(4))[0]
-        f.seek(12 + meta_len)  # skip header + metadata
+        f.seek(0)
+        header = f.read(12 + meta_len)   # magic + len + metadata, verbatim
         encrypted = f.read()
 
     if not encrypted:
         raise EPDFFormatError("Empty encrypted payload")
+
+    # v1 files were written without header authentication.
+    aad = header if version >= 2 else None
 
     # Derive key
     salt = b64decode(metadata["salt"])
@@ -380,7 +402,7 @@ def epdf_decrypt(input_path: str, output_path: str, password: str) -> dict:
 
     # Decrypt
     decrypt_fn = _DECRYPTORS[cipher]
-    pdf_bytes = decrypt_fn(key, nonce, encrypted)
+    pdf_bytes = decrypt_fn(key, nonce, encrypted, aad)
 
     # Verify it looks like a PDF
     if not pdf_bytes[:5] == b"%PDF-":

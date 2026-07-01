@@ -97,6 +97,72 @@ const BridgeAPI = {
     },
 
     /**
+     * Run the offline privacy/security audit on a PDF.
+     * @param {string} path
+     * @returns {Promise<Object>}  { success, report }
+     */
+    async analyzeDocument(path) {
+        const json = await App.bridge.analyzeDocument(path);
+        return JSON.parse(json);
+    },
+
+    /**
+     * Fetch the default sanitize option set.
+     * @returns {Promise<Object>}
+     */
+    async getSanitizeDefaults() {
+        const json = await App.bridge.getSanitizeDefaults('');
+        return JSON.parse(json);
+    },
+
+    /**
+     * Strip active/dangerous content from a PDF.
+     * @param {string} path
+     * @param {string} outputPath
+     * @param {Object} options
+     * @returns {Promise<Object>}  { success, removed, total_removed, output }
+     */
+    async sanitizeDocument(path, outputPath, options) {
+        const json = await App.bridge.sanitizeDocument(
+            path, outputPath, JSON.stringify(options || {}));
+        return JSON.parse(json);
+    },
+
+    /* ------------------------------------------------------------------
+       Translation  (offline — see setup_translation.py)
+       ------------------------------------------------------------------ */
+
+    /**
+     * Report which languages / OCR packs are provisioned.
+     * @returns {Promise<Object>}
+     */
+    async getTranslationStatus() {
+        const json = await App.bridge.getTranslationStatus();
+        return JSON.parse(json);
+    },
+
+    /**
+     * Translate a block of text.
+     * @returns {Promise<Object>}  { success, translated, source, target }
+     */
+    async translateText(text, source, target) {
+        const json = await App.bridge.translateText(text, source || 'auto', target);
+        return JSON.parse(json);
+    },
+
+    /**
+     * OCR an image then translate the text.
+     * @returns {Promise<Object>}  { success, sourceText, translatedText, ... }
+     */
+    async translateImage(path, source, target) {
+        const json = await App.bridge.translateImage(path, source || 'auto', target);
+        return JSON.parse(json);
+    },
+
+    /** Start an async PDF translation (results arrive via EventBus "done"). */
+    startTranslatePdf(params) { App.bridge.startTranslatePdf(JSON.stringify(params)); },
+
+    /**
      * Check if a file is an .epdf encrypted container and get its metadata.
      * @param {string} path
      * @returns {Promise<Object>}  { isEpdf, cipher?, kdf?, originalFilename?, created? }

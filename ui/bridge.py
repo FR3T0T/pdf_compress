@@ -43,6 +43,13 @@ from epdf_crypto import (
     EPDFError, EPDFPasswordError,
 )
 
+from pdf_analyze import analyze_document, sanitize_pdf, DEFAULT_SANITIZE
+
+from pdf_translate import (
+    translation_status, translate_text, translate_image, translate_pdf,
+    supported_languages, TranslationError,
+)
+
 from pdf_ops import (
     CompareResult,
     ExtractImagesResult,
@@ -495,6 +502,93 @@ class Bridge(QObject):
         except Exception as exc:
             log.warning("getToc failed for %s: %s", path, exc)
             return json.dumps([])
+
+    @Slot(str, result=str)
+    def analyzeDocument(self, path: str) -> str:
+        """Run the privacy/security audit on a PDF. Returns JSON.
+
+        Surfaces metadata leaks, embedded JavaScript, auto-run/launch
+        actions, external trackers, embedded files, form-submit actions,
+        hidden layers, and invisible text — all offline.
+        """
+        try:
+            report = analyze_document(path)
+            return json.dumps({"success": True, "report": report},
+                              ensure_ascii=False)
+        except Exception as exc:
+            log.exception("analyzeDocument failed for %s", path)
+            return json.dumps({"success": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def getSanitizeDefaults(self, _unused: str = "") -> str:
+        """Return the default sanitize option set for the UI checkboxes."""
+        return json.dumps(DEFAULT_SANITIZE, ensure_ascii=False)
+
+    @Slot(str, str, str, result=str)
+    def sanitizeDocument(self, path: str, output_path: str,
+                         options_json: str) -> str:
+        """Strip active/dangerous content from a PDF. Returns JSON.
+
+        ``options_json`` is a JSON object overriding DEFAULT_SANITIZE keys
+        (javascript, launch_actions, auto_actions, embedded_files,
+        submit_actions, external_links, metadata).
+        """
+        try:
+            try:
+                opts = json.loads(options_json) if options_json else {}
+            except Exception:
+                opts = {}
+            result = sanitize_pdf(path, output_path, opts)
+            result["success"] = True
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:
+            log.exception("sanitizeDocument failed for %s", path)
+            return json.dumps({"success": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    # ── Translation ───────────────────────────────────────────────
+
+    @Slot(result=str)
+    def getTranslationStatus(self) -> str:
+        """Report which languages/OCR packs are provisioned. Returns JSON."""
+        try:
+            st = translation_status()
+            st["success"] = True
+            return json.dumps(st, ensure_ascii=False)
+        except Exception as exc:
+            log.exception("getTranslationStatus failed")
+            return json.dumps({"success": False, "error": str(exc),
+                               "languages": supported_languages()},
+                              ensure_ascii=False)
+
+    @Slot(str, str, str, result=str)
+    def translateText(self, text: str, source: str, target: str) -> str:
+        """Translate a block of text (offline). Returns JSON."""
+        try:
+            res = translate_text(text, target, source or "auto")
+            return json.dumps({"success": True, **res}, ensure_ascii=False)
+        except TranslationError as exc:
+            return json.dumps({"success": False, "error": str(exc)},
+                              ensure_ascii=False)
+        except Exception as exc:
+            log.exception("translateText failed")
+            return json.dumps({"success": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, str, str, result=str)
+    def translateImage(self, path: str, source: str, target: str) -> str:
+        """OCR an image then translate the text (offline). Returns JSON."""
+        try:
+            res = translate_image(path, target, source or "auto")
+            return json.dumps({"success": True, **res}, ensure_ascii=False)
+        except TranslationError as exc:
+            return json.dumps({"success": False, "error": str(exc)},
+                              ensure_ascii=False)
+        except Exception as exc:
+            log.exception("translateImage failed for %s", path)
+            return json.dumps({"success": False, "error": str(exc)},
+                              ensure_ascii=False)
 
     @Slot(result=str)
     def getToolRegistry(self) -> str:
@@ -1203,6 +1297,27 @@ class Bridge(QObject):
             return compare_pdfs(
                 path_a=p["pathA"],
                 path_b=p["pathB"],
+            )
+
+        self._run_in_thread(tool_key, _work)
+
+    # ── Translate PDF (async — can be slow) ───────────────────────
+
+    @Slot(str)
+    def startTranslatePdf(self, json_params: str):
+        p = _normalize_params(json.loads(json_params))
+        tool_key = p.get("toolKey", "translate")
+        cancel = self._make_cancel_event(tool_key)
+        progress_cb = self._make_progress_callback(tool_key)
+
+        def _work():
+            return translate_pdf(
+                input_path=p["inputPath"],
+                output_path=p["outputPath"],
+                target=p["target"],
+                source=p.get("source", "auto"),
+                progress=progress_cb,
+                should_cancel=cancel.is_set,
             )
 
         self._run_in_thread(tool_key, _work)

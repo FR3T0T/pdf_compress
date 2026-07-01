@@ -117,6 +117,13 @@ const ICONS = {
         <rect x="7" y="7" width="10" height="2.5" rx="0.5" fill="currentColor" stroke="none"/>
         <rect x="7" y="12" width="8" height="2.5" rx="0.5" fill="currentColor" stroke="none"/>
         <rect x="7" y="17" width="6" height="2.5" rx="0.5" fill="currentColor" stroke="none"/>`,
+
+    shield: `<path d="M12 2l8 3v6c0 5-3.4 8.6-8 10-4.6-1.4-8-5-8-10V5z"/>
+        <path d="M9 12l2 2 4-4"/>`,
+
+    translate: `<circle cx="12" cy="12" r="9.5"/>
+        <path d="M2.5 12h19"/>
+        <path d="M12 2.5c2.7 2.6 4.2 6 4.2 9.5s-1.5 6.9-4.2 9.5c-2.7-2.6-4.2-6-4.2-9.5S9.3 5.1 12 2.5z"/>`,
 };
 
 /**

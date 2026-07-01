@@ -1,8 +1,8 @@
 # PDF Toolkit
 
-Fully offline PDF toolkit with 20 professional tools — compress, merge, split, convert, protect, redact, watermark, and more. DPI-aware image recompression, AES-256 encryption, and PDF/A compliance. No cloud services, no accounts, no tracking.
+Fully offline PDF toolkit with 22 professional tools — compress, merge, split, convert, protect, redact, watermark, and more. DPI-aware image recompression, AES-256 encryption, and PDF/A compliance. No cloud services, no accounts, no tracking.
 
-**v4.0.0**
+**v4.10**
 
 ---
 
@@ -20,6 +20,7 @@ pip install pikepdf pillow PySide6 PyMuPDF argon2-cffi pycryptodome cryptography
 
 **Optional dependencies:**
 - [Ghostscript](https://www.ghostscript.com/releases/gsdnld.html) — font subsetting (auto-detected if on PATH)
+- **Offline translation** (Translate tool) — `pip install argostranslate pytesseract langdetect`, the [Tesseract](https://github.com/tesseract-ocr/tesseract) binary, then `python setup_translation.py --install all` to download the language models. This download is the only step that uses the network; translation itself is fully offline.
 - [NumPy](https://numpy.org/) — improves photo vs diagram detection accuracy (`pip install numpy`)
 - [python-docx](https://python-docx.readthedocs.io/) — PDF to Word conversion (`pip install python-docx`)
 
@@ -56,6 +57,7 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 - **PDF to Images** — export pages as PNG or JPEG
 - **Images to PDF** — convert images into a PDF document
 - **PDF to Word** — extract text to a Word document
+- **Translate** — offline translation of PDF text and text inside images/photos/scans (top global languages plus German and Danish), via local Argos models and Tesseract OCR; nothing is uploaded
 
 ### Security
 - **Protect PDF** — add password and set permissions (AES-256)
@@ -81,6 +83,7 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 ### Repair & Analysis
 - **Repair PDF** — fix corrupted PDF files
 - **Compare PDFs** — find differences between two PDFs
+- **Analyze Document** — offline privacy & security audit; finds embedded JavaScript, auto-run/launch actions, external trackers, embedded files, hidden layers, invisible text, and identifying metadata, with one-click sanitizing
 
 ---
 
@@ -127,7 +130,7 @@ Each preset has per-image-type DPI targets (color, grayscale, monochrome). Your 
 - **Smart skip logic** — tiny images, already-compressed images, and images below the quality threshold are left untouched to avoid generation loss
 
 ### GUI features
-- **Dashboard home** — searchable grid of all 20 tools organized by category
+- **Dashboard home** — searchable grid of all 22 tools organized by category
 - **Sidebar navigation** — collapsible sidebar with quick access to all tools
 - **Light and dark themes** — toggle with Ctrl+T, preference remembered
 - **Space audit** — click the info button on any file to see a breakdown of images, fonts, and other content
@@ -188,12 +191,14 @@ Text and vector graphics are never modified.
 ## Security and privacy
 
 - **Fully offline** — no network access, no telemetry, no cloud dependencies, no accounts
+- **Network kill-switch** — a `QWebEngineUrlRequestInterceptor` blocks every non-local request (anything but `file`/`qrc`/`data`/`blob`/`about`) at the engine level, plus a restrictive Content-Security-Policy (`connect-src 'none'`). The app provably cannot phone home even if a future change tried to
+- **Document audit** — the Analyze Document tool inspects a PDF for trackers, scripts, and hidden data entirely on-device
 - **PDF magic validation** — rejects files without valid `%PDF-` headers before processing
 - **Decompression bomb protection** — images exceeding 200 million pixels are skipped
 - **Content stream size limit** — streams over 16 MB are skipped to prevent pathological parsing
 - **File size limit** — inputs over 2 GB are rejected
 - **Ghostscript sandboxing** — `-dSAFER` flag restricts file system access; `--` separator prevents argument injection; paths are sanitized; 5-minute process timeout
-- **Enhanced encryption** — `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 ciphers; Argon2id key derivation; AEAD authentication
+- **Enhanced encryption** — `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 ciphers; Argon2id key derivation; AEAD authentication. The `.epdf` header (cipher, KDF parameters, salt, nonce) is bound as Associated Data, so tampering or downgrade attacks on the header are detected on decrypt (format v2; v1 files still readable)
 - **Encrypted PDF handling** — password-protected files prompt for credentials; passwords are cleared from memory after use
 - **Atomic file I/O** — temp file + `os.replace()`; original file is never corrupted on failure
 - **Backup system** — optional `.backup` copy with rotation before overwriting originals
@@ -212,12 +217,16 @@ Text and vector graphics are never modified.
 | `app.py` | Application entry point and icon generation |
 | `engine.py` | Compression engine (shared by GUI and CLI) |
 | `pdf_ops.py` | PDF operations (merge, split, protect, watermark, etc.) |
-| `epdf_crypto.py` | Enhanced encryption engine (.epdf format — ChaCha20, AES-256, Camellia) |
+| `epdf_crypto.py` | Enhanced encryption engine (.epdf format — ChaCha20, AES-256, Camellia; header-authenticated v2) |
+| `pdf_analyze.py` | Offline privacy/security audit + sanitizer engine |
+| `pdf_translate.py` | Offline translation + OCR engine (Argos + Tesseract) |
+| `setup_translation.py` | One-time provisioning of offline translation/OCR models |
 | `compress_pdf.py` | Command-line interface for compression |
 | `compress_pdf.bat` | Windows launcher (no console window) |
 | `ui/` | GUI package — bridge, theme, dialogs |
 | `ui/web_shell.py` | Main window (QWebEngineView + QWebChannel) |
 | `ui/bridge.py` | Python-to-JavaScript communication bridge |
+| `ui/net_guard.py` | Network kill-switch — blocks all non-local web-engine requests |
 | `ui/tool_registry.py` | Centralized tool definitions and categories |
 | `ui/pages/` | Individual tool pages (one per tool) |
 | `web/` | Frontend HTML, CSS, and JavaScript |

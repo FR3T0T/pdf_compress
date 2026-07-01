@@ -3,6 +3,22 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Content-Security-Policy: defense-in-depth offline enforcement.
+         The QWebEngineUrlRequestInterceptor is the hard guarantee; this CSP
+         additionally forbids every network egress vector (fetch/XHR/WebSocket
+         via connect-src 'none'), plugins, and external form posts, while
+         staying permissive for the bundled local assets so nothing breaks. -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self' qrc: data: blob:;
+                   script-src 'self' qrc:;
+                   style-src 'self' 'unsafe-inline';
+                   img-src 'self' data: blob:;
+                   font-src 'self' data:;
+                   connect-src 'none';
+                   object-src 'none';
+                   base-uri 'none';
+                   form-action 'self';
+                   frame-ancestors 'none';">
     <title>PDF Toolkit</title>
 
     <!-- CSS Design System -->
@@ -66,5 +82,7 @@
     <script src="js/pages/pdf-to-word.js"></script>
     <script src="js/pages/repair.js"></script>
     <script src="js/pages/compare.js"></script>
+    <script src="js/pages/analyze.js"></script>
+    <script src="js/pages/translate.js"></script>
 </body>
 </html>

@@ -38,3 +38,9 @@ desktop.ini
 
 # Claude Code
 .claude/
+
+# Ad-hoc test artifacts (generated files, not fixtures)
+tests/*.pdf
+tests/*.epdf
+tests/*_translated.txt
+tests/*_translated.docx

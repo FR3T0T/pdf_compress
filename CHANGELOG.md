@@ -1,5 +1,38 @@
 # Changelog
 
+## v4.10
+
+Privacy/security hardening and offline translation — four additions, all fully offline.
+
+### Analyze Document (new tool)
+- **`pdf_analyze.py`** — an offline privacy/security audit engine (pikepdf, with optional PyMuPDF). Detects identifying metadata (/Info + XMP), embedded JavaScript, auto-run actions (/OpenAction, /AA), launch actions, external URI links / trackers, remote GoTo, embedded files/attachments, form submit/import actions, XFA/AcroForm, optional-content layers, and invisible text (the classic failed-redaction tell). Returns risk-graded findings and an overall risk level.
+- **One-click sanitizer** — `sanitize_pdf()` writes a cleaned copy with the selected categories stripped (JavaScript, launch/auto actions, embedded files, submit actions, and optionally external links and metadata). The original file is never modified; writes are atomic.
+- Wired into the web UI as a new **Analyze Document** tool (shield icon, Repair & Analysis category): drop a PDF → risk report → optional sanitize. New bridge slots `analyzeDocument`, `getSanitizeDefaults`, `sanitizeDocument`.
+
+### Network kill-switch (provable offline)
+- **`ui/net_guard.py`** — a `QWebEngineUrlRequestInterceptor` installed on the web profile blocks every request whose scheme isn't local (`file`/`qrc`/`data`/`blob`/`about`); it fails closed. Any tracker, beacon, web font, or stray `fetch()` is dropped before a byte leaves the machine.
+- **Content-Security-Policy** added to `index.html` (`connect-src 'none'`, `object-src 'none'`, `base-uri 'none'`, restrictive `default-src`) as defense-in-depth; kept permissive for bundled local assets so rendering is unaffected.
+- Hardened web settings: clipboard access and window-opening disabled for the page's JavaScript.
+
+### Encryption header authentication (.epdf v2)
+- The `.epdf` header (cipher, KDF parameters, salt, nonce) is now bound as **Associated Data**: AEAD ciphers authenticate it directly, and the Camellia HMAC now covers `header + iv + ciphertext`. Tampering with — or downgrading — the header is detected on decrypt instead of being silently accepted.
+- Format version bumped to **v2**; existing **v1** files still decrypt unchanged.
+
+### Translate (new tool)
+- **`pdf_translate.py`** — an offline translation/OCR engine. Translates PDF text and the text inside images/photos/scans, entirely on-device: Argos Translate (CTranslate2 models) for translation, Tesseract for OCR, and langdetect for source auto-detection. No network calls.
+- **Languages** — the global top-10 by speakers (English, Mandarin Chinese, Hindi, Spanish, Arabic, French, Bengali, Portuguese, Russian, Indonesian) plus **German** and **Danish** (12 total). Argos pivots through English, so a handful of installed languages covers translation between any of them.
+- **Image translation** — drop a photo or scan; the tool OCRs the text, detects the language, and translates it (source text + translation shown side by side, copyable). Scanned PDF pages with no text layer are OCR'd automatically.
+- **PDF translation** — runs on a background thread with progress and cancel; writes a `.txt` (page-delimited) or `.docx`. Text/Word output is used deliberately so every script (CJK, Cyrillic, Arabic, Devanagari) renders with the system's own fonts, avoiding fragile font embedding.
+- Wired into the web UI as a new **Translate** tool (globe icon, Convert category) with From/To language pickers and a provisioning-status banner. New bridge slots `getTranslationStatus`, `translateText`, `translateImage`, and async `startTranslatePdf`.
+
+### Model provisioning
+- **`setup_translation.py`** — the one explicit online step. `--status` / `--list` show what's installed; `--install all` (or specific codes) downloads the Argos language packages and prints the per-OS commands for the Tesseract OCR packs. The app's network kill-switch is unaffected — it sandboxes the embedded web UI, while provisioning is a separate, user-run tool. After setup, translation is fully offline.
+
+### Notes
+- Translation dependencies are **optional**; the rest of the toolkit works without them. The Translate tool degrades gracefully and tells the user exactly what to install if a model is missing.
+- No new dependencies for the analyze/kill-switch/encryption additions (PyMuPDF was already optional; it enables the invisible-text check).
+- New files: `pdf_analyze.py`, `pdf_translate.py`, `setup_translation.py`, `ui/net_guard.py`, `web/js/pages/analyze.js`, `web/js/pages/translate.js`; edits to `epdf_crypto.py`, `ui/web_shell.py`, `ui/bridge.py`, `ui/tool_registry.py`, `web/index.html`, `web/js/bridge.js`, `web/js/app.js`, `web/js/icons.js`, `requirements.txt`.
+
 ## v4.0.1
 
 Code quality, testing, documentation, and build hardening pass.

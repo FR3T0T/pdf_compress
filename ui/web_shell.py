@@ -19,6 +19,7 @@ from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngin
 from PySide6.QtWebChannel import QWebChannel
 
 from .bridge import Bridge
+from .net_guard import install_offline_guard
 from .theme import Theme, LIGHT, DARK, FONT
 
 log = logging.getLogger(__name__)
@@ -222,12 +223,25 @@ class WebMainWindow(QMainWindow):
         page = self._view.page()
         page.setWebChannel(self._channel)
 
+        # -- Hard offline enforcement --------------------------------------
+        # Block every non-local network request at the engine level so the
+        # app provably cannot phone home, even if a future change or
+        # dependency tried to. Reference is held so Qt doesn't GC it.
+        self._offline_guard = install_offline_guard(page.profile())
+
         # Enable local file access and other useful settings
         ws = page.settings()
         ws.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         ws.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False)
         ws.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
         ws.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
+        # Defense-in-depth: deny JS access to the clipboard and block any
+        # attempt to open external windows.
+        try:
+            ws.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, False)
+            ws.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
+        except Exception:
+            pass
 
         self.setCentralWidget(self._view)
 

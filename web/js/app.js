@@ -489,6 +489,13 @@ function _svgIcon(name) {
             '<rect x="5" y="6" width="10" height="2" rx="1" fill="currentColor" stroke="none"/>' +
             '<rect x="5" y="10" width="7" height="2" rx="1" fill="currentColor" stroke="none"/>' +
             '<rect x="5" y="14" width="9" height="2" rx="1" fill="currentColor" stroke="none"/>',
+        shield:
+            '<path d="M10 2 L16 4 V9 C16 13 13.2 15.8 10 17 C6.8 15.8 4 13 4 9 V4 Z" fill="none"/>' +
+            '<polyline points="7.5,10 9.2,11.7 12.5,8.3"/>',
+        translate:
+            '<circle cx="10" cy="10" r="8" fill="none"/>' +
+            '<path d="M2 10 H18"/>' +
+            '<path d="M10 2 C12.3 4.2 13.5 7 13.5 10 C13.5 13 12.3 15.8 10 18 C7.7 15.8 6.5 13 6.5 10 C6.5 7 7.7 4.2 10 2 Z" fill="none"/>',
     };
 
     var inner = icons[name];

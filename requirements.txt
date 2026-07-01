@@ -7,3 +7,9 @@ python-docx>=0.8.11  # optional — PDF to Word conversion
 argon2-cffi>=23.1.0  # Argon2id/Argon2d key derivation for enhanced encryption
 pycryptodome>=3.19.0 # AES-256-GCM cipher
 cryptography>=41.0.0 # ChaCha20-Poly1305, Camellia-256 ciphers
+
+# ── Optional: offline translation (Translate tool) ──
+# Provision language models afterwards with: python setup_translation.py --install all
+# argostranslate>=1.9.0   # offline neural translation (CTranslate2 models)
+# pytesseract>=0.3.10     # OCR wrapper — also needs the Tesseract binary + language packs
+# langdetect>=1.0.9       # source-language auto-detection
