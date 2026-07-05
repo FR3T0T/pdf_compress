@@ -46,6 +46,11 @@ const POSITIONS = [
   { value: 'bottom-right', label: 'Bottom Right' },
 ];
 
+const MODES = [
+  { value: 'single', label: 'Single (centered)' },
+  { value: 'tiled', label: 'Tiled (repeated across page)' },
+];
+
 const SETTINGS_KEYS = {
   naming: 'watermark/naming',
   outputDir: 'watermark/outputDir',
@@ -55,12 +60,19 @@ const SETTINGS_KEYS = {
   fontSize: 'watermark/fontSize',
   color: 'watermark/color',
   position: 'watermark/position',
+  mode: 'watermark/mode',
 };
 
 /**
  * React port of web/js/pages/watermark.js. Bridge call preserved exactly:
  * BridgeAPI.startWatermark({ files, text, opacity, rotation, font_size,
- * color, position, page_range, output_dir, naming }).
+ * color, position, mode, page_range, output_dir, naming }).
+ *
+ * `mode`: "single" (one centered instance, the original/vanilla behavior)
+ * or "tiled" (repeated in a staggered diagonal grid across the whole
+ * page, at the same `rotation` angle, so it can't be cropped out by
+ * removing one area — see pdf_ops.py's add_watermark/_tiled_watermark_body).
+ * `position` only applies in single mode.
  *
  * Bug fix vs. vanilla: the opacity slider is 1-100 (a percentage) but
  * ui/bridge.py's startWatermark reads it directly as the PDF's /ca /CA
@@ -74,7 +86,7 @@ const SETTINGS_KEYS = {
  * unlike most other "premium" pages, watermark.js's own result reading
  * already matches this exactly, so no shape bug here.
  *
- * Settings persistence (8 watermark/* keys) and preset switching
+ * Settings persistence (9 watermark/* keys) and preset switching
  * preserved; keyboard shortcuts intentionally not carried over.
  */
 export function WatermarkPage() {
@@ -87,6 +99,7 @@ export function WatermarkPage() {
   const [fontSize, setFontSize] = useState('48');
   const [color, setColor] = useState('#808080');
   const [position, setPosition] = useState('center');
+  const [mode, setMode] = useState('single');
   const [pageRange, setPageRange] = useState('');
   const [outputDir, setOutputDir] = useState('');
   const [naming, setNaming] = useState('{name}_watermarked');
@@ -112,6 +125,8 @@ export function WatermarkPage() {
       if (c) setColor(c);
       const pos = await bridgeApi.loadSetting(SETTINGS_KEYS.position);
       if (pos) setPosition(pos);
+      const m = await bridgeApi.loadSetting(SETTINGS_KEYS.mode);
+      if (m) setMode(m);
     })();
     // Deliberately runs once on mount only — loads persisted settings.
   }, []);
@@ -164,6 +179,7 @@ export function WatermarkPage() {
     bridgeApi.saveSetting(SETTINGS_KEYS.fontSize, fontSize);
     bridgeApi.saveSetting(SETTINGS_KEYS.color, color);
     bridgeApi.saveSetting(SETTINGS_KEYS.position, position);
+    bridgeApi.saveSetting(SETTINGS_KEYS.mode, mode);
   };
 
   const pickOutputDir = async () => {
@@ -194,6 +210,7 @@ export function WatermarkPage() {
         font_size: parseInt(fontSize, 10),
         color: color.trim() || '#808080',
         position,
+        mode,
         page_range: pageRange.trim() || null,
         output_dir: outputDir,
         naming: naming || '{name}_watermarked',
@@ -246,6 +263,17 @@ export function WatermarkPage() {
             </Field>
           </div>
 
+          <div style={{ marginTop: 'var(--space-4)' }}>
+            <Field label="Layout">
+              <Select value={mode} onChange={setMode} options={MODES} />
+            </Field>
+            <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginTop: 4 }}>
+              {mode === 'tiled'
+                ? 'Repeats the text diagonally across the whole page (at the rotation angle below) so it can’t be cropped out by removing one area.'
+                : 'One instance of the text, centered on the page.'}
+            </div>
+          </div>
+
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 'var(--space-4)', marginTop: 'var(--space-4)' }}>
             <Field label="Opacity">
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -255,7 +283,7 @@ export function WatermarkPage() {
                 </span>
               </div>
             </Field>
-            <Field label="Rotation (degrees)">
+            <Field label={mode === 'tiled' ? 'Diagonal angle (degrees)' : 'Rotation (degrees)'}>
               <TextInput type="number" value={rotation} onChange={setRotation} />
             </Field>
             <Field label="Font size">
@@ -280,7 +308,12 @@ export function WatermarkPage() {
               </div>
             </Field>
             <Field label="Position">
-              <Select value={position} onChange={setPosition} options={POSITIONS} />
+              <Select value={position} onChange={setPosition} options={POSITIONS} disabled={mode === 'tiled'} />
+              {mode === 'tiled' && (
+                <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginTop: 4 }}>
+                  Ignored in tiled mode — covers the whole page.
+                </div>
+              )}
             </Field>
             <Field label="Page range">
               <TextInput value={pageRange} onChange={setPageRange} placeholder="All pages (e.g. 1-5, 8, 10-12)" />

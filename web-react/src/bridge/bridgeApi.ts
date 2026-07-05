@@ -86,6 +86,7 @@ const TOOL_KEYS = {
   compare: 'compare',
   nup: 'nup',
   translatePdf: 'translate',
+  translationStatus: 'translationStatus',
 } as const;
 
 /**
@@ -224,6 +225,30 @@ export const bridgeApi = {
     };
   },
 
+  // Async counterpart of getTranslationStatus above -- see ui/bridge.py's
+  // startGetTranslationStatus for why the React Translate page must use
+  // this instead: the sync call's first-use argostranslate import can
+  // freeze the window for several seconds on page mount.
+  startGetTranslationStatus(params: Record<string, unknown>): void {
+    if (window.BridgeAPI) window.BridgeAPI.startGetTranslationStatus(params);
+    else {
+      simulateOperation(TOOL_KEYS.translationStatus, [], () => ({
+        success: true,
+        argosAvailable: true,
+        ocrAvailable: true,
+        ocrLangs: ['eng', 'spa'],
+        argosPairs: ['en->es', 'es->en', 'en->fr', 'fr->en'],
+        languages: [
+          { code: 'en', name: 'English', native: 'English', ocr: true, translateTo: true, translateFrom: true },
+          { code: 'es', name: 'Spanish', native: 'Español', ocr: true, translateTo: true, translateFrom: true },
+          { code: 'fr', name: 'French', native: 'Français', ocr: false, translateTo: true, translateFrom: true },
+          { code: 'de', name: 'German', native: 'Deutsch', ocr: false, translateTo: false, translateFrom: false },
+          { code: 'zh', name: 'Mandarin Chinese', native: '中文', ocr: false, translateTo: false, translateFrom: false },
+        ],
+      }));
+    }
+  },
+
   async translateText(
     text: string,
     source: string,
@@ -256,6 +281,42 @@ export const bridgeApi = {
         pages: 6,
         source: params.source === 'auto' ? 'en' : String(params.source ?? 'en'),
         target: String(params.target ?? 'es'),
+      }));
+    }
+  },
+
+  // Async counterparts of translateText/translateImage above -- fire-and-
+  // forget like every other startXxx, off the UI thread on the real
+  // bridge (see ui/bridge.py) so Argos's slow first-use model load
+  // doesn't freeze the window. Same toolKey ("translate") as
+  // startTranslatePdf so one useOperation('translate') on the frontend
+  // handles all three flows.
+  startTranslateText(params: Record<string, unknown>): void {
+    if (window.BridgeAPI) window.BridgeAPI.startTranslateText(params);
+    else {
+      const text = String(params.text ?? '');
+      const source = params.source === 'auto' ? 'en' : String(params.source ?? 'en');
+      const target = String(params.target ?? 'es');
+      simulateOperation(TOOL_KEYS.translatePdf, [{ name: 'text' }], () => ({
+        translated: `[mock translation of: ${text}]`,
+        source,
+        target,
+      }));
+    }
+  },
+
+  startTranslateImage(params: Record<string, unknown>): void {
+    if (window.BridgeAPI) window.BridgeAPI.startTranslateImage(params);
+    else {
+      const path = String(params.path ?? '');
+      const source = params.source === 'auto' ? 'en' : String(params.source ?? 'en');
+      const target = String(params.target ?? 'es');
+      simulateOperation(TOOL_KEYS.translatePdf, [{ name: basenameOf(path) }], () => ({
+        sourceText: '(mock OCR text)',
+        translatedText: '(mock translation)',
+        source,
+        target,
+        ocrLang: 'eng',
       }));
     }
   },

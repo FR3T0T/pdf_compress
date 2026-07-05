@@ -1,5 +1,46 @@
 # Changelog
+## v4.20
 
+Major release: the entire frontend rebuilt in React, plus new tools, a redaction overhaul, and a security-hardening pass.
+
+### React frontend (complete rewrite)
+- The whole web UI is migrated from vanilla JS to **React + Vite + TypeScript** — all 22 tools, the sidebar/router shell, and shared components rebuilt as typed React components.
+- **Security-console aesthetic** with full **light and dark themes** (WCAG-AA contrast), toggle persisted across restarts.
+- The built bundle is committed to `web-react/dist/`, so the app runs with no Node build step. Developers modifying the frontend need Node + `npm install` + `npm run build` in `web-react/`.
+- The Python bridge is unchanged; async operations (progress/cancel/done) are centralized in a single `useOperation` hook.
+
+### New tools
+- **Analyze Document** — offline privacy/security audit (`pdf_analyze.py`): flags embedded JavaScript, auto-run/launch actions, external trackers, embedded files, hidden layers, invisible text, and identifying metadata, with a one-click sanitizer. Auto-run findings now describe *when* each trigger fires and *what* it does.
+- **Translate** — offline translation (`pdf_translate.py`) of PDF text and text inside images/photos/scans (Argos + Tesseract OCR), 12 languages. Includes proper-noun/separator protection (prevents place-name and separator corruption), a user "keep these words untranslated" field, and **image-preserving PDF output** using a bundled DejaVu font.
+
+### Redaction (rewritten — true content destruction)
+- Replaced the old content-stream regex approach (which silently missed most text) with **PyMuPDF `apply_redactions()`** — text and images under a redaction are permanently destroyed and unrecoverable.
+- Added a **visual box-drawing mode**: render each page, draw boxes over content, true-redact those regions.
+- **Fixed a critical data leak**: form-field (AcroForm) values survived redaction — a black box was drawn but the underlying value (e.g. an SSN on a fillable form) remained fully extractable. Overlapping form fields are now neutralized before redaction.
+- Fixed box coordinate mapping (display-vs-natural image scaling) and removed an incorrect Y-axis inversion that sent boxes to the backend flipped.
+
+### Watermark
+- Added a **tiled/diagonal mode** — the watermark repeats across the whole page (staggered, translucent) so it can't be trivially cropped out. Single mode retained.
+
+### Security & hardening
+- **Network kill-switch** — `QWebEngineUrlRequestInterceptor` blocks every non-local request; CSP forbids all network egress. The app provably cannot phone home.
+- **`.epdf` header authentication (v2)** — cipher/KDF/salt/nonce bound as Associated Data; tampering and downgrade attacks are detected on decrypt. v1 files still decrypt.
+- **Output-path containment** — user-supplied names/templates can no longer escape the chosen folder (blocks `../` traversal and absolute-path override).
+- **`openFile`/`openFolder` validation** — only real local paths are opened; URLs and protocol handlers are refused.
+- Upgraded **stanza** to resolve **CVE-2026-54499** (critical RCE via unsafe pickle deserialization in model loading).
+
+### Fixes
+- **Translate page-load freeze** — a synchronous `argostranslate` import on tool open froze the whole window ~5s; provisioning status now runs off the UI thread with a loading state.
+- **Progress/results not updating** — async tools read `data.tool`/`data.percent` while the bridge sent `toolKey`/`pct`/nested `results`; corrected across all tools.
+- **Watermark opacity** — was sent on a 1–100 scale where the engine expects 0–1 (watermarks rendered fully opaque).
+- **`getPresets`** — called with zero args where the slot requires one (preset dropdowns fell back silently).
+- **Sidebar collapse persistence** and **`loadSetting` double-encoding** — settings now restore correctly.
+
+### Notes
+- No change for end users beyond installing dependencies — pull and run.
+- New files: the `web-react/` React project (source + committed `dist/`), `assets/fonts/DejaVuSans.ttf`. The legacy `web/` vanilla frontend is retained but no longer the active UI.
+
+---
 ## v4.10
 
 Privacy/security hardening and offline translation — four additions, all fully offline.

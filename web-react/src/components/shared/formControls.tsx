@@ -46,17 +46,20 @@ export function TextInput({
   onChange,
   placeholder,
   type = 'text',
+  disabled,
 }: {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
   type?: 'text' | 'number' | 'password';
+  disabled?: boolean;
 }) {
   return (
     <input
       type={type}
       value={value}
       placeholder={placeholder}
+      disabled={disabled}
       onChange={(e: ChangeEvent<HTMLInputElement>) => onChange(e.target.value)}
       style={{ ...controlBase, width: '100%' }}
     />
@@ -67,15 +70,18 @@ export function Select({
   value,
   onChange,
   options,
+  disabled,
 }: {
   value: string;
   onChange: (value: string) => void;
   options: Array<{ value: string; label: string }>;
+  disabled?: boolean;
 }) {
   return (
     <select
       value={value}
       onChange={(e: ChangeEvent<HTMLSelectElement>) => onChange(e.target.value)}
+      disabled={disabled}
       style={{ ...controlBase, width: '100%' }}
     >
       {options.map((o) => (

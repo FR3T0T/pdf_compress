@@ -34,9 +34,12 @@ interface RawBridge {
   getSanitizeDefaults(scope: string): Promise<string>;
   sanitizeDocument(path: string, outputPath: string, optionsJson: string): Promise<string>;
   getTranslationStatus(): Promise<string>;
+  startGetTranslationStatus(paramsJson: string): void;
   translateText(text: string, source: string, target: string, protectTermsJson: string): Promise<string>;
   translateImage(path: string, source: string, target: string, protectTermsJson: string): Promise<string>;
   startTranslatePdf(paramsJson: string): void;
+  startTranslateText(paramsJson: string): void;
+  startTranslateImage(paramsJson: string): void;
   checkEpdf(path: string): Promise<string>;
   startCompress(paramsJson: string): void;
   startMerge(paramsJson: string): void;
@@ -178,6 +181,9 @@ export function connectQWebChannel(): Promise<void> {
         async getTranslationStatus() {
           return safeJsonParse(await raw.getTranslationStatus(), {});
         },
+        startGetTranslationStatus(params) {
+          raw.startGetTranslationStatus(JSON.stringify(params));
+        },
         async translateText(text, source, target, protectTerms) {
           return safeJsonParse(
             await raw.translateText(text, source || 'auto', target, JSON.stringify(protectTerms ?? [])),
@@ -192,6 +198,12 @@ export function connectQWebChannel(): Promise<void> {
         },
         startTranslatePdf(params) {
           raw.startTranslatePdf(JSON.stringify(params));
+        },
+        startTranslateText(params) {
+          raw.startTranslateText(JSON.stringify(params));
+        },
+        startTranslateImage(params) {
+          raw.startTranslateImage(JSON.stringify(params));
         },
         async checkEpdf(path) {
           return safeJsonParse(await raw.checkEpdf(path), { isEpdf: false });

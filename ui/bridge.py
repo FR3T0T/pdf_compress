@@ -601,7 +601,15 @@ class Bridge(QObject):
 
     @Slot(result=str)
     def getTranslationStatus(self) -> str:
-        """Report which languages/OCR packs are provisioned. Returns JSON."""
+        """Report which languages/OCR packs are provisioned. Returns JSON.
+
+        Synchronous -- kept as-is for web/js/bridge.js (unmodified). This
+        runs on the UI thread: translation_status() lazily imports
+        argostranslate on first call, which pulls in ctranslate2 and its
+        transitive deps and can take several seconds cold, freezing the
+        whole window. The React UI uses startGetTranslationStatus below
+        instead so that cost never lands on the UI thread.
+        """
         try:
             st = translation_status()
             st["success"] = True
@@ -611,6 +619,25 @@ class Bridge(QObject):
             return json.dumps({"success": False, "error": str(exc),
                                "languages": supported_languages()},
                               ensure_ascii=False)
+
+    @Slot(str)
+    def startGetTranslationStatus(self, json_params: str = "{}"):
+        """Async counterpart of getTranslationStatus, for the React UI.
+
+        The Translate page calls this on mount to learn which languages/OCR
+        packs are installed -- before any translation action. Off the UI
+        thread via _run_in_thread, same as the translate/OCR slots, so the
+        argostranslate first-import cost above never blocks the window.
+        """
+        p = _normalize_params(json.loads(json_params)) if json_params else {}
+        tool_key = p.get("toolKey", "translationStatus")
+
+        def _work():
+            st = translation_status()
+            st["success"] = True
+            return st
+
+        self._run_in_thread(tool_key, _work)
 
     # Overloaded: web/js/bridge.js (unmodified, per its own contract) still
     # calls this with 3 args, so that signature must keep resolving --
@@ -658,6 +685,67 @@ class Bridge(QObject):
             log.exception("translateImage failed for %s", path)
             return json.dumps({"success": False, "error": str(exc)},
                               ensure_ascii=False)
+
+    # Async counterparts of translateText/translateImage above, for the
+    # React UI. Those two are @Slot methods that run synchronously on the
+    # UI thread -- fine for a quick translation, but Argos's first-use
+    # model load is slow enough to freeze the whole window ("not
+    # responding") when it happens there. startTranslatePdf already avoids
+    # this via _run_in_thread; these two follow the same pattern so
+    # image/text translation gets the same off-thread treatment. The sync
+    # slots above are left untouched -- web/js/bridge.js (unmodified)
+    # still calls them directly and still gets a same-thread result.
+    #
+    # Reuses toolKey "translate" (same as startTranslatePdf) so a single
+    # useOperation('translate') on the frontend routes progress/done from
+    # any of the three translate flows; _make_cancel_event() means
+    # starting one correctly signals a previous same-toolKey run to stop.
+
+    @Slot(str)
+    def startTranslateText(self, json_params: str):
+        """Translate a block of text (offline), off the UI thread.
+
+        Emits operationDone with results = {translated, source, target} --
+        the same fields translateText()'s JSON carried, just nested under
+        "results" like every other async tool instead of at the top level.
+        """
+        p = _normalize_params(json.loads(json_params))
+        tool_key = p.get("toolKey", "translate")
+        self._make_cancel_event(tool_key)
+
+        text = p["text"]
+        source = p.get("source", "auto")
+        target = p["target"]
+        protect_terms = p.get("protectTerms") or []
+
+        def _work():
+            return translate_text(text, target, source or "auto", protect_terms)
+
+        self._run_in_thread(tool_key, _work)
+
+    @Slot(str)
+    def startTranslateImage(self, json_params: str):
+        """OCR an image then translate the text (offline), off the UI
+        thread.
+
+        Emits operationDone with results = {sourceText, translatedText,
+        source, target, ocrLang} (or the no-text-found note shape) -- the
+        same fields translateImage()'s JSON carried, nested under
+        "results".
+        """
+        p = _normalize_params(json.loads(json_params))
+        tool_key = p.get("toolKey", "translate")
+        self._make_cancel_event(tool_key)
+
+        path = p["path"]
+        source = p.get("source", "auto")
+        target = p["target"]
+        protect_terms = p.get("protectTerms") or []
+
+        def _work():
+            return translate_image(path, target, source or "auto", protect_terms)
+
+        self._run_in_thread(tool_key, _work)
 
     @Slot(result=str)
     def getToolRegistry(self) -> str:
@@ -1148,6 +1236,7 @@ class Bridge(QObject):
         font_size = p.get("fontSize", 48)
         color     = p.get("color", "#888888")
         position  = p.get("position", "center")
+        mode      = p.get("mode", "single")
         page_range = p.get("pageRange")
         output_dir = p.get("outputDir") or p.get("output_dir", "")
         naming    = p.get("naming", "{name}_watermarked")
@@ -1189,6 +1278,7 @@ class Bridge(QObject):
                         font_size=font_size,
                         color=color,
                         position=position,
+                        mode=mode,
                         page_range=page_range,
                         cancel=cancel,
                     )

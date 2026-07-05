@@ -21,7 +21,7 @@ from ui.theme import FONT
 
 log = logging.getLogger(__name__)
 
-VERSION = "4.10"
+VERSION = "4.20"
 
 
 def _generate_app_icon() -> QIcon:

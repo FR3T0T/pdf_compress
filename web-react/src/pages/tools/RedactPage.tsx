@@ -29,10 +29,16 @@ interface PageImage {
 interface RedactBox {
   id: string;
   page: number;
-  // Pixel coordinates in the rendered page image (natural size, top-left
-  // origin) — NOT yet PDF points. Converted at submit time (see
-  // boxesToRects) since that's where the page height needed for the Y flip
-  // is available for every box's own page.
+  // PDF point coordinates, top-left origin -- same space as the page
+  // pixmap PageCanvas draws over and as pdf_ops.py's redact_pdf expects for
+  // its `rects` param directly, no axis flip anywhere in the pipeline (see
+  // boxesToRects). Converted from displayed pixels to points at DRAW time
+  // (see PageCanvas.finishDrag) using the image element's actual on-screen
+  // rendered size at that moment -- not its natural pixel size and not the
+  // render DPI -- so the box is correct regardless of what the display
+  // size does afterward (CSS scaling, window resize, HiDPI, browser zoom,
+  // etc.). Storing already-converted points also means resubmission
+  // doesn't depend on the display still being at the size it was drawn at.
   x0: number;
   y0: number;
   x1: number;
@@ -41,42 +47,46 @@ interface RedactBox {
 
 type RedactMode = 'terms' | 'boxes';
 
-/**
- * Converts drawn boxes (image pixel space, top-left origin) to PDF-point
- * rects (bottom-left origin) for startRedact's rects param.
- *
- * pdf_points_per_pixel = 72 / dpi -- uniform across every page because
- * getPageImages (ui/bridge.py) renders every page at the same fixed DPI,
- * regardless of that page's own point dimensions (verified directly: a
- * 612x792pt page and a 300x400pt page rendered at the same DPI produce
- * pixel dimensions that both satisfy px = pts * dpi/72 exactly).
- *
- * Y-axis: image origin is top-left, PDF origin is bottom-left, so
- * y_pdf = page_height_pts - (y_px * scale). Rounds outward (floor the
- * low edge, ceil the high edge) plus a 1pt margin, so a box can only ever
- * grow from rounding/imprecision, never shrink and leak content at the edge.
- */
-function boxesToRects(boxes: RedactBox[], pages: PageImage[], dpi: number) {
+/** PDF point dimensions of a rendered page image -- derived from its
+ *  natural pixel size and the DPI it was rendered at (uniform across every
+ *  page: getPageImages renders every page at the same fixed DPI regardless
+ *  of that page's own point dimensions, verified directly). This is only
+ *  used to know each page's size in points; it is NOT used to scale box
+ *  coordinates -- those are scaled from displayed px directly (see
+ *  PageCanvas), never from DPI. */
+function pageSizePts(page: PageImage, dpi: number) {
   const scale = 72 / dpi;
+  return { wPts: page.width * scale, hPts: page.height * scale };
+}
+
+/**
+ * Converts drawn boxes (already in PDF points) to the rects startRedact's
+ * `rects` param expects -- just ordering + outward rounding, no axis flip.
+ *
+ * pdf_ops.py's redact_pdf builds `fitz.Rect(x0, y0, x1, y1)` directly from
+ * these numbers and hands it straight to page.add_redact_annot(). PyMuPDF's
+ * page-rect coordinate space (like get_text()/search_for(), and like the
+ * page pixmap PageCanvas draws over) is top-left-origin -- confirmed
+ * directly: a word inserted at y=140 is reported by get_text('words') with
+ * y0=124.95/y1=144.19, matching insert_text's own top-left-origin y, not a
+ * bottom-left one. So a box already in that same top-left-origin point
+ * space (see PageCanvas) needs no flip -- flipping it would target the
+ * mirrored position on the page instead of the one actually drawn over.
+ *
+ * Rounds outward (floor the low edge, ceil the high edge) plus a 1pt
+ * margin, so a box can only ever grow from rounding/imprecision, never
+ * shrink and leak content at the edge.
+ */
+function boxesToRects(boxes: RedactBox[]) {
   const MARGIN_PT = 1;
-  const heightPxByPage = new Map(pages.map((p) => [p.index, p.height]));
 
-  return boxes.map((b) => {
-    const heightPx = heightPxByPage.get(b.page) ?? 0;
-    const heightPts = heightPx * scale;
-    const left = Math.min(b.x0, b.x1);
-    const right = Math.max(b.x0, b.x1);
-    const top = Math.min(b.y0, b.y1);
-    const bottom = Math.max(b.y0, b.y1);
-
-    return {
-      page: b.page,
-      x0: Math.floor(left * scale) - MARGIN_PT,
-      x1: Math.ceil(right * scale) + MARGIN_PT,
-      y0: Math.floor(heightPts - bottom * scale) - MARGIN_PT,
-      y1: Math.ceil(heightPts - top * scale) + MARGIN_PT,
-    };
-  });
+  return boxes.map((b) => ({
+    page: b.page,
+    x0: Math.floor(Math.min(b.x0, b.x1)) - MARGIN_PT,
+    x1: Math.ceil(Math.max(b.x0, b.x1)) + MARGIN_PT,
+    y0: Math.floor(Math.min(b.y0, b.y1)) - MARGIN_PT,
+    y1: Math.ceil(Math.max(b.y0, b.y1)) + MARGIN_PT,
+  }));
 }
 
 /**
@@ -213,7 +223,7 @@ export function RedactPage() {
           : {
               file: file.path,
               output_path: outputPath,
-              rects: boxesToRects(boxes, pageImages, pageDpi),
+              rects: boxesToRects(boxes),
             }
       )
     );
@@ -334,6 +344,7 @@ export function RedactPage() {
               <PageCanvas
                 key={page.index}
                 page={page}
+                dpi={pageDpi}
                 boxes={boxes.filter((b) => b.page === page.index)}
                 onAddBox={addBox}
                 onRemoveBox={removeBox}
@@ -441,6 +452,7 @@ function ModeButton({
 
 function PageCanvas({
   page,
+  dpi,
   boxes,
   onAddBox,
   onRemoveBox,
@@ -448,6 +460,7 @@ function PageCanvas({
   disabled,
 }: {
   page: PageImage;
+  dpi: number;
   boxes: RedactBox[];
   onAddBox: (box: Omit<RedactBox, 'id'>) => void;
   onRemoveBox: (id: string) => void;
@@ -455,11 +468,35 @@ function PageCanvas({
   disabled: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
   const dragStart = useRef<{ x: number; y: number } | null>(null);
   const [draft, setDraft] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  // The image's actual ON-SCREEN rendered size (not its natural pixel
+  // size) -- re-measured whenever the element's box changes so drawn
+  // boxes keep lining up with the image regardless of what the display
+  // size does (CSS scaling, window/panel resize, zoom, HiDPI, etc.).
+  const [dispSize, setDispSize] = useState<{ w: number; h: number } | null>(null);
 
+  useEffect(() => {
+    const el = imgRef.current;
+    if (!el) return;
+    const measure = () => {
+      const rect = el.getBoundingClientRect();
+      setDispSize({ w: rect.width, h: rect.height });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [page.dataUrl]);
+
+  const { wPts, hPts } = pageSizePts(page, dpi);
+
+  // Position relative to the image element's own top-left, in DISPLAYED
+  // pixels -- not the container's box, so any border/padding on the
+  // container can never introduce an offset.
   const posFromEvent = (e: ReactMouseEvent) => {
-    const rect = containerRef.current!.getBoundingClientRect();
+    const rect = imgRef.current!.getBoundingClientRect();
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   };
 
@@ -476,17 +513,51 @@ function PageCanvas({
   };
   const finishDrag = () => {
     if (dragStart.current && draft) {
-      const x0 = Math.min(draft.x0, draft.x1);
-      const x1 = Math.max(draft.x0, draft.x1);
-      const y0 = Math.min(draft.y0, draft.y1);
-      const y1 = Math.max(draft.y0, draft.y1);
+      const rect = imgRef.current!.getBoundingClientRect();
+      const dispW = rect.width;
+      const dispH = rect.height;
+      const x0Disp = Math.min(draft.x0, draft.x1);
+      const x1Disp = Math.max(draft.x0, draft.x1);
+      const y0Disp = Math.min(draft.y0, draft.y1);
+      const y1Disp = Math.max(draft.y0, draft.y1);
       // Ignore accidental clicks/tiny drags (a few px of jitter on a click).
-      if (x1 - x0 > 3 && y1 - y0 > 3) {
-        onAddBox({ page: page.index, x0, y0, x1, y1 });
+      if (x1Disp - x0Disp > 3 && y1Disp - y0Disp > 3 && dispW > 0 && dispH > 0) {
+        // Map DISPLAYED px straight to PDF points using the ratio of the
+        // page's point size to the image's actual on-screen size -- NOT
+        // natural pixel size, NOT render DPI. This is the fix: boxes used
+        // to be captured in natural-pixel space and scaled only by
+        // render DPI, which silently assumed displayed size == natural
+        // size. When the browser renders the image at any other size,
+        // that assumption is wrong and the box lands offset/undersized.
+        const scaleX = wPts / dispW;
+        const scaleY = hPts / dispH;
+        onAddBox({
+          page: page.index,
+          x0: x0Disp * scaleX,
+          y0: y0Disp * scaleY,
+          x1: x1Disp * scaleX,
+          y1: y1Disp * scaleY,
+        });
       }
     }
     dragStart.current = null;
     setDraft(null);
+  };
+
+  // Project a box (stored in PDF points) back to the CURRENT displayed
+  // px, for rendering the overlay -- re-derived on every render from
+  // `dispSize`, so already-drawn boxes stay visually aligned even if the
+  // image's displayed size changes later.
+  const toDisplayRect = (b: { x0: number; y0: number; x1: number; y1: number }) => {
+    if (!dispSize || dispSize.w === 0 || dispSize.h === 0) return null;
+    const scaleX = dispSize.w / wPts;
+    const scaleY = dispSize.h / hPts;
+    return {
+      left: Math.min(b.x0, b.x1) * scaleX,
+      top: Math.min(b.y0, b.y1) * scaleY,
+      width: Math.abs(b.x1 - b.x0) * scaleX,
+      height: Math.abs(b.y1 - b.y0) * scaleY,
+    };
   };
 
   return (
@@ -516,61 +587,70 @@ function PageCanvas({
         onMouseLeave={finishDrag}
         style={{
           position: 'relative',
-          width: page.width,
-          height: page.height,
+          display: 'inline-block',
           cursor: disabled ? 'default' : 'crosshair',
           userSelect: 'none',
-          border: '1px solid var(--border)',
+          // outline (not border): drawn on top without affecting the box
+          // model, so this container's content box -- where the image
+          // and overlay boxes are positioned -- can never be offset from
+          // the image element's own top-left by a border/padding inset.
+          outline: '1px solid var(--border)',
+          outlineOffset: -1,
         }}
       >
         <img
+          ref={imgRef}
           src={page.dataUrl}
           width={page.width}
           height={page.height}
           draggable={false}
           alt={`Page ${page.index + 1}`}
-          style={{ display: 'block', pointerEvents: 'none' }}
+          style={{ display: 'block', pointerEvents: 'none', maxWidth: '100%', height: 'auto' }}
         />
-        {boxes.map((b) => (
-          <div
-            key={b.id}
-            style={{
-              position: 'absolute',
-              left: Math.min(b.x0, b.x1),
-              top: Math.min(b.y0, b.y1),
-              width: Math.abs(b.x1 - b.x0),
-              height: Math.abs(b.y1 - b.y0),
-              background: 'rgba(216, 90, 48, 0.35)',
-              border: '1.5px solid var(--sev-high)',
-              pointerEvents: 'none',
-            }}
-          >
-            <button
-              onClick={() => onRemoveBox(b.id)}
-              onMouseDown={(e) => e.stopPropagation()}
-              title="Remove box"
+        {boxes.map((b) => {
+          const r = toDisplayRect(b);
+          if (!r) return null;
+          return (
+            <div
+              key={b.id}
               style={{
                 position: 'absolute',
-                top: -10,
-                right: -10,
-                width: 20,
-                height: 20,
-                borderRadius: '50%',
-                border: 'none',
-                background: 'var(--sev-high)',
-                color: '#fff',
-                fontSize: 12,
-                lineHeight: '20px',
-                textAlign: 'center',
-                cursor: 'pointer',
-                padding: 0,
-                pointerEvents: 'auto',
+                left: r.left,
+                top: r.top,
+                width: r.width,
+                height: r.height,
+                background: 'rgba(216, 90, 48, 0.35)',
+                border: '1.5px solid var(--sev-high)',
+                pointerEvents: 'none',
               }}
             >
-              ×
-            </button>
-          </div>
-        ))}
+              <button
+                onClick={() => onRemoveBox(b.id)}
+                onMouseDown={(e) => e.stopPropagation()}
+                title="Remove box"
+                style={{
+                  position: 'absolute',
+                  top: -10,
+                  right: -10,
+                  width: 20,
+                  height: 20,
+                  borderRadius: '50%',
+                  border: 'none',
+                  background: 'var(--sev-high)',
+                  color: '#fff',
+                  fontSize: 12,
+                  lineHeight: '20px',
+                  textAlign: 'center',
+                  cursor: 'pointer',
+                  padding: 0,
+                  pointerEvents: 'auto',
+                }}
+              >
+                ×
+              </button>
+            </div>
+          );
+        })}
         {draft && (
           <div
             style={{

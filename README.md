@@ -2,7 +2,7 @@
 
 Fully offline PDF toolkit with 22 professional tools — compress, merge, split, convert, protect, redact, watermark, and more. DPI-aware image recompression, AES-256 encryption, and PDF/A compliance. No cloud services, no accounts, no tracking.
 
-**v4.10**
+**v4.20**
 
 ---
 
@@ -23,6 +23,22 @@ pip install pikepdf pillow PySide6 PyMuPDF argon2-cffi pycryptodome cryptography
 - **Offline translation** (Translate tool) — `pip install argostranslate pytesseract langdetect`, the [Tesseract](https://github.com/tesseract-ocr/tesseract) binary, then `python setup_translation.py --install all` to download the language models. This download is the only step that uses the network; translation itself is fully offline.
 - [NumPy](https://numpy.org/) — improves photo vs diagram detection accuracy (`pip install numpy`)
 - [python-docx](https://python-docx.readthedocs.io/) — PDF to Word conversion (`pip install python-docx`)
+
+---
+
+## Frontend
+
+The GUI is a **React + Vite + TypeScript** app (`web-react/`), with its built bundle committed to `web-react/dist/` — end users just pull and run, **no Node.js required**.
+
+If you're modifying the frontend, you'll need Node.js + npm:
+
+```bash
+cd web-react
+npm install
+npm run build
+```
+
+The legacy vanilla JS frontend (`web/`) is retained as a fallback — set `PDF_TOOLKIT_UI=legacy` to force it — but is no longer the active UI.
 
 ---
 
@@ -62,7 +78,7 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 ### Security
 - **Protect PDF** — add password and set permissions (AES-256)
 - **Unlock PDF** — remove password protection
-- **Redact PDF** — permanently remove sensitive text
+- **Redact PDF** — permanently remove sensitive text via search terms or a visual box-drawing mode; true content destruction (including form-field values), not a cosmetic overlay
 - **Enhanced encryption** — custom `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 and Argon2id key derivation
 
 ### Page Operations
@@ -72,7 +88,7 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 - **N-up Layout** — arrange multiple pages per sheet
 
 ### Content & Watermark
-- **Add Watermark** — overlay text or image watermark
+- **Add Watermark** — overlay text or image watermark, with an optional tiled/diagonal mode that repeats across the page so it can't be trivially cropped out
 - **Add Page Numbers** — insert page numbering
 - **Edit Metadata** — view and edit PDF properties
 
@@ -229,7 +245,9 @@ Text and vector graphics are never modified.
 | `ui/net_guard.py` | Network kill-switch — blocks all non-local web-engine requests |
 | `ui/tool_registry.py` | Centralized tool definitions and categories |
 | `ui/pages/` | Individual tool pages (one per tool) |
-| `web/` | Frontend HTML, CSS, and JavaScript |
+| `web-react/` | Active frontend — React + Vite + TypeScript (source + committed `dist/` build) |
+| `web/` | Legacy vanilla JS frontend — retained as a fallback (`PDF_TOOLKIT_UI=legacy`), no longer active by default |
+| `assets/fonts/` | Bundled fonts (DejaVu Sans) for image-preserving PDF translation output |
 | `requirements.txt` | Python dependencies |
 
 ---

@@ -23,14 +23,13 @@ interface TranslationStatus {
   argosPairs: string[];
   languages: Language[];
 }
-interface ImageResult {
-  success: boolean;
+interface ImageTranslateResult {
   sourceText?: string;
   translatedText?: string;
   source?: string;
   target?: string;
+  ocrLang?: string;
   note?: string;
-  error?: string;
 }
 interface PdfTranslateResult {
   output: string;
@@ -40,6 +39,8 @@ interface PdfTranslateResult {
   target: string;
   note?: string;
 }
+type TranslateResult = PdfTranslateResult | ImageTranslateResult;
+type TranslateMode = 'image' | 'pdf';
 
 type OutputFormat = 'pdf' | 'docx' | 'txt';
 
@@ -62,11 +63,20 @@ function isPdf(path: string) {
 }
 
 /**
- * React port of web/js/pages/translate.js. Two bridge flows, both
- * preserved exactly:
- *   - Image (sync): BridgeAPI.translateImage(path, source, target).
- *   - PDF (async): BridgeAPI.startTranslatePdf({ inputPath, outputPath,
- *     source, target }) — camelCase, matches ui/bridge.py directly.
+ * React port of web/js/pages/translate.js. Both flows are now async,
+ * off the UI thread, through the same useOperation('translate') flow:
+ *   - Image: BridgeAPI.startTranslateImage({ path, source, target,
+ *     protectTerms }) -- was a synchronous translateImage() call, which
+ *     froze the window ("not responding") on Argos's slow first-use
+ *     model load since it ran on the UI thread. ui/bridge.py now runs it
+ *     via _run_in_thread like every other tool, same as the PDF flow
+ *     below already did.
+ *   - PDF: BridgeAPI.startTranslatePdf({ inputPath, outputPath, source,
+ *     target, protectTerms }) — camelCase, matches ui/bridge.py directly.
+ * Both share one useOperation('translate') instance (same toolKey, so
+ * progress/done routing works for either) — `lastMode` tracks which flow
+ * is in flight so the result/progress UI knows how to interpret
+ * op.result.results, since the two flows return different shapes.
  * translate_pdf's result ({output, outputSize, pages, source, target,
  * files, output_dir}, verified in pdf_translate.py) is one of the pages
  * vanilla already reads correctly via data.results.
@@ -78,9 +88,8 @@ export function TranslatePage() {
   const [target, setTarget] = useState('en');
   const [files, setFiles] = useState<PickedFile[]>([]);
   const [outputPath, setOutputPath] = useState<string | null>(null);
-  const [imageResult, setImageResult] = useState<ImageResult | null>(null);
-  const [imageBusy, setImageBusy] = useState(false);
   const [outputFormat, setOutputFormat] = useState<OutputFormat>('pdf');
+  const [lastMode, setLastMode] = useState<TranslateMode | null>(null);
   // Argos loads the target language model into memory on its first use in
   // the process — that first call has a real, noticeable delay beyond
   // normal translation time. Tracked client-side (no backend signal for
@@ -99,62 +108,78 @@ export function TranslatePage() {
         .filter(Boolean),
     [protectTermsInput]
   );
-  const op = useOperation<PdfTranslateResult>('translate');
+  const op = useOperation<TranslateResult>('translate');
+  // Mount-time provisioning check, off the UI thread: translation_status()'s
+  // first call in the process imports argostranslate (pulls in ctranslate2
+  // and friends), which can take several seconds cold. Running it through
+  // the synchronous getTranslationStatus() slot froze the whole window on
+  // Translate-page mount, before any translation action -- this async
+  // counterpart (startGetTranslationStatus, toolKey "translationStatus")
+  // keeps that cost off the UI thread, same pattern as the translate
+  // actions themselves.
+  const statusOp = useOperation<TranslationStatus>('translationStatus');
 
-  usePageBusy(op.status === 'running' || imageBusy);
+  usePageBusy(op.status === 'running');
 
   useEffect(() => {
-    bridgeApi.getTranslationStatus().then((res) => {
-      setStatus(res as unknown as TranslationStatus);
-      const en = (res as unknown as TranslationStatus).languages?.find((l) => l.code === 'en');
-      if (en) setTarget('en');
-    });
+    statusOp.run(() => bridgeApi.startGetTranslationStatus({ toolKey: 'translationStatus' }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    if (statusOp.status === 'done' && statusOp.result?.results) {
+      const res = statusOp.result.results;
+      setStatus(res);
+      const en = res.languages?.find((l) => l.code === 'en');
+      if (en) setTarget('en');
+    } else if (statusOp.status === 'error') {
+      toast.error(statusOp.error || 'Could not check translation setup.');
+    }
+  }, [statusOp.status, statusOp.result, statusOp.error, toast]);
+
+  useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
-      const { pages, note } = op.result.results;
-      toast.success(`Translated ${pages} page${pages === 1 ? '' : 's'}.`);
-      // e.g. ar/hi/bn redirected from PDF to .docx — see pdf_translate.py.
-      if (note) toast.info(note);
       setModelWarmedUp(true);
+      if (lastMode === 'pdf') {
+        const { pages, note } = op.result.results as PdfTranslateResult;
+        toast.success(`Translated ${pages} page${pages === 1 ? '' : 's'}.`);
+        // e.g. ar/hi/bn redirected from PDF to .docx — see pdf_translate.py.
+        if (note) toast.info(note);
+      } else if (lastMode === 'image') {
+        const { note } = op.result.results as ImageTranslateResult;
+        if (note) toast.info(note);
+      }
     } else if (op.status === 'error') {
       toast.error(op.error || 'Translation failed.');
       setModelWarmedUp(true);
     }
-  }, [op.status, op.result, op.error, toast]);
+  }, [op.status, op.result, op.error, lastMode, toast]);
 
   const file = files[0] ?? null;
 
-  const runImage = async (path: string, src: string, tgt: string, terms: string[]) => {
-    setImageBusy(true);
-    setImageResult(null);
-    try {
-      const res = (await bridgeApi.translateImage(path, src, tgt, terms)) as unknown as ImageResult;
-      if (!res.success) {
-        toast.error(res.error || 'Translation failed.');
-      } else {
-        if (res.note) toast.info(res.note);
-        setImageResult(res);
-      }
-    } catch {
-      toast.error('Could not translate the image.');
-    } finally {
-      setImageBusy(false);
-      setModelWarmedUp(true);
-    }
+  const runImage = (path: string, src: string, tgt: string, terms: string[]) => {
+    setLastMode('image');
+    op.run(() =>
+      bridgeApi.startTranslateImage({
+        toolKey: 'translate',
+        path,
+        source: src,
+        target: tgt,
+        protectTerms: terms,
+      })
+    );
   };
 
   useEffect(() => {
     if (!file) {
       setOutputPath(null);
-      setImageResult(null);
+      op.reset();
       return;
     }
     if (isImage(file.path)) {
-      void runImage(file.path, source, target, protectTerms);
+      runImage(file.path, source, target, protectTerms);
     } else if (isPdf(file.path)) {
-      setImageResult(null);
+      op.reset();
     } else {
       toast.warning('Unsupported file type.');
     }
@@ -162,17 +187,18 @@ export function TranslatePage() {
     // picked, not on every source/target/protectTerms change (that's
     // onSourceChange/onTargetChange below, matching vanilla's separate
     // _onLangChange path; protectTerms edits apply on the next run).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file]);
 
   // Re-run image translation when languages change, matching vanilla's
   // _onLangChange behavior.
   const onSourceChange = (v: string) => {
     setSource(v);
-    if (file && isImage(file.path) && !imageBusy) void runImage(file.path, v, target, protectTerms);
+    if (file && isImage(file.path) && op.status !== 'running') runImage(file.path, v, target, protectTerms);
   };
   const onTargetChange = (v: string) => {
     setTarget(v);
-    if (file && isImage(file.path) && !imageBusy) void runImage(file.path, source, v, protectTerms);
+    if (file && isImage(file.path) && op.status !== 'running') runImage(file.path, source, v, protectTerms);
   };
 
   const pickOutput = async () => {
@@ -199,6 +225,7 @@ export function TranslatePage() {
       toast.warning('Choose an output location.');
       return;
     }
+    setLastMode('pdf');
     op.run(() =>
       bridgeApi.startTranslatePdf({
         toolKey: 'translate',
@@ -220,39 +247,62 @@ export function TranslatePage() {
     }
   };
 
+  const running = op.status === 'running';
   const ready = !!status?.argosAvailable && (status?.argosPairs.length ?? 0) > 0;
   const r = op.status === 'done' ? op.result?.results : null;
+  const pdfResult = r && lastMode === 'pdf' ? (r as PdfTranslateResult) : null;
+  const imageResult = r && lastMode === 'image' ? (r as ImageTranslateResult) : null;
+  const busyLabel = modelWarmedUp ? 'Translating…' : 'Loading language model…';
 
   return (
     <div className="console">
       <PageHeader title="Translate" subtitle="Offline translation of documents and image text" backButton={false} />
 
-      {status && (
-        <div
-          className="panel"
-          style={{
-            borderLeftWidth: 3,
-            borderLeftStyle: 'solid',
-            borderLeftColor: ready ? 'var(--sev-info)' : 'var(--sev-medium)',
-            fontSize: 'var(--font-size-sm)',
-            color: 'var(--text-2)',
-            marginBottom: 'var(--space-3)',
-          }}
-        >
-          {ready ? (
-            <>
-              Offline translation ready · {status.languages.filter((l) => l.translateTo).length} language(s) installed
-              {status.ocrAvailable ? ' · OCR available' : ' · OCR not installed'}
-            </>
-          ) : (
-            <>
-              Translation models are not installed yet. Run{' '}
-              <code className="mono">python setup_translation.py --install all</code> once (the only online step),
-              then translation works fully offline.
-            </>
-          )}
-        </div>
-      )}
+      {!status ? (
+        <Card>
+          <div
+            style={{
+              textAlign: 'center',
+              color: 'var(--text-1)',
+              fontWeight: 600,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 10,
+              padding: '4px 0',
+            }}
+          >
+            <span className="spinner" style={{ width: 18, height: 18, borderWidth: 3 }} />
+            Checking translation setup…
+          </div>
+        </Card>
+      ) : (
+        <>
+          <div
+            className="panel"
+            style={{
+              borderLeftWidth: 3,
+              borderLeftStyle: 'solid',
+              borderLeftColor: ready ? 'var(--sev-info)' : 'var(--sev-medium)',
+              fontSize: 'var(--font-size-sm)',
+              color: 'var(--text-2)',
+              marginBottom: 'var(--space-3)',
+            }}
+          >
+            {ready ? (
+              <>
+                Offline translation ready · {status.languages.filter((l) => l.translateTo).length} language(s)
+                installed
+                {status.ocrAvailable ? ' · OCR available' : ' · OCR not installed'}
+              </>
+            ) : (
+              <>
+                Translation models are not installed yet. Run{' '}
+                <code className="mono">python setup_translation.py --install all</code> once (the only online step),
+                then translation works fully offline.
+              </>
+            )}
+          </div>
 
       <Card>
         <div style={{ display: 'flex', gap: 'var(--space-4)', flexWrap: 'wrap', alignItems: 'flex-end' }}>
@@ -261,6 +311,7 @@ export function TranslatePage() {
             <Select
               value={source}
               onChange={onSourceChange}
+              disabled={running}
               options={[
                 { value: 'auto', label: 'Auto-detect' },
                 ...(status?.languages ?? []).map((l) => ({
@@ -276,6 +327,7 @@ export function TranslatePage() {
             <Select
               value={target}
               onChange={onTargetChange}
+              disabled={running}
               options={(status?.languages ?? []).map((l) => ({
                 value: l.code,
                 label: `${l.name}${l.translateTo === false ? ' — not installed' : ''}`,
@@ -293,6 +345,7 @@ export function TranslatePage() {
           <TextInput
             value={protectTermsInput}
             onChange={setProtectTermsInput}
+            disabled={running}
             placeholder="Comma-separated names or places, e.g. Aria Nakamura, Zephyr"
           />
           <div style={{ marginTop: 6, color: 'var(--text-3)', fontSize: 'var(--font-size-xs)' }}>
@@ -310,7 +363,7 @@ export function TranslatePage() {
           title="Drop a PDF or an image"
           subtitle="PDF, PNG, JPG, TIFF…"
           accept="PDF & Images (*.pdf *.png *.jpg *.jpeg *.tiff *.bmp *.gif)"
-          disabled={op.status === 'running' || imageBusy}
+          disabled={running}
         />
       </div>
 
@@ -323,6 +376,7 @@ export function TranslatePage() {
                 <Select
                   value={outputFormat}
                   onChange={onFormatChange}
+                  disabled={running}
                   options={(Object.keys(FORMAT_OPTIONS) as OutputFormat[]).map((key) => ({
                     value: key,
                     label: FORMAT_OPTIONS[key].label,
@@ -343,14 +397,14 @@ export function TranslatePage() {
               <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
                 {outputPath ? bridgeApi.basename(outputPath) : 'No output file selected'}
               </span>
-              <button onClick={pickOutput} disabled={op.status === 'running'} className="btn-ghost">
+              <button onClick={pickOutput} disabled={running} className="btn-ghost">
                 Output…
               </button>
-              <button onClick={runPdf} disabled={op.status === 'running' || !outputPath} className="btn-primary">
-                {op.status === 'running' ? (
+              <button onClick={runPdf} disabled={running || !outputPath} className="btn-primary">
+                {running && lastMode === 'pdf' ? (
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
                     <span className="spinner" />
-                    {modelWarmedUp ? 'Translating…' : 'Loading language model…'}
+                    {busyLabel}
                   </span>
                 ) : (
                   'Translate'
@@ -366,13 +420,13 @@ export function TranslatePage() {
         </div>
       )}
 
-      {op.status === 'running' && (
+      {running && lastMode === 'pdf' && (
         <div style={{ marginTop: 'var(--space-4)' }}>
           <ProgressPanel
             pct={op.progress?.pct ?? 0}
             current={op.progress?.current}
             total={op.progress?.total}
-            filename={op.progress?.filename ?? 'Translating…'}
+            filename={op.progress?.filename ?? busyLabel}
             onCancel={() => {
               bridgeApi.cancel('translate');
               op.reset();
@@ -382,46 +436,57 @@ export function TranslatePage() {
         </div>
       )}
 
-      {imageBusy && (
+      {running && lastMode === 'image' && (
         <div style={{ marginTop: 'var(--space-4)' }}>
-          <Card>
+          <Card
+            style={{
+              borderLeftWidth: 3,
+              borderLeftStyle: 'solid',
+              borderLeftColor: 'var(--sev-info)',
+            }}
+          >
             <div
               style={{
                 textAlign: 'center',
-                color: 'var(--text-2)',
+                color: 'var(--text-1)',
+                fontWeight: 600,
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                gap: 8,
+                gap: 10,
+                padding: '4px 0',
               }}
             >
-              <span className="spinner" />
+              <span className="spinner" style={{ width: 18, height: 18, borderWidth: 3 }} />
               {modelWarmedUp ? 'Reading & translating…' : 'Loading language model…'}
             </div>
           </Card>
         </div>
       )}
 
-      {imageResult && !imageBusy && (
+      {imageResult && !running && (
         <div style={{ display: 'flex', gap: 'var(--space-4)', marginTop: 'var(--space-4)', flexWrap: 'wrap' }}>
           <TextPanel label={`Detected text (${imageResult.source ?? '?'})`} text={imageResult.sourceText ?? ''} onCopy={copy} />
           <TextPanel label={`Translation (${imageResult.target ?? '?'})`} text={imageResult.translatedText ?? ''} onCopy={copy} />
         </div>
       )}
 
-      {r && (
+      {pdfResult && (
         <div style={{ marginTop: 'var(--space-4)' }}>
           <Card>
             <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
               <span style={{ flex: 1, fontSize: 'var(--font-size-sm)' }}>
-                Saved <strong className="mono">{bridgeApi.basename(r.output)}</strong> ({r.source} → {r.target})
+                Saved <strong className="mono">{bridgeApi.basename(pdfResult.output)}</strong> ({pdfResult.source} →{' '}
+                {pdfResult.target})
               </span>
-              <button onClick={() => bridgeApi.openFilePath(r.output)} className="btn-ghost">
+              <button onClick={() => bridgeApi.openFilePath(pdfResult.output)} className="btn-ghost">
                 Open
               </button>
             </div>
           </Card>
         </div>
+      )}
+        </>
       )}
     </div>
   );

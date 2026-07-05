@@ -41,6 +41,14 @@ export interface RealBridgeAPI {
 
   // -- Translation (offline) -------------------------------------------
   getTranslationStatus(): Promise<Record<string, unknown>>;
+  // Async counterpart of getTranslationStatus, for the React UI: the
+  // sync call above runs translation_status() on the UI thread, and its
+  // first call in the process imports argostranslate (pulls in
+  // ctranslate2 and friends) which can take several seconds cold --
+  // freezing the whole window on Translate-page mount, before any
+  // translation. Results arrive via "done" under toolKey
+  // "translationStatus".
+  startGetTranslationStatus(params: Record<string, unknown>): void;
   // protectTerms: user-supplied words (names/places) to leave untranslated,
   // on top of pdf_translate.py's built-in heuristics (emails, URLs,
   // "City, ST", phone numbers, acronyms, numbers). ui/bridge.py registers
@@ -59,6 +67,15 @@ export interface RealBridgeAPI {
     protectTerms?: string[]
   ): Promise<Record<string, unknown>>;
   startTranslatePdf(params: Record<string, unknown>): void;
+  // Async counterparts of translateText/translateImage, off the UI
+  // thread (ui/bridge.py) -- fire-and-forget like every startXxx, results
+  // arrive via the "done" EventBus event under toolKey "translate", same
+  // as startTranslatePdf. translateText/translateImage above stay
+  // synchronous for web/js/bridge.js's unmodified callers, but the React
+  // UI must use these instead: Argos's first-use model load is slow
+  // enough on the synchronous path to freeze the whole window.
+  startTranslateText(params: Record<string, unknown>): void;
+  startTranslateImage(params: Record<string, unknown>): void;
   checkEpdf(path: string): Promise<{
     isEpdf: boolean;
     cipher?: string;

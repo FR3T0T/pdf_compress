@@ -770,13 +770,60 @@ def _pdf_escape(text):
     return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
+def _tiled_watermark_body(text, font_size, cos_a, sin_a, pw, ph):
+    """Build the repeated Tm/Tj pairs for a tiled diagonal watermark.
+
+    Spacing scales with the approximate rendered text width and font_size
+    (same avg-char-width estimate the single-instance mode already uses)
+    so large text doesn't overlap illegibly and small text isn't too
+    sparse. Rows are staggered by half a step so the pattern isn't just a
+    plain rectangular grid, matching the classic tiled-watermark look and
+    making the text harder to crop out along a straight line.
+
+    `pad` extends the grid well past every edge (by a full tile step) so
+    a 45-degree-rotated tile still covers the corners fully -- a rotated
+    tile's on-page footprint is bigger than its untransformed bounding
+    box, so starting/stopping exactly at 0/pw/ph would leave the corners
+    thin or bare.
+    """
+    safe_text = _pdf_escape(text)
+    approx_text_width = len(text) * font_size * 0.5
+    step_x = approx_text_width + font_size * 2.5
+    step_y = font_size * 3
+    pad = max(step_x, step_y)
+
+    lines = []
+    y = -pad
+    row = 0
+    while y < ph + pad:
+        offset = (row % 2) * (step_x / 2)
+        x = -pad + offset
+        while x < pw + pad:
+            lines.append(f"{cos_a:.4f} {sin_a:.4f} {-sin_a:.4f} {cos_a:.4f} {x:.2f} {y:.2f} Tm")
+            lines.append(f"({safe_text}) Tj")
+            x += step_x
+        y += step_y
+        row += 1
+    return "\n".join(lines)
+
+
 def add_watermark(input_path, output_path, text="WATERMARK", opacity=0.3,
                   rotation=45, font_size=48, color="#888888", position="center",
-                  page_range=None, cancel=None):
+                  mode="single", page_range=None, cancel=None):
     """Add a text watermark to PDF pages.
 
-    Text is centered on the page (accounting for text width) and supports
-    special characters. Opacity applies to both fill and stroke.
+    mode="single" (default): one instance of the text, centered on the
+    page and rotated by `rotation` -- the original behavior, unchanged.
+
+    mode="tiled": the text is repeated in a staggered grid across the
+    entire page at the `rotation` angle, so a single crop/redaction of
+    one area can't remove the watermark -- every tile carries the same
+    fill_opacity/color as the single mode. `position` is ignored in
+    tiled mode since there's no one placement to apply it to.
+
+    Text supports special characters (escaped for the PDF content
+    stream). Opacity applies to both fill and stroke via the page's
+    /ExtGState, same as single mode.
     """
     src = pikepdf.open(input_path)
     num_pages = len(src.pages)
@@ -814,9 +861,16 @@ def add_watermark(input_path, output_path, text="WATERMARK", opacity=0.3,
         pw = float(mbox[2]) - float(mbox[0])
         ph = float(mbox[3]) - float(mbox[1])
 
-        # Center of page, offset by half the text width so it's visually centered
-        cx = pw / 2 - (approx_text_width / 2) * cos_a
-        cy = ph / 2 - (approx_text_width / 2) * sin_a
+        if mode == "tiled":
+            body = _tiled_watermark_body(text, font_size, cos_a, sin_a, pw, ph)
+        else:
+            # Center of page, offset by half the text width so it's visually centered
+            cx = pw / 2 - (approx_text_width / 2) * cos_a
+            cy = ph / 2 - (approx_text_width / 2) * sin_a
+            body = (
+                f"{cos_a:.4f} {sin_a:.4f} {-sin_a:.4f} {cos_a:.4f} {cx:.2f} {cy:.2f} Tm\n"
+                f"({safe_text}) Tj"
+            )
 
         # Build watermark content stream
         wm = (
@@ -825,8 +879,7 @@ def add_watermark(input_path, output_path, text="WATERMARK", opacity=0.3,
             f"{r:.3f} {g:.3f} {b:.3f} rg\n"
             f"BT\n"
             f"/F1 {font_size} Tf\n"
-            f"{cos_a:.4f} {sin_a:.4f} {-sin_a:.4f} {cos_a:.4f} {cx:.2f} {cy:.2f} Tm\n"
-            f"({safe_text}) Tj\n"
+            f"{body}\n"
             f"ET\n"
             f"Q\n"
         )

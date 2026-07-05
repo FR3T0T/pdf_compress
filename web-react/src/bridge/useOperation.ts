@@ -46,7 +46,20 @@ export function useOperation<TResult = unknown>(toolKey: string): UseOperationRe
     setProgress(null);
     setResult(null);
     setError(null);
-    startFn();
+    // Defer the actual dispatch two frames so the browser/WebEngine has
+    // definitely painted the "running" state (spinner, disabled inputs)
+    // before startFn's bridge call runs. Without this, the state update
+    // and the dispatch happen in the same synchronous tick, and React
+    // doesn't commit/paint until that tick finishes -- so anything that
+    // makes the dispatch itself take even a little synchronous time (IPC
+    // serialization, a busy renderer process, etc.) pushes the paint out
+    // with it. Two rAFs is the standard "wait for a real paint" pattern
+    // (a single one can still land before the frame is presented).
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        startFn();
+      });
+    });
   }, []);
 
   const cancel = useCallback(() => {
