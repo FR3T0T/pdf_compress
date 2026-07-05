@@ -1,0 +1,274 @@
+/* ==========================================================================
+   Security console design tokens.
+   Sharp corners, dark technical palette, monospace for machine-readable
+   data. No web fonts — system mono/sans stacks only (offline-safe).
+
+   Dark is the default/:root palette; [data-theme="light"] below overrides
+   every token with a light counterpart tuned for the SAME identity (cool
+   graphite/steel, not a generic light UI) — see Sidebar.tsx for how the
+   toggle sets data-theme and persists the choice.
+
+   Severity colors have two variants each: --sev-X (saturated fill, for
+   borders/badge-tint backgrounds/progress fills — non-text UI, WCAG
+   1.4.11 3:1) and --sev-X-text (for text/labels, WCAG AA 4.5:1). These
+   necessarily diverge in light mode: a fill bright enough to read behind
+   black button text is too light to use AS text on a white page, and the
+   reverse for text darkened enough to read on white would be too dark to
+   read against a near-black panel. All contrast figures below verified
+   against both --panel-bg and --panel-bg-elevated with a WCAG relative-
+   luminance calculator, not eyeballed.
+   --sev-X-rgb mirrors --sev-X as an unpacked "r, g, b" triplet so the
+   badge tint backgrounds below can alpha-blend via rgba(var(--x-rgb), a)
+   and stay correct per-theme instead of hardcoding the dark-mode hex.
+   ========================================================================== */
+
+:root {
+  --page-bg: #0c0d10;
+  --panel-bg: #14161a;
+  --panel-bg-elevated: #1b1e24;
+  --border: #262a30;
+  --border-strong: #33383f;
+
+  --text-1: #e4e6e9;
+  --text-2: #8a9099;
+  /* 2.91:1 pre-fix (#5c6169) — below even the 3:1 non-text floor despite
+     being used as real label/caption text across ~23 files. 4.69:1 now. */
+  --text-3: #7c828e;
+
+  --sev-high: #d85a30;
+  --sev-high-text: #f0997b;
+  --sev-medium: #efb35a;
+  --sev-medium-text: #efb35a;
+  --sev-low: #378add;
+  --sev-low-text: #6cb1f2;
+  --sev-info: #1d9e75;
+  --sev-info-text: #4fc79f;
+
+  --sev-high-rgb: 216, 90, 48;
+  --sev-medium-rgb: 239, 179, 90;
+  --sev-low-rgb: 55, 138, 221;
+  --sev-info-rgb: 29, 158, 117;
+
+  --radius-panel: 8px;
+  --radius-panel-sm: 6px;
+  --radius-badge: 4px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 20px;
+  --space-5: 28px;
+
+  --font-sans:
+    -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono:
+    ui-monospace, 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+
+  --font-size-xs: 11px;
+  --font-size-sm: 13px;
+  --font-size-md: 14px;
+  --font-size-lg: 17px;
+}
+
+[data-theme='light'] {
+  --page-bg: #e8eaed;
+  --panel-bg: #ffffff;
+  --panel-bg-elevated: #eef0f3;
+  --border: #d7dbe0;
+  /* 3.14:1 — input/control borders are a real (non-text) UI component,
+     not a decorative divider, so this needs to clear 3:1 too. */
+  --border-strong: #8a929e;
+
+  --text-1: #14171c;
+  --text-2: #565c66;
+  --text-3: #666d79;
+
+  /* Fills stay bright enough to sit behind black button/logo text
+     (verified: #0c0d10 on each of these is >= 4.9:1) and to clear 3:1 as
+     a border/tint against both --panel-bg and --panel-bg-elevated.
+     --sev-high/--sev-low keep their dark-mode hex (already >= 3:1 on
+     white); --sev-medium and --sev-info needed real darkening. */
+  --sev-high: #d85a30;
+  --sev-medium: #b87e1a;
+  --sev-low: #378add;
+  --sev-info: #1a9570;
+
+  /* Text variants: darkened well past the fills for 4.5:1 AA on white —
+     the exact "coral/amber/blue/teal wash out on white" case. */
+  --sev-high-text: #a8391a;
+  --sev-medium-text: #8f6000;
+  --sev-low-text: #1a5a96;
+  --sev-info-text: #0f7a5c;
+
+  --sev-high-rgb: 216, 90, 48;
+  --sev-medium-rgb: 184, 126, 26;
+  --sev-low-rgb: 55, 138, 221;
+  --sev-info-rgb: 26, 149, 112;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--page-bg);
+  color: var(--text-1);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-md);
+  -webkit-font-smoothing: antialiased;
+}
+
+.console {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: var(--space-5) var(--space-4) 64px;
+}
+
+.console-heading {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+  margin: 0 0 2px;
+}
+
+.console-subheading {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  color: var(--text-2);
+  margin: 0 0 var(--space-4);
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  padding: var(--space-4);
+}
+
+.panel + .panel {
+  margin-top: var(--space-3);
+}
+
+/* ---------------------------------------------------------------- badges */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: var(--radius-badge);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.badge--high {
+  color: var(--sev-high-text);
+  background: rgba(var(--sev-high-rgb), 0.14);
+  border: 1px solid rgba(var(--sev-high-rgb), 0.35);
+}
+
+.badge--medium {
+  color: var(--sev-medium-text);
+  background: rgba(var(--sev-medium-rgb), 0.14);
+  border: 1px solid rgba(var(--sev-medium-rgb), 0.35);
+}
+
+.badge--low {
+  color: var(--sev-low-text);
+  background: rgba(var(--sev-low-rgb), 0.14);
+  border: 1px solid rgba(var(--sev-low-rgb), 0.35);
+}
+
+.badge--info {
+  color: var(--sev-info-text);
+  background: rgba(var(--sev-info-rgb), 0.14);
+  border: 1px solid rgba(var(--sev-info-rgb), 0.35);
+}
+
+/* ------------------------------------------------------------- scrollbar */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-badge);
+}
+
+/* ------------------------------------------------------------------ misc */
+
+button {
+  font-family: var(--font-sans);
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+a {
+  color: var(--sev-low-text);
+}
+
+/* --------------------------------------------------------- button variants
+   Shared across tool pages so each doesn't repeat its own inline style
+   object. Sizing/typography match navButtonStyle/GhostButton conventions
+   already established in Sidebar.tsx / dev tooling. */
+
+.btn-primary,
+.btn-ghost {
+  border-radius: var(--radius-panel-sm);
+  padding: 8px 16px;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.btn-primary {
+  background: var(--sev-info);
+  border: 1px solid var(--sev-info);
+  color: #0c0d10;
+}
+
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-1);
+  font-weight: 400;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spinner {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: -2px;
+}

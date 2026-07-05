@@ -24,6 +24,7 @@ with a clear, actionable message.
 from __future__ import annotations
 
 import os
+import re
 import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -217,11 +218,111 @@ def _resolve_source(text: str, source: str) -> str:
     return detected
 
 
-def translate_text(text: str, target: str, source: str = "auto") -> dict:
+# ════════════════════════════════════════════════════════════════════
+#  Protecting literals during translation
+#
+#  Sent raw, Argos hallucinates on lone symbols (a bare "|" becomes
+#  "124"/"Yep 124") and translates proper nouns it shouldn't ("Commerce"
+#  -> "Handel"). translate_line() splits a line on separator characters,
+#  masks emails/URLs/"City, ST"/phone numbers/acronyms/numbers/caller-
+#  supplied terms with sentinel tokens before handing the remainder to
+#  the model, then restores them afterward -- the model never sees the
+#  literal, so it can't mistranslate or hallucinate on it. See _sentinel()
+#  for why the tokens are plain ASCII, not the originally-planned
+#  private-use-area codepoints.
+# ════════════════════════════════════════════════════════════════════
+
+_SEP_RE = re.compile(r'(\s*[|•·‣▪◦]\s*|\s{2,})')
+_PATTERNS = [
+    re.compile(r'\b[\w.+-]+@[\w-]+\.[\w.-]+\b'),
+    re.compile(r'\b(?:https?://|www\.)\S+|\b[\w-]+\.(?:com|org|net|edu|io|gov)(?:/\S*)?\b', re.I),
+    re.compile(r'\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*,\s*[A-Z]{2}\b'),
+    re.compile(r'\+?\d[\d\-\(\)\.\s]{6,}\d'),
+    re.compile(r'\b(?:[A-Z]\.){1,}[A-Z]?\b'),
+    re.compile(r'\b[A-Z]{2,5}\b'),
+    re.compile(r'\b\d[\d,.\-/]*\b'),
+]
+
+
+def _sentinel(i):
+    # ASCII, not the private-use-area codepoints this was originally
+    # written with: verified against the installed Argos model that PUA
+    # sentinels get corrupted mid-translation (e.g. \uE010 comes back as
+    # a real Cyrillic letter), silently destroying the protected span on
+    # restore. This single-token ASCII form survives Argos translation
+    # intact in testing for the realistic case (a handful of protected
+    # spans per line); very dense lines with many sentinels are not fully
+    # reliable -- a limitation of asking a generative NMT model to pass
+    # through unfamiliar tokens verbatim, not something a smarter
+    # sentinel format alone can fully solve.
+    return f"Zqpt{i}qzX"
+
+
+def _protect(text, extra_terms):
+    spans = []
+    for term in (extra_terms or []):
+        for m in re.finditer(rf'\b{re.escape(term)}\b', text):
+            spans.append((m.start(), m.end()))
+    for rx in _PATTERNS:
+        for m in rx.finditer(text):
+            spans.append((m.start(), m.end()))
+    spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+    chosen, last = [], -1
+    for a, b in spans:
+        if a >= last:
+            chosen.append((a, b))
+            last = b
+    saved = {}
+    for i, (a, b) in enumerate(reversed(chosen)):
+        key = _sentinel(i)
+        saved[key] = text[a:b]
+        text = text[:a] + key + text[b:]
+    return text, saved
+
+
+def _restore(text, saved):
+    for key, val in saved.items():
+        text = text.replace(key, val)
+    return text
+
+
+_LETTER_RE = re.compile(r'[A-Za-zÀ-ɏЀ-ӿ]')
+
+
+def translate_line(line, translate_fn, protect_terms=None):
+    """Translate one line, protecting separators/emails/phones/acronyms/
+    numbers/caller-supplied terms from the model. See module docstring
+    above this section for why.
+    """
+    if not line.strip():
+        return line
+    out = []
+    for part in _SEP_RE.split(line):
+        if not part or _SEP_RE.fullmatch(part):
+            out.append(part)
+            continue
+        masked, saved = _protect(part, protect_terms)
+        residual = masked
+        for k in saved:
+            residual = residual.replace(k, "")
+        if not _LETTER_RE.search(residual):
+            out.append(part)
+            continue
+        out.append(_restore(translate_fn(masked), saved))
+    return ''.join(out)
+
+
+def translate_text(text: str, target: str, source: str = "auto",
+                    protect_terms: Optional[list[str]] = None) -> dict:
     """Translate a block of text. Returns {translated, source, target}.
 
     Argos pivots through English automatically when a direct model pair
-    isn't installed (e.g. de→en→ru).
+    isn't installed (e.g. de→en→ru). Routed line-by-line through
+    translate_line() so separators/emails/phone numbers/acronyms/proper
+    nouns like "City, ST" survive instead of being hallucinated or
+    mistranslated (see the section above). ``protect_terms`` lets callers
+    add their own words (names, places) the heuristic patterns wouldn't
+    otherwise catch.
     """
     if not text or not text.strip():
         return {"translated": "", "source": source, "target": target}
@@ -235,14 +336,21 @@ def translate_text(text: str, target: str, source: str = "auto") -> dict:
     t, _p = _argos()
     from_code = LANG_BY_CODE[src].argos
     to_code = LANG_BY_CODE[target].argos
-    try:
-        translated = t.translate(text, from_code, to_code)
-    except Exception as exc:
-        raise ModelMissingError(
-            f"No offline model for {LANG_BY_CODE[src].name} → "
-            f"{LANG_BY_CODE[target].name}. Install it with:\n"
-            f"    python setup_translation.py --install {src} {target}"
-        ) from exc
+
+    def _translate_fn(s: str) -> str:
+        try:
+            return t.translate(s, from_code, to_code)
+        except Exception as exc:
+            raise ModelMissingError(
+                f"No offline model for {LANG_BY_CODE[src].name} → "
+                f"{LANG_BY_CODE[target].name}. Install it with:\n"
+                f"    python setup_translation.py --install {src} {target}"
+            ) from exc
+
+    translated = "\n".join(
+        translate_line(line, _translate_fn, protect_terms)
+        for line in text.split("\n")
+    )
     return {"translated": translated, "source": src, "target": target}
 
 
@@ -289,7 +397,8 @@ def ocr_image(image_path: str, source: str = "auto") -> dict:
     return {"text": text.strip(), "ocrLang": ocr_code}
 
 
-def translate_image(image_path: str, target: str, source: str = "auto") -> dict:
+def translate_image(image_path: str, target: str, source: str = "auto",
+                     protect_terms: Optional[list[str]] = None) -> dict:
     """OCR an image then translate the extracted text.
 
     Returns {sourceText, translatedText, source, target, ocrLang}.
@@ -302,7 +411,7 @@ def translate_image(image_path: str, target: str, source: str = "auto") -> dict:
             "source": source, "target": target, "ocrLang": ocr["ocrLang"],
             "note": "No text was found in the image.",
         }
-    result = translate_text(src_text, target, source)
+    result = translate_text(src_text, target, source, protect_terms)
     return {
         "sourceText": src_text,
         "translatedText": result["translated"],
@@ -348,20 +457,192 @@ def _extract_pages(path: str, ocr_fallback_source: str = "auto") -> list[str]:
     return pages
 
 
+# Scripts that render correctly with plain left-to-right textbox insertion
+# (no shaping/reordering needed) once a font with the right coverage is
+# used. zh is handled separately via fitz's built-in CJK support.
+_LATIN_CYRILLIC_TARGETS = {"en", "es", "fr", "pt", "de", "da", "id", "ru"}
+
+# PyMuPDF's insert_textbox() lays out left-to-right, one glyph after another,
+# with no bidi reordering or contextual shaping. That's wrong for these
+# scripts (Arabic needs RTL + joined letterforms, Hindi/Bengali need
+# grapheme-cluster shaping for conjuncts) -- inserting translated text
+# directly would silently produce unreadable output. PDF output for these
+# targets is routed to .docx instead (see translate_pdf).
+_COMPLEX_SHAPING_TARGETS = {"ar", "hi", "bn"}
+
+_FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
+
+# A Unicode TTF covering Latin + Greek + Cyrillic, needed to embed into the
+# translated PDF for _LATIN_CYRILLIC_TARGETS (fitz's built-in "helv" is
+# Latin-only). Checked in order; the first one found is embedded. Bundling
+# a font (e.g. DejaVuSans.ttf, SIL/Bitstream Vera license) into
+# assets/fonts/ is preferred since it's portable across machines -- these
+# are the OS-provided fallbacks used until one is added there. Referenced
+# by absolute path at runtime only; never copied into the repo (most are
+# proprietary OS assets, not redistributable).
+_UNICODE_FONT_CANDIDATES = [
+    os.path.join(_FONTS_DIR, "DejaVuSans.ttf"),
+    os.path.join(_FONTS_DIR, "NotoSans-Regular.ttf"),
+    r"C:\Windows\Fonts\arial.ttf",
+    r"C:\Windows\Fonts\tahoma.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+]
+
+
+def _resolve_unicode_font_path() -> Optional[str]:
+    for path in _UNICODE_FONT_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _font_kwargs_for_target(target: str) -> dict:
+    """insert_textbox() font kwargs for a translation target.
+
+    zh uses fitz's built-in CJK support (the "china-s" reserved fontname --
+    no file needed, MuPDF has it embedded). Latin/Cyrillic targets get a
+    Unicode TTF if one can be found (see _resolve_unicode_font_path);
+    otherwise this falls back to the Latin-only built-in font and logs a
+    loud warning rather than failing silently.
+    """
+    if target == "zh":
+        return {"fontname": "china-s"}
+    if target in _LATIN_CYRILLIC_TARGETS:
+        font_path = _resolve_unicode_font_path()
+        if font_path:
+            return {"fontfile": font_path, "fontname": "unicode-body"}
+        log.warning(
+            "No Unicode TTF found for PDF translation target '%s' (checked "
+            "%s); falling back to the built-in Latin-only font -- Cyrillic/"
+            "Greek characters will not render correctly. Drop a font (e.g. "
+            "DejaVuSans.ttf) into %s to fix this.",
+            target, _UNICODE_FONT_CANDIDATES, _FONTS_DIR,
+        )
+    return {"fontname": "helv"}
+
+
+def _insert_autofit_text(page, rect, text: str, font_kwargs: dict) -> None:
+    """Insert ``text`` into ``rect``, shrinking the font until it fits.
+
+    insert_textbox() returns negative when text overflows the rect. Starts
+    near a normal body size and steps down to a sane minimum -- dense
+    blocks (a short source string that translates much longer) may still
+    end up visually smaller than the original; that's an accepted
+    trade-off of reusing the original block's rect rather than reflowing
+    the whole page.
+    """
+    size = 11.0
+    min_size = 5.0
+    while size >= min_size:
+        overflow = page.insert_textbox(rect, text, fontsize=size, **font_kwargs)
+        if overflow >= 0:
+            return
+        size -= 0.5
+    page.insert_textbox(rect, text, fontsize=min_size, **font_kwargs)
+
+
+def _translate_pdf_to_pdf(input_path: str, output_path: str, target: str,
+                           source: str,
+                           progress: Optional[Callable[[int, int], None]],
+                           should_cancel: Optional[Callable[[], bool]],
+                           protect_terms: Optional[list[str]] = None) -> dict:
+    """Rebuild the PDF page-by-page, keeping original images in place and
+    replacing each text block's text with its translation in the same rect.
+
+    Layout is approximate, not a true reflow: images keep their exact
+    original position/size, but translated text rarely matches the source
+    string's length, so text is auto-shrunk to fit its original block's
+    rect (see _insert_autofit_text) rather than reflowing the page. Callers
+    must not route _COMPLEX_SHAPING_TARGETS here -- see that constant.
+    """
+    import fitz  # PyMuPDF
+
+    src = fitz.open(input_path)
+    out = fitz.open()
+    total = src.page_count
+    detected_source = None
+    font_kwargs = _font_kwargs_for_target(target)
+
+    try:
+        for i in range(total):
+            if should_cancel and should_cancel():
+                raise InterruptedError("Cancelled")
+            page = src[i]
+            new_page = out.new_page(width=page.rect.width, height=page.rect.height)
+
+            for img in page.get_images(full=True):
+                xref = img[0]
+                try:
+                    rects = page.get_image_rects(xref)
+                    if not rects:
+                        continue
+                    img_bytes = src.extract_image(xref)["image"]
+                    for rect in rects:
+                        new_page.insert_image(rect, stream=img_bytes)
+                except Exception as exc:
+                    log.debug("skipping image xref=%s on page %d: %s", xref, i, exc)
+
+            for block in page.get_text("blocks"):
+                x0, y0, x1, y1, text, _block_no, block_type = block[:7]
+                if block_type != 0 or not text.strip():
+                    continue
+                res = translate_text(text, target, source, protect_terms)
+                detected_source = detected_source or res["source"]
+                rect = fitz.Rect(x0, y0, x1, y1)
+                try:
+                    _insert_autofit_text(new_page, rect, res["translated"], font_kwargs)
+                except Exception as exc:
+                    log.debug("skipping text block on page %d: %s", i, exc)
+
+            if progress:
+                try:
+                    progress(i + 1, total)
+                except Exception:
+                    pass
+
+        out.save(output_path)
+    finally:
+        src.close()
+        out.close()
+
+    return {
+        "output": output_path,
+        "outputSize": os.path.getsize(output_path),
+        "pages": total,
+        "source": detected_source or source,
+        "target": target,
+        "files": [output_path],
+        "output_dir": os.path.dirname(os.path.abspath(output_path)),
+    }
+
+
 def translate_pdf(input_path: str, output_path: str, target: str,
                   source: str = "auto",
                   progress: Optional[Callable[[int, int], None]] = None,
-                  should_cancel: Optional[Callable[[], bool]] = None) -> dict:
+                  should_cancel: Optional[Callable[[], bool]] = None,
+                  protect_terms: Optional[list[str]] = None) -> dict:
     """Translate a PDF's text and write the result.
 
     Output format follows the ``output_path`` extension:
-      * .txt  — page-delimited plain text (default, universal)
+      * .pdf  — rebuilds each page, keeping original images in place and
+                replacing text in its original block position (approximate
+                layout — see _translate_pdf_to_pdf). Not available for
+                _COMPLEX_SHAPING_TARGETS (ar, hi, bn); those are
+                automatically redirected to .docx, with a `note` in the
+                returned dict explaining why, since PyMuPDF's text
+                insertion doesn't perform the bidi/shaping those scripts
+                need and would otherwise produce unreadable output.
       * .docx — a Word document with a heading per page (needs python-docx)
+      * .txt  — page-delimited plain text (fallback for any other/missing
+                extension)
 
-    Plain-text/Word output is used deliberately: it renders every script
-    (CJK, Cyrillic, Arabic, Devanagari) with the system's own fonts and
-    avoids the heavy, error-prone job of embedding fonts for a re-laid-out
-    PDF.  Returns a summary dict.
+    .txt/.docx render every script correctly using the system's own fonts
+    and involve no layout guesswork; .pdf is best-effort and intended for
+    cases where keeping the original images and rough page layout matters
+    more than pixel-perfect text placement. Returns a summary dict.
     """
     if not os.path.isfile(input_path):
         raise FileNotFoundError(input_path)
@@ -370,6 +651,25 @@ def translate_pdf(input_path: str, output_path: str, target: str,
         raise TranslationError("File too large (max 2 GB).")
     if target not in LANG_BY_CODE:
         raise TranslationError(f"Unsupported target language: {target}")
+
+    ext = os.path.splitext(output_path)[1].lower()
+    note = None
+
+    if ext == ".pdf" and target in _COMPLEX_SHAPING_TARGETS:
+        output_path = os.path.splitext(output_path)[0] + ".docx"
+        ext = ".docx"
+        note = (
+            f"{LANG_BY_CODE[target].name} text needs shaping that PDF output "
+            f"doesn't support correctly, so this was saved as a Word "
+            f"document instead."
+        )
+
+    if ext == ".pdf":
+        result = _translate_pdf_to_pdf(input_path, output_path, target, source,
+                                        progress, should_cancel, protect_terms)
+        if note:
+            result["note"] = note
+        return result
 
     page_texts = _extract_pages(input_path, source)
     total = len(page_texts)
@@ -382,7 +682,7 @@ def translate_pdf(input_path: str, output_path: str, target: str,
         if not ptext.strip():
             translated_pages.append("")
         else:
-            res = translate_text(ptext, target, source)
+            res = translate_text(ptext, target, source, protect_terms)
             detected_source = detected_source or res["source"]
             translated_pages.append(res["translated"])
         if progress:
@@ -391,13 +691,12 @@ def translate_pdf(input_path: str, output_path: str, target: str,
             except Exception:
                 pass
 
-    ext = os.path.splitext(output_path)[1].lower()
     if ext == ".docx":
         _write_docx(translated_pages, output_path)
     else:
         _write_txt(translated_pages, output_path)
 
-    return {
+    result = {
         "output": output_path,
         "outputSize": os.path.getsize(output_path),
         "pages": total,
@@ -406,6 +705,9 @@ def translate_pdf(input_path: str, output_path: str, target: str,
         "files": [output_path],
         "output_dir": os.path.dirname(os.path.abspath(output_path)),
     }
+    if note:
+        result["note"] = note
+    return result
 
 
 def _write_txt(pages: list[str], output_path: str) -> None:

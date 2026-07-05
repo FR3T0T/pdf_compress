@@ -196,6 +196,58 @@ def _scan_metadata(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
         ))
 
 
+_TRIGGER_MEANINGS = {
+    "/WC": "fires just before the document is closed",
+    "/WS": "fires just before the document is saved",
+    "/DS": "fires right after the document is saved",
+    "/WP": "fires just before the document is printed",
+    "/DP": "fires right after the document is printed",
+    "/O":  "fires when the page is opened",
+    "/C":  "fires when the page is closed",
+    "/E":  "fires when the pointer enters the field",
+    "/X":  "fires when the pointer leaves the field",
+    "/D":  "fires on mouse-down in the field",
+    "/U":  "fires on mouse-up in the field",
+    "/Fo": "fires when the field gains focus",
+    "/Bl": "fires when the field loses focus",
+    "/PO": "fires when the field's page opens",
+    "/PC": "fires when the field's page closes",
+    "/PV": "fires when the field's page becomes visible",
+    "/PI": "fires when the field's page becomes hidden",
+    "/K":  "fires on each keystroke in the field",
+    "/F":  "fires when the field is formatted",
+    "/V":  "fires when the field is validated",
+    "/Calc": "fires when field values are recalculated",
+}
+
+_ACTION_VERBS = {
+    "/JavaScript": "runs embedded JavaScript",
+    "/Launch":     "launches an external program or file",
+    "/URI":        "opens a URL",
+    "/GoToR":      "opens an external document",
+    "/GoToE":      "opens an embedded document",
+    "/SubmitForm": "submits form data over the network",
+    "/ImportData": "imports data from another file",
+    "/Named":      "runs a named viewer command",
+    "/Rendition":  "plays embedded media",
+    "/Sound":      "plays an embedded sound",
+    "/Movie":      "plays an embedded movie",
+}
+
+
+def _describe_autorun(where: str, stype: str) -> str:
+    if "/OpenAction" in where:
+        when = "fires as soon as the document is opened"
+    elif "/AA" in where:
+        toks = where.replace("/Next", "").split()
+        trig = next((t for t in reversed(toks) if t.startswith("/") and t != "/AA"), "")
+        when = _TRIGGER_MEANINGS.get(trig, f"fires on the {trig} event" if trig else "fires automatically")
+    else:
+        when = "fires automatically"
+    verb = _ACTION_VERBS.get(stype, "runs an action")
+    return f"{where} — {when}; {verb}"
+
+
 def _collect_actions(pdf: pikepdf.Pdf):
     """Yield (where, action_dict) for every action reachable in the document.
 
@@ -305,7 +357,7 @@ def _scan_scripts_and_actions(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
             stype = ""
 
         if where.startswith("Document /OpenAction") or "/AA" in where:
-            autorun.append(where)
+            autorun.append(_describe_autorun(where, stype))
 
         if stype == "/JavaScript" or "/JS" in action:
             js_hits.append(f"{where}: JavaScript")

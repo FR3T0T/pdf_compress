@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from engine import fmt_size
-from pdf_ops import redact_text, RedactResult
+from pdf_ops import redact_pdf, RedactResult
 from ..theme import Theme, FONT
 from ..widgets import DropZone
 from .base import BasePage
@@ -248,7 +248,7 @@ class RedactPage(BasePage):
                 def _progress(cur, total):
                     signals.progress.emit(cur, total)
 
-                result = redact_text(
+                result = redact_pdf(
                     input_path, output_path,
                     search_terms=terms,
                     case_sensitive=case_sensitive,

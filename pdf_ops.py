@@ -18,6 +18,31 @@ log = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Path safety
+# ═══════════════════════════════════════════════════════════════════
+
+def contained_output_path(out_folder: str, out_name: str) -> str:
+    """Join out_folder + out_name, guaranteeing the result stays inside
+    out_folder.
+
+    os.path.join() silently DISCARDS out_folder if out_name is an
+    absolute path (e.g. "/etc/passwd" or "C:\\Windows\\..."), and "../"
+    segments can walk back out of out_folder -- both let a user-editable
+    naming template/output name escape the folder the user actually
+    chose. Used everywhere an output path is built from such a name
+    (protect/unlock/watermark naming templates in ui/bridge.py,
+    split_pdf's name_template here).
+
+    Raises ValueError if the resolved candidate is not inside out_folder.
+    """
+    base = os.path.realpath(out_folder)
+    candidate = os.path.realpath(os.path.join(base, out_name))
+    if os.path.commonpath([base, candidate]) != base:
+        raise ValueError(f"Output path escapes the chosen folder: {out_name!r}")
+    return candidate
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Data classes
 # ═══════════════════════════════════════════════════════════════════
 
@@ -269,7 +294,7 @@ def split_pdf(
             start=start, end=end, n=start,        # {start}/{end}/{n} all work
             title=title,
         ) + ".pdf"
-        out_path = os.path.join(output_dir, out_name)
+        out_path = contained_output_path(output_dir, out_name)
 
         dest = pikepdf.Pdf.new()
         for p in range(start - 1, end):  # 0-indexed
@@ -1442,137 +1467,131 @@ class RedactResult:
     pages_affected: int
 
 
-def redact_text(
+def redact_pdf(
     input_path: str,
     output_path: str,
-    search_terms: list[str],
+    *,
+    search_terms: list[str] | None = None,
+    rects: list[dict] | None = None,
     case_sensitive: bool = False,
     pages: list[int] | None = None,
+    password: str | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     cancel: threading.Event | None = None,
-    password: str | None = None,
 ) -> RedactResult:
-    """Redact text from a PDF by replacing matching content with black rectangles.
+    """Redact a PDF using PyMuPDF's real redaction API.
 
-    This performs true redaction — the underlying text is removed, not just
-    covered. The redacted content cannot be recovered from the output file.
+    True redaction: add_redact_annot()/apply_redactions() physically strips
+    the text and image data under each area from the page content -- it
+    isn't painted over, and it isn't recoverable from the saved file
+    afterward. Replaces the previous regex-on-raw-content-stream approach,
+    which only matched literal parenthesized text operands and silently
+    missed anything kerned, hex-encoded, or laid out via TJ arrays --
+    meaning it could report success while leaving the real text fully
+    extractable from the "redacted" output.
 
-    Args:
-        input_path: Source PDF path.
-        output_path: Destination path for the redacted PDF.
-        search_terms: List of text strings to redact.
-        case_sensitive: Whether matching is case-sensitive.
-        pages: Optional list of 0-based page indices to redact (None = all).
-        on_progress: Callback(current_page, total_pages).
-        cancel: Threading event to signal cancellation.
-        password: Password for encrypted PDFs.
+    Two ways to select what to redact, combinable, at least one required:
+      * search_terms: text found via page.search_for() -- every match on
+        the page is redacted.
+      * rects: user-drawn boxes, each {"page": int (0-based), "x0", "y0",
+        "x1", "y1": float} in PDF point coordinates -- for the visual
+        redaction UI (Part 2); unused by the current search-term-only
+        frontend but wired through end-to-end.
 
-    Returns:
-        RedactResult with redaction details.
+    Returns a RedactResult with redaction_count (total redacted areas
+    across the document) and pages_affected (count of pages with at least
+    one redaction) -- the same fields the UI already reads.
     """
-    import re as re_mod
+    if not search_terms and not rects:
+        raise ValueError("Provide search_terms and/or rects to redact.")
 
-    if not search_terms:
-        raise ValueError("No search terms provided for redaction")
+    doc = fitz.open(input_path)
+    if password and doc.needs_pass:
+        if not doc.authenticate(password):
+            doc.close()
+            raise ValueError("Wrong password.")
 
-    open_kwargs = {}
-    if password:
-        open_kwargs["password"] = password
+    total = len(doc)
+    rects_by_page: dict[int, list[dict]] = {}
+    for r in (rects or []):
+        rects_by_page.setdefault(int(r["page"]), []).append(r)
 
-    src = pikepdf.open(input_path, **open_kwargs)
-    total_pages = len(src.pages)
-    target_pages = pages if pages is not None else list(range(total_pages))
+    target = list(pages) if pages is not None else list(range(total))
+    hit_count = 0
+    pages_touched: set[int] = set()
 
-    total_redactions = 0
-    pages_affected = set()
-
-    for idx, page_num in enumerate(target_pages):
+    for i, pno in enumerate(target):
         if cancel and cancel.is_set():
-            src.close()
+            doc.close()
             raise ValueError("Cancelled")
-
         if on_progress:
-            on_progress(idx + 1, len(target_pages))
-
-        if page_num < 0 or page_num >= total_pages:
+            on_progress(i + 1, len(target))
+        if pno < 0 or pno >= total:
             continue
 
-        page = src.pages[page_num]
-
-        # Extract the page content stream text to find matches
-        try:
-            if "/Contents" not in page:
-                continue
-            contents = page["/Contents"]
-            if isinstance(contents, pikepdf.Array):
-                raw = b""
-                for stream in contents:
-                    raw += stream.read_bytes()
-            else:
-                raw = contents.read_bytes()
-
-            text_content = raw.decode("latin-1", errors="replace")
-        except Exception:
-            continue
-
-        # Search for terms in the content stream text operands
-        page_had_redaction = False
-        for term in search_terms:
+        page = doc[pno]
+        added = 0
+        page_redaction_rects: list[fitz.Rect] = []
+        for term in (search_terms or []):
             if not term.strip():
                 continue
+            # search_for() has no case-sensitivity flag in PyMuPDF -- it's
+            # always case-insensitive at the matching level (verified: no
+            # TEXT_* flag affects it). For case_sensitive=True, filter each
+            # match by re-extracting the exact text under its own rect and
+            # requiring an exact-case substring match, since the plain
+            # "flags" toggle this was originally written with does nothing.
+            for r in page.search_for(term, flags=fitz.TEXT_DEHYPHENATE):
+                if case_sensitive and term not in page.get_textbox(r):
+                    continue
+                page.add_redact_annot(r, fill=(0, 0, 0))
+                page_redaction_rects.append(r)
+                added += 1
+        for rr in rects_by_page.get(pno, []):
+            rect = fitz.Rect(rr["x0"], rr["y0"], rr["x1"], rr["y1"])
+            if not rect.is_empty and rect.is_valid:
+                page.add_redact_annot(rect, fill=(0, 0, 0))
+                page_redaction_rects.append(rect)
+                added += 1
 
-            flags = 0 if case_sensitive else re_mod.IGNORECASE
-            escaped = re_mod.escape(term)
+        if added:
+            # Form field (AcroForm widget) values live in /V and render via
+            # a separate appearance stream -- apply_redactions() only
+            # strips page CONTENT (text/images drawn in the content
+            # stream), so a redaction box over a fillable field would
+            # otherwise leave the value fully intact and extractable
+            # (verified: still readable via both the widget API and plain
+            # get_text() after apply_redactions() alone). Neutralize any
+            # widget whose rect intersects a redaction area -- from either
+            # a search-term match or a user-drawn rect -- before the
+            # content-level redaction runs.
+            for wdg in list(page.widgets()):
+                if any(r.intersects(wdg.rect) for r in page_redaction_rects):
+                    try:
+                        wdg.field_value = ""
+                        wdg.update()
+                    except Exception:
+                        pass
+                    page.delete_widget(wdg)
 
-            # Replace text within PDF text-showing operators: (text) Tj / (text) '
-            # This handles the common case of text in parenthesized strings
-            def _redact_match(m):
-                nonlocal total_redactions, page_had_redaction
-                total_redactions += 1
-                page_had_redaction = True
-                # Replace matched text with spaces of same byte length
-                return b" " * len(m.group(0))
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
+            hit_count += added
+            pages_touched.add(pno)
 
-            # Match the term in parenthesized text strings
-            pattern = escaped.encode("latin-1", errors="replace")
-            if not case_sensitive:
-                # Build case-insensitive byte pattern
-                ci_parts = []
-                for ch in term:
-                    if ch.isalpha():
-                        ci_parts.append(
-                            f"[{re_mod.escape(ch.lower())}{re_mod.escape(ch.upper())}]"
-                        )
-                    else:
-                        ci_parts.append(re_mod.escape(ch))
-                pattern = "".join(ci_parts).encode("latin-1", errors="replace")
+    if hit_count == 0:
+        doc.close()
+        raise ValueError("No matching content found to redact.")
 
-            new_content = re_mod.sub(pattern, _redact_match, raw)
-            if new_content != raw:
-                raw = new_content
-
-        if page_had_redaction:
-            pages_affected.add(page_num)
-            # Write back the redacted content stream
-            if isinstance(page["/Contents"], pikepdf.Array):
-                # Merge into single stream
-                page["/Contents"] = src.make_stream(raw)
-            else:
-                page["/Contents"].write(raw)
-
-            # Add black redaction rectangles as annotation overlay
-            # This provides visual indication that content was redacted
-            _add_redaction_overlay(page, src)
-
-    # Save — use a temp file for atomic write
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=os.path.dirname(output_path))
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        suffix=".pdf", dir=os.path.dirname(os.path.abspath(output_path)) or "."
+    )
     os.close(tmp_fd)
     try:
-        src.save(tmp_path)
-        src.close()
+        doc.save(tmp_path, garbage=4, deflate=True, clean=True)
+        doc.close()
         os.replace(tmp_path, output_path)
     except Exception:
-        src.close()
+        doc.close()
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
@@ -1580,151 +1599,8 @@ def redact_text(
     return RedactResult(
         input_path=input_path,
         output_path=output_path,
-        redaction_count=total_redactions,
-        pages_affected=len(pages_affected),
-    )
-
-
-def _add_redaction_overlay(page, pdf):
-    """Add a subtle 'REDACTED' footer marker on pages that were redacted."""
-    mbox = page.get("/MediaBox", pikepdf.Array([0, 0, 612, 792]))
-    pw = float(mbox[2]) - float(mbox[0])
-
-    # Small grey "REDACTED" text at bottom-right corner
-    marker = (
-        f"q\n"
-        f"0.7 0.7 0.7 rg\n"
-        f"BT\n"
-        f"/F1 6 Tf\n"
-        f"{pw - 60:.2f} 8 Td\n"
-        f"(REDACTED) Tj\n"
-        f"ET\n"
-        f"Q\n"
-    )
-    marker_stream = pikepdf.Stream(pdf, marker.encode())
-
-    # Ensure font resource exists
-    if "/Resources" not in page:
-        page["/Resources"] = pikepdf.Dictionary()
-    resources = page["/Resources"]
-    if "/Font" not in resources:
-        resources["/Font"] = pikepdf.Dictionary()
-    if "/F1" not in resources["/Font"]:
-        resources["/Font"]["/F1"] = pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/Font"),
-            "/Subtype": pikepdf.Name("/Type1"),
-            "/BaseFont": pikepdf.Name("/Helvetica"),
-        })
-
-    # Append marker to page contents
-    existing = page.get("/Contents")
-    if existing is None:
-        page["/Contents"] = marker_stream
-    elif isinstance(existing, pikepdf.Array):
-        existing.append(marker_stream)
-    else:
-        page["/Contents"] = pikepdf.Array([existing, marker_stream])
-
-
-def redact_region(
-    input_path: str,
-    output_path: str,
-    regions: list[dict],
-    on_progress: Callable[[int, int], None] | None = None,
-    cancel: threading.Event | None = None,
-    password: str | None = None,
-) -> RedactResult:
-    """Redact rectangular regions from PDF pages.
-
-    Each region dict should have: page (0-based), x, y, width, height
-    (in PDF points, origin at bottom-left).
-
-    The region content is replaced with a filled black rectangle and
-    the underlying content stream is modified to remove text in that area.
-
-    Args:
-        input_path: Source PDF path.
-        output_path: Destination path.
-        regions: List of region dicts with page, x, y, width, height.
-        on_progress: Callback(current, total).
-        cancel: Threading event.
-        password: Password for encrypted PDFs.
-
-    Returns:
-        RedactResult with redaction details.
-    """
-    if not regions:
-        raise ValueError("No regions provided for redaction")
-
-    open_kwargs = {}
-    if password:
-        open_kwargs["password"] = password
-
-    src = pikepdf.open(input_path, **open_kwargs)
-    total_pages = len(src.pages)
-    pages_affected = set()
-
-    for idx, region in enumerate(regions):
-        if cancel and cancel.is_set():
-            src.close()
-            raise ValueError("Cancelled")
-
-        if on_progress:
-            on_progress(idx + 1, len(regions))
-
-        page_num = region.get("page", 0)
-        if page_num < 0 or page_num >= total_pages:
-            continue
-
-        x = float(region.get("x", 0))
-        y = float(region.get("y", 0))
-        w = float(region.get("width", 100))
-        h = float(region.get("height", 20))
-
-        page = src.pages[page_num]
-        pages_affected.add(page_num)
-
-        # Create a black filled rectangle that covers the region
-        redaction_stream = (
-            f"q\n"
-            f"0 0 0 rg\n"           # Black fill
-            f"{x} {y} {w} {h} re\n"  # Rectangle
-            f"f\n"                    # Fill
-            f"Q\n"
-        ).encode("ascii")
-
-        # Append to existing contents
-        if "/Contents" in page:
-            existing = page["/Contents"]
-            if isinstance(existing, pikepdf.Array):
-                existing_bytes = b""
-                for stream in existing:
-                    existing_bytes += stream.read_bytes()
-            else:
-                existing_bytes = existing.read_bytes()
-            combined = existing_bytes + b"\n" + redaction_stream
-            page["/Contents"] = src.make_stream(combined)
-        else:
-            page["/Contents"] = src.make_stream(redaction_stream)
-
-    # Atomic save
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=os.path.dirname(output_path))
-    os.close(tmp_fd)
-    try:
-        src.save(tmp_path)
-        src.close()
-        os.replace(tmp_path, output_path)
-    except Exception:
-        src.close()
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
-
-    return RedactResult(
-        input_path=input_path,
-        output_path=output_path,
-        redaction_count=len(regions),
-        pages_affected=len(pages_affected),
+        redaction_count=hit_count,
+        pages_affected=len(pages_touched),
     )
 
 

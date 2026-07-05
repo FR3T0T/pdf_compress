@@ -44,3 +44,7 @@ tests/*.pdf
 tests/*.epdf
 tests/*_translated.txt
 tests/*_translated.docx
+
+# React build bundle (committed so it runs without Node)
+!web-react/dist/
+!web-react/dist/**

@@ -65,6 +65,7 @@ from pdf_ops import (
     add_watermark,
     apply_page_operations,
     compare_pdfs,
+    contained_output_path,
     crop_pages,
     extract_images,
     extract_text,
@@ -76,7 +77,7 @@ from pdf_ops import (
     pdf_to_word,
     protect_pdf,
     read_metadata,
-    redact_text,
+    redact_pdf,
     repair_pdf,
     get_toc,
     split_pdf,
@@ -483,6 +484,55 @@ class Bridge(QObject):
             return json.dumps({"success": False, "error": str(exc)})
 
     @Slot(str, result=str)
+    def getPageImages(self, path: str) -> str:
+        """Render every page of a PDF as a full-size PNG (base64 data URLs).
+
+        For the Redact page's box-drawing canvas -- reuses the exact same
+        page.get_pixmap() approach as getThumbnail above, just per-page
+        and at a resolution suited to precise box placement rather than
+        a small preview thumbnail. No new rendering logic; same PyMuPDF
+        rasterization pdf_to_images() already relies on, just returned
+        directly instead of written to a user-chosen output folder.
+
+        Returns JSON: { success, dpi, pages: [{index, dataUrl, width, height}] }
+
+        `width`/`height` are the rendered pixel dimensions. `dpi` lets the
+        caller derive PDF points-per-pixel as 72/dpi -- uniform across
+        every page regardless of that page's own point dimensions, since
+        every page here is rendered at this same fixed DPI.
+        """
+        DPI = 150
+        try:
+            import base64
+            import fitz  # PyMuPDF
+
+            doc = fitz.open(path)
+            zoom = DPI / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pages = []
+            for i in range(doc.page_count):
+                page = doc[i]
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img_bytes = pix.tobytes("png")
+                b64 = base64.b64encode(img_bytes).decode("ascii")
+                pages.append({
+                    "index": i,
+                    "dataUrl": f"data:image/png;base64,{b64}",
+                    "width": pix.width,
+                    "height": pix.height,
+                })
+            doc.close()
+
+            return json.dumps({
+                "success": True,
+                "dpi": DPI,
+                "pages": pages,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            log.exception("getPageImages failed for %s", path)
+            return json.dumps({"success": False, "error": str(exc)})
+
+    @Slot(str, result=str)
     def getMetadata(self, path: str) -> str:
         """Read PDF metadata. Returns JSON."""
         try:
@@ -562,11 +612,26 @@ class Bridge(QObject):
                                "languages": supported_languages()},
                               ensure_ascii=False)
 
+    # Overloaded: web/js/bridge.js (unmodified, per its own contract) still
+    # calls this with 3 args, so that signature must keep resolving --
+    # QWebChannel picks the Qt-registered overload by exact arg count (see
+    # the getPresets fix elsewhere in this file for the same failure mode).
+    # Stacking @Slot decorators registers both signatures against the same
+    # method; the 3-arg call falls through to protect_terms_json's default.
     @Slot(str, str, str, result=str)
-    def translateText(self, text: str, source: str, target: str) -> str:
-        """Translate a block of text (offline). Returns JSON."""
+    @Slot(str, str, str, str, result=str)
+    def translateText(self, text: str, source: str, target: str,
+                       protect_terms_json: str = "") -> str:
+        """Translate a block of text (offline). Returns JSON.
+
+        protect_terms_json: JSON array of user-supplied terms (names,
+        places) to leave untranslated, on top of the built-in heuristics
+        in pdf_translate.py (emails, URLs, "City, ST", phone numbers,
+        acronyms, numbers). "" means none.
+        """
         try:
-            res = translate_text(text, target, source or "auto")
+            terms = json.loads(protect_terms_json) if protect_terms_json else []
+            res = translate_text(text, target, source or "auto", terms)
             return json.dumps({"success": True, **res}, ensure_ascii=False)
         except TranslationError as exc:
             return json.dumps({"success": False, "error": str(exc)},
@@ -576,11 +641,15 @@ class Bridge(QObject):
             return json.dumps({"success": False, "error": str(exc)},
                               ensure_ascii=False)
 
+    # Same overload rationale as translateText above.
     @Slot(str, str, str, result=str)
-    def translateImage(self, path: str, source: str, target: str) -> str:
+    @Slot(str, str, str, str, result=str)
+    def translateImage(self, path: str, source: str, target: str,
+                        protect_terms_json: str = "") -> str:
         """OCR an image then translate the text (offline). Returns JSON."""
         try:
-            res = translate_image(path, target, source or "auto")
+            terms = json.loads(protect_terms_json) if protect_terms_json else []
+            res = translate_image(path, target, source or "auto", terms)
             return json.dumps({"success": True, **res}, ensure_ascii=False)
         except TranslationError as exc:
             return json.dumps({"success": False, "error": str(exc)},
@@ -630,6 +699,14 @@ class Bridge(QObject):
     def openFolder(self, path: str):
         """Open a folder in the OS file manager."""
         path = os.path.normpath(path)
+        # Require a real, absolute local path -- os.startfile() (Windows)
+        # dispatches via ShellExecute, which also handles non-file URI
+        # schemes (http://, mailto:, custom registered protocol handlers),
+        # so a bare string check isn't enough to guarantee this only opens
+        # a local folder.
+        if not (os.path.isabs(path) and os.path.exists(path)):
+            log.warning("Refusing to open non-local or nonexistent path: %s", path)
+            return
         try:
             if platform.system() == "Windows":
                 os.startfile(path)
@@ -644,6 +721,10 @@ class Bridge(QObject):
     def openFile(self, path: str):
         """Open a file with the default application."""
         path = os.path.normpath(path)
+        # Same rationale as openFolder above.
+        if not (os.path.isabs(path) and os.path.exists(path)):
+            log.warning("Refusing to open non-local or nonexistent path: %s", path)
+            return
         try:
             if platform.system() == "Windows":
                 os.startfile(path)
@@ -837,7 +918,7 @@ class Bridge(QObject):
                         out_name = f"{name_no_ext}_protected"
 
                     out_folder = output_dir or os.path.dirname(fpath)
-                    out_path = os.path.join(out_folder, out_name + ext)
+                    out_path = contained_output_path(out_folder, out_name + ext)
 
                     if mode == "enhanced":
                         epdf_encrypt(
@@ -917,7 +998,7 @@ class Bridge(QObject):
                         out_name = f"{name_no_ext}_unlocked"
 
                     out_folder = output_dir or os.path.dirname(fpath)
-                    out_path = os.path.join(out_folder, out_name + ".pdf")
+                    out_path = contained_output_path(out_folder, out_name + ".pdf")
 
                     if is_epdf(fpath):
                         epdf_decrypt(fpath, out_path, password)
@@ -1097,7 +1178,7 @@ class Bridge(QObject):
                         except (KeyError, IndexError):
                             out_name = f"{name_no_ext}_watermarked"
                         out_folder = output_dir or os.path.dirname(fpath)
-                        out_path = os.path.join(out_folder, out_name + ".pdf")
+                        out_path = contained_output_path(out_folder, out_name + ".pdf")
 
                     add_watermark(
                         input_path=fpath,
@@ -1318,6 +1399,7 @@ class Bridge(QObject):
                 source=p.get("source", "auto"),
                 progress=progress_cb,
                 should_cancel=cancel.is_set,
+                protect_terms=p.get("protectTerms") or [],
             )
 
         self._run_in_thread(tool_key, _work)
@@ -1332,15 +1414,19 @@ class Bridge(QObject):
         progress_cb = self._make_progress_callback(tool_key)
 
         def _work():
-            return redact_text(
+            return redact_pdf(
                 input_path=p["inputPath"],
                 output_path=p["outputPath"],
-                search_terms=p["searchTerms"],
+                search_terms=p.get("searchTerms"),
+                # Coordinate boxes for the visual redaction UI (Part 2):
+                # JSON array of {page, x0, y0, x1, y1}. Unused until that
+                # UI sends it, but wired through end-to-end now.
+                rects=p.get("rects"),
                 case_sensitive=p.get("caseSensitive", False),
                 pages=p.get("pages"),
+                password=p.get("password"),
                 on_progress=progress_cb,
                 cancel=cancel,
-                password=p.get("password"),
             )
 
         self._run_in_thread(tool_key, _work)

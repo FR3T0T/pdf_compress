@@ -33,6 +33,32 @@ _PROJECT_ROOT = os.path.dirname(_HERE)
 _WEB_DIR = os.path.join(_PROJECT_ROOT, "web")
 _INDEX_HTML = os.path.join(_WEB_DIR, "index.html")
 
+# React frontend (web-react/), built via `npm run build` -> web-react/dist/.
+# Kept alongside the vanilla web/ dir rather than replacing it, so nothing
+# is lost if the React build is missing or the user opts back out.
+_WEB_REACT_DIR = os.path.join(_PROJECT_ROOT, "web-react", "dist")
+_WEB_REACT_INDEX_HTML = os.path.join(_WEB_REACT_DIR, "index.html")
+
+
+def _resolve_index_html() -> str:
+    """Pick which frontend build to load.
+
+    Defaults to the React build when it exists (``web-react/dist/`` has been
+    built). Set ``PDF_TOOLKIT_UI=legacy`` to force the vanilla ``web/``
+    frontend -- e.g. as a fallback if the React build is missing or behaving
+    unexpectedly. Never modifies or removes ``web/``; both stay on disk.
+    """
+    if os.environ.get("PDF_TOOLKIT_UI", "").strip().lower() == "legacy":
+        return _INDEX_HTML
+    if os.path.isfile(_WEB_REACT_INDEX_HTML):
+        return _WEB_REACT_INDEX_HTML
+    log.warning(
+        "React build not found at %s; falling back to the legacy frontend. "
+        "Run `npm run build` in web-react/ to enable it.",
+        _WEB_REACT_INDEX_HTML,
+    )
+    return _INDEX_HTML
+
 
 def _find_qwebchannel_js() -> str:
     """Locate the ``qwebchannel.js`` shipped with PySide6.
@@ -246,8 +272,10 @@ class WebMainWindow(QMainWindow):
         self.setCentralWidget(self._view)
 
         # -- Load the frontend HTML ----------------------------------------
+        self._index_html_path = _resolve_index_html()
+        log.info("Loading frontend from %s", self._index_html_path)
         page.loadFinished.connect(self._on_page_loaded)
-        self._view.setUrl(QUrl.fromLocalFile(_INDEX_HTML))
+        self._view.setUrl(QUrl.fromLocalFile(self._index_html_path))
 
         # -- Keyboard shortcuts --------------------------------------------
         self._setup_shortcuts()
@@ -273,7 +301,7 @@ class WebMainWindow(QMainWindow):
     def _on_page_loaded(self, ok: bool):
         """Called when the web page finishes loading."""
         if not ok:
-            log.error("Failed to load frontend HTML from %s", _INDEX_HTML)
+            log.error("Failed to load frontend HTML from %s", self._index_html_path)
             return
 
         log.info("Frontend loaded successfully")
@@ -304,9 +332,15 @@ class WebMainWindow(QMainWindow):
     # -- Navigation helpers ------------------------------------------------
 
     def _navigate_home(self):
-        """Tell the JS router to navigate to the home page."""
+        """Tell the JS router to navigate to the home page.
+
+        Vanilla exposes a global ``Router``; the React frontend uses plain
+        hash routing with no global to call, so fall back to setting the
+        hash directly -- its RouterProvider listens for hashchange either way.
+        """
         self._view.page().runJavaScript(
-            "if (typeof Router !== 'undefined') Router.navigate('home');"
+            "if (typeof Router !== 'undefined') { Router.navigate('home'); }"
+            "else { window.location.hash = '#/home'; }"
         )
 
     # -- Keyboard shortcuts ------------------------------------------------
