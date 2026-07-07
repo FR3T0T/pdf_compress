@@ -1,18 +1,24 @@
 """Tests for epdf_crypto.py — enhanced PDF encryption (.epdf format)."""
 
+import json
 import os
+import struct
 
 import pytest
 
 from epdf_crypto import (
+    EPDF_MAGIC,
+    EPDF_VERSION,
+    MAX_KDF_PARAMS,
     EPDFError,
+    EPDFFormatError,
     EPDFPasswordError,
+    _validate_kdf_params,
     epdf_decrypt,
     epdf_encrypt,
     epdf_read_metadata,
     is_epdf,
 )
-
 
 # ═══════════════════════════════════════════════════════════════════
 #  Encrypt / Decrypt round-trip tests
@@ -145,4 +151,65 @@ class TestReadMetadata:
         assert meta["kdf"] == "argon2id"
         assert "salt" in meta
         assert "nonce" in meta
-        assert meta["version"] == 1
+        assert meta["version"] == EPDF_VERSION
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  KDF parameter validation (denial-of-service hardening)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestValidateKdfParams:
+    def test_defaults_pass(self):
+        clean = _validate_kdf_params({})
+        assert clean["memory_cost"] == 65536
+        assert clean["time_cost"] == 3
+        assert clean["parallelism"] == 4
+
+    def test_rejects_absurd_memory_cost(self):
+        with pytest.raises(EPDFFormatError, match="memory_cost"):
+            _validate_kdf_params({"memory_cost": MAX_KDF_PARAMS["memory_cost"] + 1})
+
+    def test_rejects_absurd_time_cost(self):
+        with pytest.raises(EPDFFormatError, match="time_cost"):
+            _validate_kdf_params({"time_cost": 10_000})
+
+    def test_rejects_absurd_parallelism(self):
+        with pytest.raises(EPDFFormatError, match="parallelism"):
+            _validate_kdf_params({"parallelism": 1024})
+
+    def test_rejects_non_integer(self):
+        with pytest.raises(EPDFFormatError, match="integer"):
+            _validate_kdf_params({"memory_cost": "99999999"})
+
+    def test_rejects_bool(self):
+        # bool is an int subclass — must not slip through.
+        with pytest.raises(EPDFFormatError, match="integer"):
+            _validate_kdf_params({"time_cost": True})
+
+    def test_rejects_below_minimum(self):
+        with pytest.raises(EPDFFormatError):
+            _validate_kdf_params({"memory_cost": 0})
+
+
+class TestDecryptRejectsHostileKdf:
+    @pytest.mark.integration
+    def test_tampered_memory_cost_refused_before_derivation(self, sample_pdf, tmp_path):
+        """A .epdf whose header demands an absurd Argon2 memory_cost must be
+        refused during key derivation, not allowed to OOM the machine."""
+        enc = str(tmp_path / "hostile.epdf")
+        epdf_encrypt(sample_pdf, enc, "pw")
+
+        # Rewrite the header, demanding 64 GiB of memory (in KiB).
+        with open(enc, "rb") as f:
+            data = f.read()
+        meta_len = struct.unpack("<I", data[8:12])[0]
+        meta = json.loads(data[12:12 + meta_len])
+        payload = data[12 + meta_len:]
+        meta["kdf_params"]["memory_cost"] = 64 * 1024 * 1024
+        new_meta = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+        with open(enc, "wb") as f:
+            f.write(EPDF_MAGIC + struct.pack("<I", len(new_meta)) + new_meta + payload)
+
+        with pytest.raises(EPDFError):  # EPDFFormatError is an EPDFError subclass
+            epdf_decrypt(enc, str(tmp_path / "out.pdf"), "pw")

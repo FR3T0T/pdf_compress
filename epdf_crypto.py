@@ -20,16 +20,15 @@ File format:
   [rest]     Encrypted PDF bytes (+ auth tag for AEAD ciphers)
 """
 
-import os
-import json
-import struct
 import hashlib
 import hmac
+import json
 import logging
+import os
+import struct
 import tempfile
-from base64 import b64encode, b64decode
+from base64 import b64decode, b64encode
 from datetime import datetime, timezone
-from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +56,23 @@ DEFAULT_KDF_PARAMS = {
     "parallelism": 4,
 }
 
+# Hard bounds on Argon2 cost parameters. Decryption reads these from the
+# .epdf header, which is attacker-controllable — an unbounded memory_cost or
+# time_cost would let a hostile file OOM or hang the machine during key
+# derivation (a denial-of-service vector). Values outside this range are
+# rejected. The ceilings sit far above the defaults, so legitimate
+# high-security files still derive normally.
+MIN_KDF_PARAMS = {
+    "time_cost":   1,
+    "memory_cost": 8,               # Argon2's own floor
+    "parallelism": 1,
+}
+MAX_KDF_PARAMS = {
+    "time_cost":   20,
+    "memory_cost": 2 * 1024 * 1024,  # 2 GiB (Argon2 memory_cost is in KiB)
+    "parallelism": 16,
+}
+
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
 
 # ═══════════════════════════════════════════════════════════════════
@@ -82,12 +98,40 @@ class EPDFFileTooLargeError(EPDFError):
 #  Key derivation
 # ═══════════════════════════════════════════════════════════════════
 
+def _validate_kdf_params(params: dict) -> dict:
+    """Validate Argon2 cost parameters, returning a clean int-typed dict.
+
+    Guards key derivation against hostile .epdf headers that request absurd
+    memory/time — a denial-of-service vector, since decrypt takes these
+    straight from the (unauthenticated-until-AEAD) file header. Raises
+    EPDFFormatError on any non-integer or out-of-range value.
+    """
+    clean: dict = {}
+    for name in ("time_cost", "memory_cost", "parallelism"):
+        value = params.get(name, DEFAULT_KDF_PARAMS[name])
+        # bool is an int subclass — reject it explicitly.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise EPDFFormatError(
+                f"Invalid KDF parameter {name!r}: must be an integer")
+        if not (MIN_KDF_PARAMS[name] <= value <= MAX_KDF_PARAMS[name]):
+            raise EPDFFormatError(
+                f"KDF parameter {name!r}={value} is outside the allowed range "
+                f"[{MIN_KDF_PARAMS[name]}, {MAX_KDF_PARAMS[name]}] — refusing "
+                f"to derive key (possible denial-of-service file)")
+        clean[name] = value
+    # Argon2 additionally requires memory_cost >= 8 * parallelism.
+    if clean["memory_cost"] < 8 * clean["parallelism"]:
+        raise EPDFFormatError(
+            "KDF memory_cost is too low for the requested parallelism")
+    return clean
+
+
 def _derive_key(password: str, salt: bytes, kdf: str = "argon2id",
                 kdf_params: dict | None = None) -> bytes:
     """Derive a 32-byte encryption key from a password using Argon2."""
     import argon2.low_level
 
-    params = {**DEFAULT_KDF_PARAMS, **(kdf_params or {})}
+    params = _validate_kdf_params({**DEFAULT_KDF_PARAMS, **(kdf_params or {})})
 
     if kdf == "argon2id":
         variant = argon2.low_level.Type.ID
