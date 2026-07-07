@@ -107,12 +107,8 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 
 | Shortcut | Action |
 |----------|--------|
-| Ctrl+O | Add files |
-| Ctrl+Enter | Compress |
 | Ctrl+T | Toggle light/dark theme |
-| Ctrl+, | About |
 | Ctrl+Home | Dashboard |
-| Escape | Clear files |
 
 ---
 
