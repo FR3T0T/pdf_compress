@@ -23,9 +23,9 @@ with a clear, actionable message.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
-import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -101,8 +101,8 @@ def supported_languages() -> list[dict]:
 
 def _argos():
     try:
-        import argostranslate.translate as t
         import argostranslate.package as p
+        import argostranslate.translate as t
         return t, p
     except Exception as exc:  # not installed
         raise ModelMissingError(
@@ -193,7 +193,7 @@ def detect_language(text: str) -> Optional[str]:
     if len(sample) < 3:
         return None
     try:
-        from langdetect import detect, DetectorFactory
+        from langdetect import DetectorFactory, detect
         DetectorFactory.seed = 0  # deterministic
         raw = detect(sample)
     except Exception:
@@ -747,8 +747,8 @@ def _write_docx(pages: list[str], output_path: str) -> None:
 # ════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import sys
     import json as _json
+    import sys
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
         print("usage:\n"

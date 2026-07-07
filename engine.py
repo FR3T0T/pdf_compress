@@ -26,7 +26,6 @@ DPI-aware image recompression with:
   - Duplicate font merging and content stream optimization
 """
 
-import ctypes
 import hashlib
 import io
 import logging
@@ -40,8 +39,7 @@ import stat
 import subprocess
 import tempfile
 import threading
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import pikepdf
@@ -153,32 +151,6 @@ def _sanitize_path_for_subprocess(path: str) -> str:
     return path
 
 
-def _secure_delete_string(s: str) -> None:
-    """
-    Best-effort zeroing of a Python string's internal buffer.
-    Python strings are immutable so this uses ctypes to overwrite the
-    underlying C buffer. Not guaranteed on all implementations but
-    reduces the window for password exposure in memory.
-    """
-    if not s:
-        return
-    try:
-        str_type = type(s)
-        # CPython: string data follows the PyUnicodeObject header
-        # This is a best-effort approach
-        buf = ctypes.cast(id(s), ctypes.POINTER(ctypes.c_char))
-        # Find the string data (after the object header)
-        # We overwrite a generous range that should cover the string data
-        header_size = 48 + 4  # approximate PyUnicodeObject header on 64-bit
-        for i in range(header_size, header_size + len(s) * 4 + 8):
-            try:
-                buf[i] = b'\x00'
-            except (ValueError, IndexError):
-                break
-    except Exception:
-        pass  # non-CPython or restricted environment
-
-
 def create_backup(filepath: str) -> Optional[str]:
     """
     Create a backup of a file before overwriting.
@@ -231,7 +203,6 @@ def detect_pdfa_conformance(pdf: pikepdf.Pdf) -> Optional[str]:
             import xml.etree.ElementTree as ET
             try:
                 root = ET.fromstring(raw_xml)
-                ns = {"pdfaid": "http://www.aiim.org/pdfa/ns/id/"}
                 for elem in root.iter():
                     tag = elem.tag.lower() if elem.tag else ""
                     if "part" in tag and elem.text:
@@ -1361,7 +1332,7 @@ def compress_with_ghostscript(
                 if cancel is not None and cancel.is_set():
                     proc.kill()
                     proc.wait()
-                    raise CancelledError("Compression cancelled during Ghostscript pass")
+                    raise CancelledError("Compression cancelled during Ghostscript pass") from None
                 if elapsed >= gs_timeout:
                     proc.kill()
                     proc.wait()
@@ -1803,7 +1774,7 @@ def compress_pdf(
             raise EncryptedPDFError(
                 "This PDF is password-protected. "
                 "Please provide the correct password."
-            )
+            ) from None
 
         _check_cancel(cancel)
 
@@ -1877,9 +1848,14 @@ def compress_pdf(
             if gs_tmp_path and os.path.exists(gs_tmp_path):
                 os.remove(gs_tmp_path)
 
-        # If compression didn't help, keep original
+        # If compression didn't help, keep the original content. When the
+        # caller asked for a *separate* output file, still materialize it (a
+        # verbatim copy of the original) so the requested path always exists
+        # — otherwise a "no gain" result silently produces no output file.
         if compressed_size >= original_size:
             os.remove(tmp_path)
+            if not is_overwriting:
+                shutil.copy2(input_path, output_path)
             return Result(
                 input_path=input_path,
                 output_path=output_path,
@@ -1896,10 +1872,6 @@ def compress_pdf(
         _copy_file_permissions(input_path, tmp_path)
 
         os.replace(tmp_path, output_path)
-
-        # Securely clear password from memory
-        if password:
-            _secure_delete_string(password)
 
         return Result(
             input_path=input_path,

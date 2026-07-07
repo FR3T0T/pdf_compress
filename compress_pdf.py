@@ -24,9 +24,15 @@ import os
 import sys
 
 from engine import (
-    PRESETS, PRESET_ORDER, compress_pdf, fmt_size,
-    EncryptedPDFError, FileTooLargeError, InvalidPDFError,
-    setup_file_logging, validate_pdf_magic,
+    PRESET_ORDER,
+    PRESETS,
+    EncryptedPDFError,
+    FileTooLargeError,
+    InvalidPDFError,
+    compress_pdf,
+    fmt_size,
+    setup_file_logging,
+    validate_pdf_magic,
 )
 
 
@@ -88,7 +94,7 @@ def main():
 
     if args.output and len(args.inputs) > 1:
         if not os.path.isdir(args.output):
-            print(f"ERROR: For batch, -o must be an existing directory.")
+            print("ERROR: For batch, -o must be an existing directory.")
             sys.exit(1)
 
     meta_note = "  (strips metadata)" if preset.strip_metadata else ""
@@ -96,9 +102,9 @@ def main():
     print(f"  DPI     : {preset.target_dpi}")
     print(f"  JPEG    : {preset.jpeg_quality}%")
     if args.linearize:
-        print(f"  Output  : linearized (web-optimized)")
+        print("  Output  : linearized (web-optimized)")
     if args.gs:
-        print(f"  GS      : enabled (font subsetting)")
+        print("  GS      : enabled (font subsetting)")
     print(f"  {'─' * 42}")
 
     total_saved = 0
@@ -114,7 +120,7 @@ def main():
         if not validate_pdf_magic(path):
             n_err += 1
             print(f"\n  {os.path.basename(path)}")
-            print(f"    SKIPPED: Not a valid PDF file (missing %PDF- header)")
+            print("    SKIPPED: Not a valid PDF file (missing %PDF- header)")
             continue
 
         if args.output:

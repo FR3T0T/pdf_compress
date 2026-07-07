@@ -4,14 +4,21 @@ PDF Toolkit — Desktop GUI (PySide6)
 Requires: pip install PySide6 pikepdf pillow
 """
 
+import logging
 import os
 import sys
-import logging
 
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import (
-    QFont, QColor, QPainter, QPen, QBrush, QIcon, QPixmap,
-    QLinearGradient, QPainterPath,
+    QBrush,
+    QColor,
+    QFont,
+    QIcon,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
 )
 from PySide6.QtWidgets import QApplication
 

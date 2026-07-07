@@ -6,21 +6,20 @@ JavaScript happens through the ``Bridge`` object registered on a
 ``QWebChannel``.
 """
 
-import os
-import sys
 import json
 import logging
+import os
 
-from PySide6.QtCore import Qt, QUrl, QSettings, QTimer
-from PySide6.QtGui import QFont, QKeySequence, QShortcut
-from PySide6.QtWidgets import QApplication, QMainWindow, QSystemTrayIcon
-from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
+from PySide6.QtCore import QSettings, QTimer, QUrl
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import QApplication, QMainWindow, QSystemTrayIcon
 
 from .bridge import Bridge
 from .net_guard import install_offline_guard
-from .theme import Theme, LIGHT, DARK, FONT
+from .theme import DARK, LIGHT, Theme
 
 log = logging.getLogger(__name__)
 

@@ -28,10 +28,10 @@ imported lazily inside the functions that need them.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
-import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 import pikepdf
@@ -570,13 +570,10 @@ def _scan_invisible_text(path: str, res: AnalysisResult) -> None:
                         # PyMuPDF exposes render mode via "char" only in some
                         # versions; fall back to detecting fully transparent
                         # text drawn as type 3 in the content stream below.
-            doc_text = page.get_text("text")
-            raw = page.get_text("rawdict")
             # Reliable signal: text present but not visible via "dict" opacity
             # is hard; instead detect explicit "3 Tr" in content stream.
             try:
-                for xref in [page.xref]:
-                    cont = doc.xref_stream(page.get_contents()[0]) if page.get_contents() else b""
+                cont = doc.xref_stream(page.get_contents()[0]) if page.get_contents() else b""
             except Exception:
                 cont = b""
             if b" 3 Tr" in cont or cont.strip().endswith(b"3 Tr"):
@@ -843,8 +840,8 @@ def sanitize_pdf(input_path: str, output_path: str,
 # ════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import sys
     import json as _json
+    import sys
     if len(sys.argv) < 2:
         print("usage: python pdf_analyze.py file.pdf [--sanitize out.pdf]")
         raise SystemExit(2)

@@ -26,7 +26,7 @@ from __future__ import annotations
 import sys
 
 try:
-    from pdf_translate import SUPPORTED_LANGUAGES, LANG_BY_CODE, translation_status
+    from pdf_translate import LANG_BY_CODE, SUPPORTED_LANGUAGES, translation_status
 except Exception as exc:  # pragma: no cover
     print(f"Could not import pdf_translate: {exc}")
     sys.exit(1)

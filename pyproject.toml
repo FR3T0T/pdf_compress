@@ -1,7 +1,7 @@
 [project]
 name = "pdf-toolkit"
-version = "4.0.1"
-description = "Fully offline PDF toolkit with 20 professional tools"
+version = "4.21"
+description = "Fully offline PDF toolkit with 22 professional tools"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "FR3T0T"}]
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.6"]
 extras = ["numpy>=1.24.0", "python-docx>=0.8.11"]
 
 [tool.pytest.ini_options]
@@ -25,4 +25,27 @@ testpaths = ["tests"]
 markers = [
     "slow: marks tests that take a while (e.g. full compression)",
     "integration: marks tests requiring real PDF I/O",
+]
+
+[tool.ruff]
+# The built React frontend and any build output are not ours to lint.
+extend-exclude = ["web-react", "web", "build", "dist"]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# Focus on real-bug and hygiene rules; leave the codebase's deliberate
+# compact one-liner style (if x: return ...) alone.
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes — unused imports/vars, undefined names
+    "W",   # pycodestyle warnings
+    "B",   # flake8-bugbear — likely bugs (e.g. bare except, mutable defaults)
+    "I",   # isort — import ordering
+]
+ignore = [
+    "E501",  # line length — enforced loosely, not worth churn
+    "E701",  # multiple statements on one line (colon) — intentional style
+    "E702",  # multiple statements on one line (semicolon) — intentional style
+    "E741",  # ambiguous variable names (l/I/O) — pre-existing, low value
 ]
