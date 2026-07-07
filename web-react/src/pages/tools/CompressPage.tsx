@@ -40,17 +40,13 @@ interface CompressResultItem {
  * circular savings gauge (pure polish) and per-file editable output names
  * (non-functional without a backend change — see the note below).
  *
- * Bug found, not replicated: startCompress's Python side reads
- * `outputPath` (singular) — safe only for single-file calls, since a
- * batch call passes ONE outputPath used for every file in the loop
- * (verified in ui/bridge.py). It never reads output_dir/naming at all.
- * compress_pdf() defaults to `<name>_compressed.pdf` next to the source
- * when output_path is None. So the vanilla page's "Output Folder" /
- * "Output Suffix" settings are silently non-functional for the batch
- * case it always uses. Rather than ship decorative controls that do
- * nothing, this page omits them — output always lands as
- * `<name>_compressed.pdf` beside each source file, same real behavior
- * as vanilla, just not advertised as configurable.
+ * Output location: this page sends no output path, so each file is written
+ * as `<name>_compressed.pdf` beside its source. The backend now supports
+ * per-file batch output too — startCompress honors `outputDir` and a
+ * `naming` template (via `_compress_output_path` in ui/bridge.py), and only
+ * applies a single explicit `outputPath` to single-file calls (a batch used
+ * to overwrite one shared path — fixed). Output Folder / naming controls
+ * could be re-added here on top of that; deliberately left out for now.
  */
 export function CompressPage() {
   const toast = useToast();

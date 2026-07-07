@@ -247,6 +247,38 @@ def _progress_payload(
     }, ensure_ascii=False)
 
 
+def _compress_output_path(
+    input_path: str,
+    file_count: int,
+    explicit_output: str | None,
+    output_dir: str,
+    naming: str,
+    preset_key: str,
+) -> str | None:
+    """Resolve one file's compression output path for a (possibly batch) run.
+
+    A single explicit ``outputPath`` is honored only for a single-file call --
+    for a batch it would make every file overwrite the same path (the bug this
+    replaces). When an output directory or a non-default naming template is
+    given, a distinct path is built per file (sanitized via
+    ``contained_output_path``). Otherwise ``None`` is returned so
+    ``compress_pdf`` writes ``<name>_compressed.pdf`` beside the source, the
+    long-standing default.
+    """
+    if file_count == 1 and explicit_output:
+        return explicit_output
+    naming = naming or "{name}_compressed"
+    if not output_dir and naming == "{name}_compressed":
+        return None
+    name_no_ext = os.path.splitext(os.path.basename(input_path))[0]
+    try:
+        out_name = naming.format(name=name_no_ext, preset=preset_key)
+    except (KeyError, IndexError):
+        out_name = f"{name_no_ext}_compressed"
+    out_folder = output_dir or os.path.dirname(input_path)
+    return contained_output_path(out_folder, out_name + ".pdf")
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Bridge
 # ═══════════════════════════════════════════════════════════════════
@@ -853,6 +885,9 @@ class Bridge(QObject):
 
         preset_key = p.get("preset", "standard")
         use_gs = p.get("useGhostscript") or p.get("useGs", False)
+        explicit_output = p.get("outputPath")
+        output_dir = p.get("outputDir") or p.get("output_dir", "")
+        naming = p.get("naming") or "{name}_compressed"
 
         def _work():
             results = []
@@ -863,9 +898,13 @@ class Bridge(QObject):
                     _progress_payload(tool_key, i, len(files),
                                       os.path.basename(fpath))
                 )
+                out_path = _compress_output_path(
+                    fpath, len(files), explicit_output,
+                    output_dir, naming, preset_key,
+                )
                 result = compress_pdf(
                     input_path=fpath,
-                    output_path=p.get("outputPath"),
+                    output_path=out_path,
                     preset_key=preset_key,
                     linearize=p.get("linearize", False),
                     cancel=cancel,

@@ -4,6 +4,15 @@
 Frontend parity pass — brought the React app to full parity with the old
 vanilla-JS frontend, then retired the latter.
 
+### Fixes
+- **Batch compression no longer overwrites a single output path.**
+  `startCompress` applied one explicit `outputPath` to every file in a batch,
+  so all files wrote to the same path. It now builds a distinct per-file path
+  from an optional `outputDir` + `naming` template (`_compress_output_path` in
+  `ui/bridge.py`), applies an explicit `outputPath` only to single-file calls,
+  and otherwise defaults to `<name>_compressed.pdf` beside the source. Added
+  `tests/test_bridge.py`.
+
 ### React frontend parity
 - **Merge** shows each file's page count as it's added.
 - **Per-page keyboard shortcuts** restored (Ctrl+O add files, Ctrl+Enter run,
