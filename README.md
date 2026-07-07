@@ -148,22 +148,18 @@ Each preset has per-image-type DPI targets (color, grayscale, monochrome). Your 
 - **Dashboard home** — searchable grid of all 22 tools organized by category
 - **Sidebar navigation** — collapsible sidebar with quick access to all tools
 - **Light and dark themes** — toggle with Ctrl+T, preference remembered
-- **Space audit** — click the info button on any file to see a breakdown of images, fonts, and other content
-- **PDF/A detection** — badges on PDF/A-compliant files with warnings when metadata stripping would break compliance
+- **Compress file cards** — each added PDF shows a page-1 thumbnail, size/pages/image chips, image DPI with a downscale warning, and estimated savings for the selected preset (updates as you switch presets)
+- **Keyboard shortcuts** — Ctrl+O add files, Ctrl+Enter run, Esc clear on the main tool pages (see the Keyboard shortcuts table above)
 - **Invalid PDF detection** — files without valid `%PDF-` headers are flagged and skipped
-- **Encrypted PDF support** — prompts for password, re-analyzes after unlock
-- **Custom naming templates** — configure output filenames with `{name}`, `{preset}`, `{dpi}` variables
-- **Backup on replace** — optional `.backup` copy before overwriting originals
+- **Encrypted PDF support** — prompts for a password on protected files
+- **Custom naming templates** — on tools that write named output (e.g. split, protect, watermark), configure filenames with template variables like `{name}`
 - **Linearization** — produce web-optimized PDFs for fast online viewing
-- **Replace original** — compress in-place with a safety confirmation dialog
-- **Per-file progress bars** — individual progress per file during batch compression
-- **Sortable file list** — sort by name, size, or page count
-- **Batch summary dialog** — sortable results table after batch compression
-- **Recent files** — quickly re-add previously compressed files
-- **System tray notifications** — notified when compression finishes while minimized
+- **Per-file progress bars** — individual progress per file during batch operations
+- **Results panel** — per-file before/after sizes and total savings after a batch
+- **Cancellation** — cancel a running batch at any time without leaving partial files
+- **System tray notifications** — notified when a long operation finishes while minimized
 - **Folder drag-and-drop** — drop a folder to add all PDFs recursively
 - **Windows context menu** — register "Compress with PDF Compress" in the Explorer right-click menu (via About dialog)
-- **Cancellation** — cancel a running batch at any time without leaving partial files
 - **Background analysis** — files are analyzed in a background thread without freezing the UI
 - **Programmatic app icon** — no external icon file needed
 
