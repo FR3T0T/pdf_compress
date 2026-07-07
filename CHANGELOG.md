@@ -1,4 +1,27 @@
 # Changelog
+## Unreleased
+
+Frontend parity pass — brought the React app to full parity with the old
+vanilla-JS frontend, then retired the latter.
+
+### React frontend parity
+- **Merge** shows each file's page count as it's added.
+- **Per-page keyboard shortcuts** restored (Ctrl+O add files, Ctrl+Enter run,
+  Esc clear) on Compress/Merge/Split/Watermark, via a shared `useHotkeys` hook
+  scoped to the active page.
+- **Router keep-alive** — visited pages stay mounted, so a half-filled form
+  survives navigating away and back (matches the old router's cached pages).
+- **Compress rich file cards** — page-1 thumbnail, live analysis chips (size,
+  pages, images, DPI with a downscale warning), and per-preset estimated
+  savings that update with the selected preset.
+
+### Removed
+- **Deleted the legacy vanilla-JS frontend (`web/`).** The React app
+  (`web-react/`) is the only frontend now. `ui/web_shell.py` loads
+  `web-react/dist/` directly and the `PDF_TOOLKIT_UI=legacy` override is gone;
+  the PyInstaller spec bundles `web-react/dist/` in its place.
+
+---
 ## v4.21
 
 Maintenance pass — a code-health cleanup: dead-code removal, a real bug fix, and test/security hygiene. No user-facing feature changes.

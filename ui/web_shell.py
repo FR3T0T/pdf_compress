@@ -29,34 +29,27 @@ log = logging.getLogger(__name__)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_HERE)
-_WEB_DIR = os.path.join(_PROJECT_ROOT, "web")
-_INDEX_HTML = os.path.join(_WEB_DIR, "index.html")
 
-# React frontend (web-react/), built via `npm run build` -> web-react/dist/.
-# Kept alongside the vanilla web/ dir rather than replacing it, so nothing
-# is lost if the React build is missing or the user opts back out.
+# The frontend is a React + Vite + TypeScript app (web-react/). Its built
+# bundle is committed to web-react/dist/, so end users need no Node toolchain;
+# developers who change web-react/src/ must rebuild (`npm run build`).
 _WEB_REACT_DIR = os.path.join(_PROJECT_ROOT, "web-react", "dist")
 _WEB_REACT_INDEX_HTML = os.path.join(_WEB_REACT_DIR, "index.html")
 
 
 def _resolve_index_html() -> str:
-    """Pick which frontend build to load.
+    """Return the path to the built React frontend (web-react/dist/index.html).
 
-    Defaults to the React build when it exists (``web-react/dist/`` has been
-    built). Set ``PDF_TOOLKIT_UI=legacy`` to force the vanilla ``web/``
-    frontend -- e.g. as a fallback if the React build is missing or behaving
-    unexpectedly. Never modifies or removes ``web/``; both stay on disk.
+    The bundle is committed, so this normally always exists. If it's missing
+    the checkout is incomplete or the build hasn't been run -- raise a clear
+    error rather than launching an empty window.
     """
-    if os.environ.get("PDF_TOOLKIT_UI", "").strip().lower() == "legacy":
-        return _INDEX_HTML
     if os.path.isfile(_WEB_REACT_INDEX_HTML):
         return _WEB_REACT_INDEX_HTML
-    log.warning(
-        "React build not found at %s; falling back to the legacy frontend. "
-        "Run `npm run build` in web-react/ to enable it.",
-        _WEB_REACT_INDEX_HTML,
+    raise FileNotFoundError(
+        f"Frontend build not found at {_WEB_REACT_INDEX_HTML}. "
+        "Run `npm run build` in web-react/ to generate it."
     )
-    return _INDEX_HTML
 
 
 def _find_qwebchannel_js() -> str:

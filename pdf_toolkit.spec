@@ -17,11 +17,13 @@ block_cipher = None
 
 # ── Paths ────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.abspath(SPECPATH)
-WEB_DIR = os.path.join(PROJECT_ROOT, "web")
+WEB_REACT_DIST = os.path.join(PROJECT_ROOT, "web-react", "dist")
 
 # ── Data files (frontend assets) ─────────────────────────────────────
+# The built React frontend. web_shell.py resolves web-react/dist/index.html
+# relative to the project root, so it's bundled at the same relative path.
 datas = [
-    (WEB_DIR, "web"),  # HTML/CSS/JS frontend
+    (WEB_REACT_DIST, os.path.join("web-react", "dist")),
 ]
 
 # ── Hidden imports ───────────────────────────────────────────────────

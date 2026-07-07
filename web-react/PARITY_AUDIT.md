@@ -89,9 +89,11 @@ Severity: 🟡 minor UX · ⚪ cosmetic/behavioral. None are functional breakage
   configurable output is actually wanted, it needs a **backend** fix in
   `ui/bridge.py`, not just UI.
 
-## Retiring `web/`
+## Retiring `web/` — done
 
-Once the items above are triaged (fixed or accepted), `web/` can be deleted —
-the same clean-removal pattern as the ~9,500-line native-Qt widget UI removed
-earlier on this branch. Until then it remains the `PDF_TOOLKIT_UI=legacy`
-fallback. See `ui/web_shell.py` (`_resolve_index_html()`) for the switch.
+All four open items are resolved, so the legacy `web/` frontend has been
+**deleted**. `_resolve_index_html()` (`ui/web_shell.py`) now loads only the
+React build (`web-react/dist/`) and the `PDF_TOOLKIT_UI=legacy` escape hatch
+is gone; the PyInstaller spec bundles `web-react/dist/` instead of `web/`.
+Only the backend confirmation item above (`startCompress` output path)
+remains, and it lives in `ui/bridge.py`, not the frontend.

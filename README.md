@@ -38,7 +38,7 @@ npm install
 npm run build
 ```
 
-The legacy vanilla JS frontend (`web/`) is retained as a fallback — set `PDF_TOOLKIT_UI=legacy` to force it — but is no longer the active UI.
+The original vanilla-JS frontend has been fully retired now that the React app is at feature parity.
 
 ---
 
@@ -243,8 +243,7 @@ Text and vector graphics are never modified.
 | `ui/bridge.py` | Python-to-JavaScript communication bridge |
 | `ui/net_guard.py` | Network kill-switch — blocks all non-local web-engine requests |
 | `ui/tool_registry.py` | Centralized tool metadata and categories |
-| `web-react/` | Active frontend — React + Vite + TypeScript (source + committed `dist/` build) |
-| `web/` | Legacy vanilla JS frontend — retained as a fallback (`PDF_TOOLKIT_UI=legacy`), no longer active by default |
+| `web-react/` | Frontend — React + Vite + TypeScript (source + committed `dist/` build) |
 | `assets/fonts/` | Bundled fonts (DejaVu Sans) for image-preserving PDF translation output |
 | `requirements.txt` | Python dependencies |
 
