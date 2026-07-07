@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { usePageActive } from '../router/Router';
 
 export interface HotkeyHandlers {
   /** Ctrl/Cmd+O — open the file picker / add files. */
@@ -22,15 +23,18 @@ function isEditableTarget(el: EventTarget | null): boolean {
  * web/js/pages/{merge,split,watermark}.js: Ctrl/Cmd+O add files,
  * Ctrl/Cmd+Enter run, Esc clear. Cross-platform (Ctrl or Cmd).
  *
- * Only one tool page is mounted at a time (the router unmounts the rest),
- * so a per-page window listener never competes with another page's. Any
- * handler left undefined is simply inert for that key. App-level shortcuts
- * (Ctrl+T theme, Ctrl+Home dashboard) live in Python (ui/web_shell.py) and
- * are unaffected.
+ * With AppShell keep-alive, several pages are mounted at once (hidden ones
+ * via display:none), so the listener is scoped to the active page via
+ * PageActiveContext — otherwise a hidden page's Ctrl+Enter/Esc would fire
+ * too. Any handler left undefined is simply inert for that key. App-level
+ * shortcuts (Ctrl+T theme, Ctrl+Home dashboard) live in Python
+ * (ui/web_shell.py) and are unaffected.
  */
 export function useHotkeys({ onAddFiles, onRun, onClear, enabled = true }: HotkeyHandlers): void {
+  const pageActive = usePageActive();
+
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || !pageActive) return;
 
     const handler = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
@@ -54,5 +58,5 @@ export function useHotkeys({ onAddFiles, onRun, onClear, enabled = true }: Hotke
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [onAddFiles, onRun, onClear, enabled]);
+  }, [onAddFiles, onRun, onClear, enabled, pageActive]);
 }

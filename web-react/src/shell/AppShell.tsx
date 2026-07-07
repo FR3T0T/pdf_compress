@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Sidebar } from './Sidebar';
-import { useRouter } from '../router/Router';
+import { useRouter, PageActiveContext } from '../router/Router';
 import type { RouteDef } from '../router/Router';
 
 /**
@@ -42,7 +42,9 @@ export function AppShell({ routes }: { routes: Record<string, RouteDef> }) {
           const active = key === currentRoute;
           return (
             <div key={key} style={{ display: active ? 'block' : 'none' }} aria-hidden={!active}>
-              <Route />
+              <PageActiveContext.Provider value={active}>
+                <Route />
+              </PageActiveContext.Provider>
             </div>
           );
         })}

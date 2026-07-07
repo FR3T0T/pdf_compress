@@ -15,6 +15,21 @@ interface RouterContextValue {
 
 const RouterContext = createContext<RouterContextValue | null>(null);
 
+/**
+ * True only for the route AppShell is currently showing. With keep-alive
+ * (AppShell mounts visited pages and hides them with display:none rather
+ * than unmounting), several pages are mounted at once; window-level
+ * effects like useHotkeys must scope themselves to the active page so a
+ * hidden page's Ctrl+Enter/Esc listener doesn't also fire. Defaults to
+ * true so a page rendered outside AppShell (tests, the dev gallery) still
+ * behaves normally.
+ */
+export const PageActiveContext = createContext<boolean>(true);
+
+export function usePageActive(): boolean {
+  return useContext(PageActiveContext);
+}
+
 function parseHash(): string {
   const raw = (window.location.hash.slice(2) || '').split('?')[0];
   return raw || 'home';
