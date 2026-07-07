@@ -47,11 +47,13 @@ Severity: 🟡 minor UX · ⚪ cosmetic/behavioral. None are functional breakage
   at `src/pages/tools/CompressPage.tsx` top-of-file comment.* Decide whether
   to rebuild any of this bespoke UI or accept the simpler shared components.
 
-- [ ] 🟡 **Merge — per-file page counts.** The vanilla page called
+- [x] 🟡 **Merge — per-file page counts.** ~~The vanilla page called
   `analyzeFile` per added file to show its page count in the list; React shows
-  only `total_pages` in the final result. Restoring it means calling
-  `bridgeApi.analyzeFile(path)` as files are added and surfacing the count in
-  `FileList`. *Undocumented.* (`src/pages/tools/MergePage.tsx`)
+  only `total_pages` in the final result.~~ **Done:** `MergePage` now fetches
+  `analyzeFile` per file as it's added (guarded against re-fetch) and populates
+  `PickedFile.pages`; `FileList` renders the count. Field fallback matches
+  vanilla (`info.pages ?? info.page_count`). (`src/pages/tools/MergePage.tsx`,
+  `src/components/shared/FileList.tsx`)
 
 - [ ] 🟡 **Keyboard shortcuts — per-page.** `Ctrl+O` (add files), `Ctrl+Enter`
   (run), and `Esc` (clear) were implemented on 3 vanilla pages
