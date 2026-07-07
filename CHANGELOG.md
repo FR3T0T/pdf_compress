@@ -1,4 +1,29 @@
 # Changelog
+## v4.21
+
+Maintenance pass — a code-health cleanup: dead-code removal, a real bug fix, and test/security hygiene. No user-facing feature changes.
+
+### Fixes
+- **Compression to a distinct output path now always produces a file.** When compression yielded no size gain, the skip branch returned early without writing the requested `output_path` — so `compress a.pdf -o out.pdf` could silently produce nothing when the file didn't shrink. It now writes a verbatim copy of the original to the requested path (in-place overwrites are unaffected). Added a regression test that exercises the skip branch.
+- **Fixed a stale crypto test** that hard-coded `.epdf` format `version == 1`; it now asserts against the current `EPDF_VERSION` constant so it won't rot on the next format bump.
+
+### Security & robustness
+- **`.epdf` KDF-parameter clamping (DoS hardening)** — decryption previously fed the Argon2 cost parameters (`memory_cost`, `time_cost`, `parallelism`) straight from the file header into key derivation. A hostile `.epdf` could set `memory_cost` to, say, 64 GiB and OOM or hang the machine *before* any authentication ran. Key derivation now validates these against hard bounds (`MIN_KDF_PARAMS`/`MAX_KDF_PARAMS`) at a single chokepoint (`_validate_kdf_params` in `_derive_key`, so both encrypt and decrypt are guarded) and refuses out-of-range or non-integer values with a clear error. Ceilings sit far above the defaults, so legitimate high-security files still work. Added unit + integration tests (including a tampered-header file that must be refused).
+- **Removed `_secure_delete_string()`** from `engine.py`. It cast `id(str)` to a raw pointer and zeroed a *guessed* memory range — which could corrupt interned strings (crash/data corruption) and over-write past the buffer, all while not reliably wiping anything (CPython strings are immutable). Net-negative "security theater" replaced by simply not doing it. Dropped the now-unused `ctypes` import.
+
+### Tooling / CI
+- **Added GitHub Actions CI** (`.github/workflows/ci.yml`): a `ruff` lint job plus a test matrix across Ubuntu + Windows on Python 3.10 and 3.12, running `pytest` with coverage. (The green-vs-broken state that let the stale crypto test above slip through is now caught automatically.)
+- **Added `ruff`** with a pragmatic config in `pyproject.toml` — real-bug and hygiene rules (`E`, `F`, `W`, `B`, `I`) on, the codebase's deliberate compact one-liner style left alone (`E701`/`E702`/`E741` ignored). Added `ruff` to `requirements-dev.txt` and the `dev` optional-dependencies group.
+- **Cleared all lint findings**: removed unused imports and dead local assignments (`ns`, `output_size`, `para`, `bpc`, `doc_text`, `raw`, unused `docx` imports), sorted imports, added `from None`/`from err` to re-raises inside `except` blocks (B904), and simplified a pointless single-iteration loop in the invisible-text scan. No behavior changes.
+- Fixed the stale `version`/tool-count in `pyproject.toml` (`4.0.1` → `4.21`, "20" → "22 professional tools").
+- `.gitignore`: ignore coverage (`.coverage`, `htmlcov/`) and `.ruff_cache/` artifacts.
+
+### Removed (dead code)
+- **Deleted the unreachable native-Qt widget UI** — ~9,500 lines across 32 files: `ui/shell.py`, `ui/sidebar.py`, `ui/dialogs.py`, `ui/icons.py`, `ui/widgets.py`, `ui/widgets_generic.py`, `ui/batch_helpers.py`, `ui/signals.py`, and all of `ui/pages/`. Since the React migration, `ui/__init__.py` exposes only `WebMainWindow`; none of these were reachable from the entry point. (This also removed the two remaining bare `except:` clauses.)
+- **Decoupled `ui/tool_registry.py`** from the native UI: it previously imported every native page module (via `get_tools()` → `_tools()`) to build `page_factory` lambdas the web bridge never used. It now holds pure tool metadata with no UI-framework dependencies. Public API (`ToolDef`, `CATEGORIES`, `get_tools`, `get_tool`) and all 22 tool definitions are unchanged.
+- Updated the README file map to drop the removed `ui/pages/` entry.
+
+---
 ## v4.20
 
 Major release: the entire frontend rebuilt in React, plus new tools, a redaction overhaul, and a security-hardening pass.
