@@ -78,16 +78,17 @@ Severity: 🟡 minor UX · ⚪ cosmetic/behavioral. None are functional breakage
   (only once visited); the router's busy guard still blocks navigation mid-op,
   so hidden pages are inert. (`src/shell/AppShell.tsx`, `src/router/Router.tsx`)
 
-## Confirmation to double-check (not a gap)
+## Backend fix (was: confirmation to double-check)
 
-- **Compress output controls.** The vanilla page's "Output Folder" / "Output
-  Suffix" controls were **silently non-functional** in the batch case it
-  always used: `startCompress`'s Python side reads `outputPath` (singular), so
-  output always lands as `<name>_compressed.pdf` beside each source. React
-  deliberately omits those dead controls rather than replicate them (see the
-  `CompressPage.tsx` comment). Confirm this is the intended behavior; if
-  configurable output is actually wanted, it needs a **backend** fix in
-  `ui/bridge.py`, not just UI.
+- [x] **Compress output controls / batch overwrite.** ~~The vanilla page's
+  "Output Folder" / "Output Suffix" controls were silently non-functional:
+  `startCompress` read `outputPath` (singular) and applied it to every file in
+  a batch, so a shared path would overwrite.~~ **Fixed in `ui/bridge.py`:**
+  `_compress_output_path()` honors `outputDir` + a `naming` template to build a
+  distinct path per file, applies a single explicit `outputPath` only to
+  single-file calls, and otherwise defaults to `<name>_compressed.pdf` beside
+  the source. Covered by `tests/test_bridge.py`. The React page doesn't yet
+  expose output-folder/naming controls, but the backend now supports them.
 
 ## Retiring `web/` — done
 
