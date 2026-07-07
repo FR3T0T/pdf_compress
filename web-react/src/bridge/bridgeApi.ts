@@ -19,6 +19,13 @@ function basenameOf(path: string): string {
   return path.split(/[/\\]/).pop() ?? path;
 }
 
+/** Small stable string hash, so mock analysis is deterministic per filename. */
+function mockHash(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) >>> 0;
+  return h;
+}
+
 function dirnameOf(path: string): string {
   const parts = path.split(/[/\\]/);
   parts.pop();
@@ -124,14 +131,71 @@ export const bridgeApi = {
   async analyzeFile(path: string): Promise<Record<string, unknown>> {
     if (window.BridgeAPI) return window.BridgeAPI.analyzeFile(path);
     await delay(MOCK_DELAY_MS);
-    return { success: true, file_size: 2_400_000, page_count: 8 };
+    // Deterministic-from-filename mock so the Compress rich cards (size,
+    // pages, image DPI, per-preset savings estimate) are exercisable in
+    // vite dev. The real bridge returns these same fields from ui/bridge.py
+    // (estimates{}, imageSummary{}); shapes match field-for-field.
+    const h = mockHash(basenameOf(path));
+    const fileSize = 900_000 + (h % 9) * 620_000; // ~0.9–6 MB
+    const pages = 2 + (h % 22);
+    const imageCount = h % 11;
+    const maxDpi = [96, 150, 220, 300][h % 4];
+    const mkEst = (colorDpi: number, jpegQ: number) => {
+      const dpiFactor = maxDpi > colorDpi ? 1 - colorDpi / maxDpi : 0;
+      const savedPct = Math.min(
+        82,
+        Math.round(6 + dpiFactor * 62 + (85 - jpegQ) * 0.3 + (imageCount > 0 ? 8 : 0))
+      );
+      const est = Math.round(fileSize * (1 - savedPct / 100));
+      return {
+        estimatedSize: est,
+        estimatedSizeStr: formatSizeOf(est),
+        savedBytes: fileSize - est,
+        savedBytesStr: formatSizeOf(fileSize - est),
+        savedPct,
+        targetDpi: colorDpi,
+        jpegQuality: jpegQ,
+      };
+    };
+    return {
+      success: true,
+      file_size: fileSize,
+      page_count: pages,
+      image_count: imageCount,
+      imageSummary: {
+        count: imageCount,
+        totalBytes: Math.round(fileSize * 0.6),
+        totalBytesStr: formatSizeOf(Math.round(fileSize * 0.6)),
+        avgDpi: Math.round(maxDpi * 0.8),
+        maxDpi,
+        minDpi: Math.round(maxDpi * 0.5),
+        jpegCount: imageCount,
+        grayscaleCount: 0,
+        monochromeCount: 0,
+        pctOfFile: imageCount > 0 ? 60 : 0,
+      },
+      estimates: { light: mkEst(200, 85), standard: mkEst(150, 75), aggressive: mkEst(100, 60) },
+    };
   },
 
   async getThumbnail(
     path: string
   ): Promise<{ success: boolean; dataUrl?: string; width?: number; height?: number }> {
     if (window.BridgeAPI) return window.BridgeAPI.getThumbnail(path);
-    return { success: false };
+    // Synthetic page-1 preview (SVG data URL) so the thumbnail column is
+    // reviewable in vite dev. The real bridge renders a JPEG via PyMuPDF.
+    await delay(200);
+    const name = basenameOf(path).replace(/[^\x20-\x7e]/g, '');
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" width="140" height="180">` +
+      `<rect width="140" height="180" fill="#f7f6f2"/>` +
+      `<rect x="14" y="18" width="112" height="8" rx="2" fill="#c9c6be"/>` +
+      `<rect x="14" y="34" width="90" height="6" rx="2" fill="#dcd9d1"/>` +
+      `<rect x="14" y="50" width="112" height="6" rx="2" fill="#dcd9d1"/>` +
+      `<rect x="14" y="64" width="70" height="6" rx="2" fill="#dcd9d1"/>` +
+      `<text x="70" y="168" font-size="9" text-anchor="middle" fill="#9a978f">${name.slice(0, 20)}</text>` +
+      `</svg>`;
+    return { success: true, dataUrl: `data:image/svg+xml;base64,${btoa(svg)}`, width: 140, height: 180 };
   },
 
   async getPageImages(path: string) {

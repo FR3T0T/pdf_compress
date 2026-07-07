@@ -39,13 +39,18 @@ lines (`bridgeApi`\n`.foo()`) — e.g. `getSanitizeDefaults` (analyze) and
 
 Severity: 🟡 minor UX · ⚪ cosmetic/behavioral. None are functional breakages.
 
-- [ ] ⚪ **Compress — visual richness.** React omits per-file thumbnails, live
+- [x] ⚪ **Compress — visual richness.** ~~React omits per-file thumbnails, live
   DPI/image-analysis chips, the animated circular savings gauge, and
-  individually editable output filenames; it uses the shared
-  `FileList`/`ResultsPanel` instead. Core workflow (multi-file, presets, real
-  per-file progress, before/after sizes) is intact. *Deliberate — documented
-  at `src/pages/tools/CompressPage.tsx` top-of-file comment.* Decide whether
-  to rebuild any of this bespoke UI or accept the simpler shared components.
+  individually editable output filenames.~~ **Done (mostly):** added
+  `CompressFileCard` — page-1 thumbnail (`getThumbnail`) + live analysis
+  (`analyzeFile`): size, pages, image count, image DPI with a downscale
+  warning, and per-preset estimated savings that update with the selected
+  preset. Dev mocks enriched so it's reviewable in `vite dev`. **Two
+  sub-parts intentionally deferred:** the *animated circular savings gauge*
+  (pure polish) and *editable per-file output names* — the latter is
+  non-functional without the backend fix tracked in the next section, so an
+  editable field would be decorative. (`CompressFileCard.tsx`,
+  `CompressPage.tsx`, `bridge/bridgeApi.ts` mocks)
 
 - [x] 🟡 **Merge — per-file page counts.** ~~The vanilla page called
   `analyzeFile` per added file to show its page count in the list; React shows

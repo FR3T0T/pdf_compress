@@ -4,7 +4,8 @@ import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
 import type { DropZoneHandle } from '../../components/shared/DropZone';
 import { useHotkeys } from '../../bridge/useHotkeys';
-import { FileList } from '../../components/shared/FileList';
+import { CompressFileCard } from './CompressFileCard';
+import type { FileAnalysis } from './CompressFileCard';
 import { PresetCards } from '../../components/shared/PresetCards';
 import { ProgressPanel } from '../../components/shared/ProgressPanel';
 import { ResultsPanel } from '../../components/shared/ResultsPanel';
@@ -31,14 +32,13 @@ interface CompressResultItem {
  * call preserved exactly: BridgeAPI.startCompress({ files, preset,
  * output_dir, use_gs }). Has a real progress callback (per-file).
  *
- * DELIBERATE SIMPLIFICATION, flagged rather than silent: the vanilla page
- * has per-file thumbnails, live DPI/image analysis chips, an animated
- * circular savings gauge, and individually editable output filenames —
- * a large bespoke visualization system. This port keeps the full bridge
- * contract and core workflow (multi-file, presets, progress, real
- * before/after sizes) but uses the shared FileList/ResultsPanel instead
- * of rebuilding that custom UI, given the scope of a full 20-page
- * migration.
+ * Rich file cards (CompressFileCard): each added file gets a page-1
+ * thumbnail (getThumbnail) and live analysis (analyzeFile) — size, pages,
+ * image count, image DPI with a downscale warning, and the estimated
+ * savings for the selected preset, which updates when the preset changes.
+ * Mirrors the vanilla page's bespoke card UI. Still deferred: the animated
+ * circular savings gauge (pure polish) and per-file editable output names
+ * (non-functional without a backend change — see the note below).
  *
  * Bug found, not replicated: startCompress's Python side reads
  * `outputPath` (singular) — safe only for single-file calls, since a
@@ -62,6 +62,11 @@ export function CompressPage() {
   const op = useOperation<CompressResultItem[]>('compress');
   const [startTime, setStartTime] = useState<number | null>(null);
   const dropRef = useRef<DropZoneHandle>(null);
+  // Per-file analysis + thumbnail, keyed by path. analyzedPaths guards
+  // against re-fetching (pruned to the current file set, so remove-then-add
+  // re-analyzes) — same pattern as the merge page.
+  const [analyses, setAnalyses] = useState<Record<string, FileAnalysis>>({});
+  const analyzedPaths = useRef<Set<string>>(new Set());
 
   usePageBusy(op.status === 'running');
 
@@ -72,6 +77,63 @@ export function CompressPage() {
       setGhostscriptAvailable(res.ghostscriptAvailable);
     });
   }, []);
+
+  // Fetch analysis + thumbnail concurrently for each newly-added file.
+  useEffect(() => {
+    const currentPaths = new Set(files.map((f) => f.path));
+    for (const p of analyzedPaths.current) {
+      if (!currentPaths.has(p)) analyzedPaths.current.delete(p);
+    }
+    setAnalyses((prev) => {
+      const next: Record<string, FileAnalysis> = {};
+      for (const f of files) if (prev[f.path]) next[f.path] = prev[f.path];
+      return next;
+    });
+
+    const pending = files.filter((f) => !analyzedPaths.current.has(f.path));
+    if (pending.length === 0) return;
+
+    let cancelled = false;
+    for (const f of pending) {
+      analyzedPaths.current.add(f.path);
+      setAnalyses((prev) => ({ ...prev, [f.path]: { status: 'analyzing' } }));
+      Promise.allSettled([bridgeApi.analyzeFile(f.path), bridgeApi.getThumbnail(f.path)]).then(
+        ([infoRes, thumbRes]) => {
+          if (cancelled) return;
+          const thumbnail =
+            thumbRes.status === 'fulfilled' && thumbRes.value?.success ? thumbRes.value.dataUrl : undefined;
+
+          if (infoRes.status !== 'fulfilled' || !infoRes.value || infoRes.value.success === false) {
+            const err =
+              infoRes.status === 'fulfilled' && infoRes.value
+                ? infoRes.value.encrypted
+                  ? 'Password-protected'
+                  : String(infoRes.value.error || 'Analysis failed')
+                : 'Analysis failed';
+            setAnalyses((prev) => ({ ...prev, [f.path]: { status: 'error', error: err, thumbnail } }));
+            return;
+          }
+
+          const d = infoRes.value;
+          setAnalyses((prev) => ({
+            ...prev,
+            [f.path]: {
+              status: 'ready',
+              thumbnail,
+              size: (d.file_size ?? d.fileSize) as number | undefined,
+              pages: (d.page_count ?? d.pageCount) as number | undefined,
+              imageCount: (d.image_count ?? d.imageCount ?? 0) as number,
+              imageSummary: d.imageSummary as FileAnalysis['imageSummary'],
+              estimates: d.estimates as FileAnalysis['estimates'],
+            },
+          }));
+        }
+      );
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [files]);
 
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
@@ -131,9 +193,20 @@ export function CompressPage() {
         subtitle="or click to browse — add as many as you need"
         disabled={op.status === 'running'}
       />
-      <div style={{ marginTop: 8 }}>
-        <FileList files={files} onRemove={(i) => setFiles((fs) => fs.filter((_, idx) => idx !== i))} />
-      </div>
+      {files.length > 0 && (
+        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {files.map((f, i) => (
+            <CompressFileCard
+              key={f.path}
+              file={f}
+              analysis={analyses[f.path]}
+              presetKey={preset}
+              disabled={op.status === 'running'}
+              onRemove={() => setFiles((fs) => fs.filter((_, idx) => idx !== i))}
+            />
+          ))}
+        </div>
+      )}
 
       <div style={{ marginTop: 'var(--space-4)' }}>
         <div
