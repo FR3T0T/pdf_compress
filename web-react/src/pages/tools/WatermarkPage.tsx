@@ -1,13 +1,15 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
+import type { DropZoneHandle } from '../../components/shared/DropZone';
 import { FileList } from '../../components/shared/FileList';
 import { ProgressPanel } from '../../components/shared/ProgressPanel';
 import { ResultsPanel } from '../../components/shared/ResultsPanel';
 import { Select, Slider, TextInput } from '../../components/shared/formControls';
 import { useToast } from '../../components/shared/Toast';
+import { useHotkeys } from '../../bridge/useHotkeys';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
@@ -104,8 +106,15 @@ export function WatermarkPage() {
   const [outputDir, setOutputDir] = useState('');
   const [naming, setNaming] = useState('{name}_watermarked');
   const op = useOperation<WatermarkResult>('watermark');
+  const dropRef = useRef<DropZoneHandle>(null);
 
   usePageBusy(op.status === 'running');
+
+  useHotkeys({
+    onAddFiles: () => dropRef.current?.open(),
+    onRun: () => op.status !== 'running' && run(),
+    onClear: op.status === 'running' ? undefined : () => setFiles([]),
+  });
 
   useEffect(() => {
     (async () => {
@@ -236,6 +245,7 @@ export function WatermarkPage() {
       <PageHeader title="Watermark" subtitle="Add text watermarks to PDF pages" backButton={false} />
 
       <DropZone
+        ref={dropRef}
         files={files}
         onFilesChanged={setFiles}
         multiple

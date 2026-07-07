@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
+import type { DropZoneHandle } from '../../components/shared/DropZone';
+import { useHotkeys } from '../../bridge/useHotkeys';
 import { FileList } from '../../components/shared/FileList';
 import { PresetCards } from '../../components/shared/PresetCards';
 import { ProgressPanel } from '../../components/shared/ProgressPanel';
@@ -59,6 +61,7 @@ export function CompressPage() {
   const [useGs, setUseGs] = useState(false);
   const op = useOperation<CompressResultItem[]>('compress');
   const [startTime, setStartTime] = useState<number | null>(null);
+  const dropRef = useRef<DropZoneHandle>(null);
 
   usePageBusy(op.status === 'running');
 
@@ -83,6 +86,12 @@ export function CompressPage() {
   }, [op.status, op.result, op.error, toast]);
 
   const canRun = files.length > 0 && op.status !== 'running';
+
+  useHotkeys({
+    onAddFiles: () => dropRef.current?.open(),
+    onRun: () => canRun && run(),
+    onClear: op.status === 'running' ? undefined : () => setFiles([]),
+  });
 
   const run = () => {
     if (files.length === 0) {
@@ -113,6 +122,7 @@ export function CompressPage() {
       <PageHeader title="Compress PDF" subtitle="Reduce file size while preserving quality" backButton={false} />
 
       <DropZone
+        ref={dropRef}
         files={files}
         onFilesChanged={setFiles}
         multiple

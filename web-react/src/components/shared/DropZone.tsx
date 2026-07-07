@@ -1,6 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import type { PickedFile } from '../../types/bridge';
 import { bridgeApi, isRealBridge } from '../../bridge/bridgeApi';
+
+/** Imperative handle so a page can trigger the picker (e.g. from a Ctrl+O hotkey). */
+export interface DropZoneHandle {
+  open: () => void;
+}
 
 interface DropZoneProps {
   /** Current picked files — DropZone is controlled; it never holds its own list. */
@@ -25,16 +30,19 @@ interface DropZoneProps {
  * QWebEngine), and click opens BridgeAPI.openFiles(accept). Plain-browser
  * dev (no window.BridgeAPI): falls back to a real <input type="file">.
  */
-export function DropZone({
-  files,
-  onFilesChanged,
-  title = 'Drop PDF files here',
-  subtitle = 'or click to browse',
-  accept = 'PDF Files (*.pdf)',
-  multiple = true,
-  compact = false,
-  disabled = false,
-}: DropZoneProps) {
+export const DropZone = forwardRef<DropZoneHandle, DropZoneProps>(function DropZone(
+  {
+    files,
+    onFilesChanged,
+    title = 'Drop PDF files here',
+    subtitle = 'or click to browse',
+    accept = 'PDF Files (*.pdf)',
+    multiple = true,
+    compact = false,
+    disabled = false,
+  },
+  ref
+) {
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -63,6 +71,8 @@ export function DropZone({
       inputRef.current?.click();
     }
   };
+
+  useImperativeHandle(ref, () => ({ open: browse }));
 
   const summary =
     files.length === 1
@@ -125,4 +135,4 @@ export function DropZone({
       />
     </div>
   );
-}
+});

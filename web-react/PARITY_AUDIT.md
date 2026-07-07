@@ -53,14 +53,15 @@ Severity: 🟡 minor UX · ⚪ cosmetic/behavioral. None are functional breakage
   `bridgeApi.analyzeFile(path)` as files are added and surfacing the count in
   `FileList`. *Undocumented.* (`src/pages/tools/MergePage.tsx`)
 
-- [ ] 🟡 **Keyboard shortcuts — per-page.** `Ctrl+O` (add files), `Ctrl+Enter`
-  (run), and `Esc` (clear) were implemented on 3 vanilla pages
-  (merge/split/watermark) and are not carried into React. App-level `Ctrl+T`
-  (theme) and `Ctrl+Home` (dashboard) still work — they live in Python
-  (`ui/web_shell.py:348`), independent of frontend. The main `README.md`
-  keyboard table was corrected to list only the two that actually work.
-  Decide whether to reintroduce per-page shortcuts (e.g. a shared `useHotkeys`
-  hook) or leave them retired.
+- [x] 🟡 **Keyboard shortcuts — per-page.** ~~`Ctrl+O` (add files),
+  `Ctrl+Enter` (run), and `Esc` (clear) were implemented on 3 vanilla pages
+  (merge/split/watermark) and are not carried into React.~~ **Done:** added a
+  shared `useHotkeys` hook (`src/bridge/useHotkeys.ts`, cross-platform
+  Ctrl/Cmd) and an imperative `open()` handle on `DropZone`, wired into the
+  primary workflow pages **Compress, Merge, Split, Watermark**. `Esc` is
+  ignored while typing in a field. App-level `Ctrl+T` (theme) / `Ctrl+Home`
+  (dashboard) remain in Python (`ui/web_shell.py:348`). Other tool pages can
+  adopt the same hook incrementally.
 
 - [ ] ⚪ **Router — page state resets on revisit.** The React router unmounts a
   page on navigate-away; the vanilla router cached page instances, so a

@@ -105,10 +105,13 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 
 ## Keyboard shortcuts (GUI)
 
-| Shortcut | Action |
-|----------|--------|
-| Ctrl+T | Toggle light/dark theme |
-| Ctrl+Home | Dashboard |
+| Shortcut | Action | Scope |
+|----------|--------|-------|
+| Ctrl+T | Toggle light/dark theme | Global |
+| Ctrl+Home | Dashboard | Global |
+| Ctrl+O | Add files | Compress, Merge, Split, Watermark |
+| Ctrl+Enter | Run the tool | Compress, Merge, Split, Watermark |
+| Escape | Clear selected files | Compress, Merge, Split, Watermark |
 
 ---
 
