@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
@@ -36,6 +36,10 @@ export function MergePage() {
   const [outputDir, setOutputDir] = useState('');
   const [outputName, setOutputName] = useState('merged');
   const op = useOperation<MergeResult>('merge');
+  // Paths we've already kicked off analyzeFile() for, so a fetch that fails
+  // or returns no count isn't retried on every render. Pruned to the current
+  // file set below, so removing then re-adding a file re-analyzes it.
+  const analyzedPaths = useRef<Set<string>>(new Set());
 
   usePageBusy(op.status === 'running');
 
@@ -43,6 +47,43 @@ export function MergePage() {
     bridgeApi.loadSetting('merge/outputDir').then((v) => v && setOutputDir(v));
     bridgeApi.loadSetting('merge/outputName').then((v) => v && setOutputName(v));
   }, []);
+
+  // Fetch each file's page count (and true size) as it's added, mirroring the
+  // vanilla merge page's per-file info. Additive: FileList shows `pages` when
+  // present. Field fallback matches vanilla (info.pages || info.page_count).
+  useEffect(() => {
+    const currentPaths = new Set(files.map((f) => f.path));
+    for (const p of analyzedPaths.current) {
+      if (!currentPaths.has(p)) analyzedPaths.current.delete(p);
+    }
+
+    const pending = files.filter((f) => f.pages === undefined && !analyzedPaths.current.has(f.path));
+    if (pending.length === 0) return;
+
+    let cancelled = false;
+    for (const f of pending) {
+      analyzedPaths.current.add(f.path);
+      bridgeApi
+        .analyzeFile(f.path)
+        .then((info) => {
+          if (cancelled || !info) return;
+          const pages = (info.pages ?? info.page_count) as number | undefined;
+          const size = (info.size ?? info.file_size) as number | undefined;
+          if (pages === undefined && size === undefined) return;
+          setFiles((fs) =>
+            fs.map((x) =>
+              x.path === f.path ? { ...x, pages: pages ?? x.pages, size: size ?? x.size } : x
+            )
+          );
+        })
+        .catch(() => {
+          /* leave counts unset — the list still renders name/size */
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [files]);
 
   useEffect(() => {
     if (op.status === 'done') {

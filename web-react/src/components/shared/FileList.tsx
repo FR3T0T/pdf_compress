@@ -45,6 +45,11 @@ export function FileList({ files, onRemove, onReorder, emptyMessage = 'No files 
           <span className="mono" style={{ flex: 1, fontSize: 'var(--font-size-sm)', wordBreak: 'break-word' }} title={f.path}>
             {f.name}
           </span>
+          {typeof f.pages === 'number' && (
+            <span className="mono" style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)' }}>
+              {f.pages} {f.pages === 1 ? 'page' : 'pages'}
+            </span>
+          )}
           {typeof f.size === 'number' && (
             <span className="mono" style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)' }}>
               {bridgeApi.formatSize(f.size)}
