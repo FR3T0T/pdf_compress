@@ -4,7 +4,6 @@ import os
 import shutil
 import threading
 
-import pikepdf
 import pytest
 
 from engine import (
@@ -13,7 +12,6 @@ from engine import (
     CancelledError,
     CompressionStats,
     EncryptedPDFError,
-    FileTooLargeError,
     InvalidPDFError,
     Result,
     _sanitize_path_for_subprocess,
@@ -23,7 +21,6 @@ from engine import (
     fmt_size,
     validate_pdf_magic,
 )
-
 
 # ═══════════════════════════════════════════════════════════════════
 #  Pure unit tests (no file I/O)
@@ -177,7 +174,23 @@ class TestCompressPdf:
     def test_compress_standard(self, sample_pdf, tmp_path):
         out = str(tmp_path / "compressed.pdf")
         result = compress_pdf(sample_pdf, out, preset_key="standard")
-        assert os.path.isfile(out) or result.skipped
+        # The requested output path must always exist afterwards — even a
+        # "no size gain" result now materializes the file (see skip branch).
+        assert isinstance(result, Result)
+        assert os.path.isfile(out)
+
+    @pytest.mark.integration
+    def test_compress_skip_still_writes_distinct_output(self, text_only_pdf, tmp_path):
+        """A distinct output path must be created even when compression can't
+        beat the original (skip branch), instead of silently producing nothing.
+        A text-only PDF has no images to recompress, so it reliably skips."""
+        out = str(tmp_path / "out.pdf")
+        result = compress_pdf(text_only_pdf, out, preset_key="prepress")
+        assert os.path.isfile(out), "output path must exist even when skipped"
+        assert validate_pdf_magic(out)
+        if result.skipped:
+            # Skip branch writes a verbatim copy of the original.
+            assert os.path.getsize(out) == os.path.getsize(text_only_pdf)
 
     @pytest.mark.integration
     @pytest.mark.parametrize("preset_key", PRESET_ORDER)
