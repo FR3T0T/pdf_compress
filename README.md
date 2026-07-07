@@ -239,12 +239,11 @@ Text and vector graphics are never modified.
 | `setup_translation.py` | One-time provisioning of offline translation/OCR models |
 | `compress_pdf.py` | Command-line interface for compression |
 | `compress_pdf.bat` | Windows launcher (no console window) |
-| `ui/` | GUI package — bridge, theme, dialogs |
+| `ui/` | GUI package — web shell, bridge, theme |
 | `ui/web_shell.py` | Main window (QWebEngineView + QWebChannel) |
 | `ui/bridge.py` | Python-to-JavaScript communication bridge |
 | `ui/net_guard.py` | Network kill-switch — blocks all non-local web-engine requests |
-| `ui/tool_registry.py` | Centralized tool definitions and categories |
-| `ui/pages/` | Individual tool pages (one per tool) |
+| `ui/tool_registry.py` | Centralized tool metadata and categories |
 | `web-react/` | Active frontend — React + Vite + TypeScript (source + committed `dist/` build) |
 | `web/` | Legacy vanilla JS frontend — retained as a fallback (`PDF_TOOLKIT_UI=legacy`), no longer active by default |
 | `assets/fonts/` | Bundled fonts (DejaVu Sans) for image-preserving PDF translation output |
