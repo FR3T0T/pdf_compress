@@ -1,13 +1,19 @@
 # Frontend parity audit — `web/` (legacy) → `web-react/` (active)
 
 Page-by-page audit of the React frontend against the legacy vanilla-JS
-frontend it replaced. Purpose: confirm the migration is functionally complete
-before `web/` is retired, and track the remaining polish items.
+frontend it replaced. It confirmed the migration was functionally complete,
+tracked the remaining polish items to closure, and cleared the way to retire
+`web/`.
+
+> **Status: complete.** All items below are resolved and the legacy `web/`
+> frontend has been deleted (see "Retiring `web/`"). This document is kept as
+> the migration record. References to the "vanilla page" / `web/*` are
+> historical — those files no longer exist.
 
 **Date:** 2026-07-07 · **Branch:** `chore/v4.21-code-health`
-**Verdict:** near-complete migration. Backend wiring is 100% intact across all
-22 tools; remaining gaps are cosmetic/UX polish, not functional regressions.
-Nothing here blocks retiring `web/`.
+**Verdict:** migration complete. Backend wiring is 100% intact across all
+22 tools; the gaps found were cosmetic/UX polish, not functional regressions,
+and have since been closed.
 
 ## Method
 
