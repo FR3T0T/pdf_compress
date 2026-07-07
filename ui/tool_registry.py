@@ -1,7 +1,7 @@
 """Tool registry — centralized tool metadata for the web frontend.
 
-The React frontend (and legacy vanilla-JS fallback) renders every tool page
-itself; Python only supplies the tool catalogue (keys, titles, categories,
+The React frontend renders every tool page itself; Python only supplies the
+tool catalogue (keys, titles, categories,
 accepted extensions) over the QWebChannel bridge. This module therefore holds
 pure metadata with no UI-framework dependencies.
 """
