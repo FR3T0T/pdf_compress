@@ -32,13 +32,11 @@ interface RouterProviderProps {
  * bounce-to-fallback on an unregistered route, and the busy-navigation
  * guard with the exact original warning message (router.js:78).
  *
- * One deliberate behavior change: router.js caches page instances so a
- * page's internal state survives navigating away and back (it never
- * unmounts). This port unmounts on navigate-away like a normal React
- * route — simpler and more maintainable across 20 pages, but state (e.g.
- * a half-filled form) resets on revisit. Flagged for review; can be
- * revisited with a keep-alive wrapper later if that behavior turns out to
- * matter in practice.
+ * Page state survives navigating away and back, matching router.js's
+ * cached page instances: the keep-alive lives in AppShell, which mounts
+ * each visited route once and toggles `display:none` rather than
+ * unmounting. This component only tracks the current route key and the
+ * busy-navigation guard; it doesn't mount the pages itself.
  */
 export function RouterProvider({ routes, fallback = 'home', children }: RouterProviderProps) {
   const toast = useToast();
