@@ -14,9 +14,7 @@ import logging
 import os
 import platform
 import subprocess
-import sys
 import threading
-import traceback
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
@@ -30,7 +28,6 @@ from engine import (
     EncryptedPDFError,
     FileTooLargeError,
     InvalidPDFError,
-    PDFAnalysis,
     Result,
     analyze_pdf,
     compress_pdf,
@@ -38,29 +35,20 @@ from engine import (
     fmt_size,
 )
 from epdf_crypto import (
-    epdf_encrypt, epdf_decrypt, is_epdf, epdf_read_metadata,
-    CIPHERS as EPDF_CIPHERS, KDFS as EPDF_KDFS,
-    EPDFError, EPDFPasswordError,
+    CIPHERS as EPDF_CIPHERS,
 )
-
-from pdf_analyze import analyze_document, sanitize_pdf, DEFAULT_SANITIZE
-
-from pdf_translate import (
-    translation_status, translate_text, translate_image, translate_pdf,
-    supported_languages, TranslationError,
+from epdf_crypto import (
+    KDFS as EPDF_KDFS,
 )
-
+from epdf_crypto import (
+    EPDFPasswordError,
+    epdf_decrypt,
+    epdf_encrypt,
+    epdf_read_metadata,
+    is_epdf,
+)
+from pdf_analyze import DEFAULT_SANITIZE, analyze_document, sanitize_pdf
 from pdf_ops import (
-    CompareResult,
-    ExtractImagesResult,
-    ExtractTextResult,
-    ImagesToPdfResult,
-    MergeResult,
-    PageOpResult,
-    PdfToImagesResult,
-    PdfToWordResult,
-    RedactResult,
-    SplitResult,
     add_page_numbers,
     add_watermark,
     apply_page_operations,
@@ -70,6 +58,7 @@ from pdf_ops import (
     extract_images,
     extract_text,
     flatten_pdf,
+    get_toc,
     images_to_pdf,
     merge_pdfs,
     nup_layout,
@@ -79,10 +68,17 @@ from pdf_ops import (
     read_metadata,
     redact_pdf,
     repair_pdf,
-    get_toc,
     split_pdf,
     unlock_pdf,
     write_metadata,
+)
+from pdf_translate import (
+    TranslationError,
+    supported_languages,
+    translate_image,
+    translate_pdf,
+    translate_text,
+    translation_status,
 )
 
 log = logging.getLogger(__name__)
@@ -452,6 +448,7 @@ class Bridge(QObject):
         """
         try:
             import base64
+
             import fitz  # PyMuPDF
 
             doc = fitz.open(path)
@@ -504,6 +501,7 @@ class Bridge(QObject):
         DPI = 150
         try:
             import base64
+
             import fitz  # PyMuPDF
 
             doc = fitz.open(path)
@@ -1105,7 +1103,7 @@ class Bridge(QObject):
                         "details": detail,
                         "outputPath": out_path,
                     })
-                except EPDFPasswordError as exc:
+                except EPDFPasswordError:
                     file_results.append({
                         "file": fname,
                         "status": "error",

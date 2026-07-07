@@ -1,15 +1,13 @@
 """PDF operations — merge, split, and page manipulation."""
 
+import logging
+import math
 import os
+import re
 import tempfile
 import threading
-import logging
 from dataclasses import dataclass, field
 from typing import Callable
-
-import math
-
-import re
 
 import fitz  # PyMuPDF
 import pikepdf
@@ -107,7 +105,7 @@ def merge_pdfs(
         except pikepdf.PasswordError:
             raise pikepdf.PasswordError(
                 f"Cannot merge password-protected file: {os.path.basename(path)}"
-            )
+            ) from None
 
         dest.pages.extend(src.pages)
         total_pages += len(src.pages)
@@ -393,7 +391,6 @@ def apply_page_operations(
             os.unlink(tmp)
         raise
 
-    output_size = os.path.getsize(output_path)
     ops_str = ", ".join(ops) if ops else "No changes"
     log.info("Page ops on %s → %s: %s", input_path, output_path, ops_str)
 
@@ -545,8 +542,9 @@ def images_to_pdf(image_paths, output_path, page_size="auto", margin_mm=10,
     Handles EXIF rotation, transparency (via white background compositing),
     and preserves image quality.
     """
-    from PIL import Image, ImageOps
     import io
+
+    from PIL import Image, ImageOps
 
     PAGE_SIZES = {
         "a4": (595.28, 841.89),
@@ -656,10 +654,8 @@ def pdf_to_word(input_path, output_path, on_progress=None, cancel=None):
     """Extract text from PDF and create a Word document using PyMuPDF."""
     try:
         from docx import Document
-        from docx.shared import Pt, Inches
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
     except ImportError:
-        raise ImportError("python-docx is required: pip install python-docx")
+        raise ImportError("python-docx is required: pip install python-docx") from None
 
     import fitz  # PyMuPDF
 
@@ -693,8 +689,7 @@ def pdf_to_word(input_path, output_path, on_progress=None, cancel=None):
                 text = block[4].strip()
                 if text:
                     page_has_text = True
-                    # Detect heading-like blocks by font size via dict extraction
-                    para = doc.add_paragraph(text)
+                    doc.add_paragraph(text)
 
         if not page_has_text:
             doc.add_paragraph("[No extractable text on this page]")
@@ -1109,8 +1104,8 @@ class ExtractImagesResult:
 def extract_images(input_path, output_dir, fmt="png", min_size=0,
                    on_progress=None, cancel=None):
     """Extract all images from a PDF."""
+
     from PIL import Image
-    import io
 
     os.makedirs(output_dir, exist_ok=True)
     src = pikepdf.open(input_path)
@@ -1131,7 +1126,7 @@ def extract_images(input_path, output_dir, fmt="png", min_size=0,
         if "/XObject" not in resources:
             continue
 
-        for key, xobj_ref in resources["/XObject"].items():
+        for _key, xobj_ref in resources["/XObject"].items():
             try:
                 xobj = xobj_ref
                 if hasattr(xobj, 'resolve'):
@@ -1163,7 +1158,6 @@ def extract_images(input_path, output_dir, fmt="png", min_size=0,
                     try:
                         data = xobj.read_bytes()
                         cs = str(xobj.get("/ColorSpace", "/DeviceRGB"))
-                        bpc = int(xobj.get("/BitsPerComponent", 8))
 
                         if "/DeviceRGB" in cs:
                             mode = "RGB"
