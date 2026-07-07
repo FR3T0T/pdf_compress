@@ -1,11 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
+import type { DropZoneHandle } from '../../components/shared/DropZone';
 import { ProgressPanel } from '../../components/shared/ProgressPanel';
 import { Select, TextInput } from '../../components/shared/formControls';
 import { useToast } from '../../components/shared/Toast';
+import { useHotkeys } from '../../bridge/useHotkeys';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
@@ -47,6 +49,7 @@ export function SplitPage() {
   const [outputDir, setOutputDir] = useState('');
   const [nameTemplate, setNameTemplate] = useState('{filename}_page_{n}');
   const op = useOperation<SplitResult>('split');
+  const dropRef = useRef<DropZoneHandle>(null);
 
   usePageBusy(op.status === 'running');
 
@@ -122,6 +125,12 @@ export function SplitPage() {
 
   const canRun = !!file && op.status !== 'running';
 
+  useHotkeys({
+    onAddFiles: () => dropRef.current?.open(),
+    onRun: () => canRun && run(),
+    onClear: op.status === 'running' ? undefined : () => setFiles([]),
+  });
+
   const run = () => {
     if (!file) {
       toast.warning('Please add a PDF file first.');
@@ -169,6 +178,7 @@ export function SplitPage() {
       <PageHeader title="Split PDF" subtitle="Split a PDF into individual pages, page ranges, or chapters" backButton={false} />
 
       <DropZone
+        ref={dropRef}
         files={files}
         onFilesChanged={setFiles}
         multiple={false}

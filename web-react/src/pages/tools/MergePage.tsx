@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
+import type { DropZoneHandle } from '../../components/shared/DropZone';
+import { useHotkeys } from '../../bridge/useHotkeys';
 import { FileList } from '../../components/shared/FileList';
 import { ProgressPanel } from '../../components/shared/ProgressPanel';
 import { ResultsPanel } from '../../components/shared/ResultsPanel';
@@ -27,8 +29,7 @@ interface MergeResult {
  * ({output_path, input_paths, total_pages}), verified against
  * pdf_ops.py. Settings persistence (merge/outputDir, merge/outputName)
  * preserved via the same bridge keys. Keyboard shortcuts (Ctrl+O,
- * Ctrl+Enter, Esc) intentionally not carried over — UX sugar, not part
- * of the bridge contract.
+ * Ctrl+Enter, Esc) restored via the shared useHotkeys hook.
  */
 export function MergePage() {
   const toast = useToast();
@@ -40,6 +41,7 @@ export function MergePage() {
   // or returns no count isn't retried on every render. Pruned to the current
   // file set below, so removing then re-adding a file re-analyzes it.
   const analyzedPaths = useRef<Set<string>>(new Set());
+  const dropRef = useRef<DropZoneHandle>(null);
 
   usePageBusy(op.status === 'running');
 
@@ -95,6 +97,12 @@ export function MergePage() {
 
   const canRun = files.length >= 2 && op.status !== 'running';
 
+  useHotkeys({
+    onAddFiles: () => dropRef.current?.open(),
+    onRun: () => canRun && run(),
+    onClear: op.status === 'running' ? undefined : () => setFiles([]),
+  });
+
   const pickOutputDir = async () => {
     const dir = await bridgeApi.openFolder();
     if (dir) {
@@ -132,6 +140,7 @@ export function MergePage() {
       <PageHeader title="Merge PDFs" subtitle="Combine multiple PDF files into one document" backButton={false} />
 
       <DropZone
+        ref={dropRef}
         files={files}
         onFilesChanged={setFiles}
         multiple
