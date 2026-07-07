@@ -65,11 +65,13 @@ Severity: 🟡 minor UX · ⚪ cosmetic/behavioral. None are functional breakage
   (dashboard) remain in Python (`ui/web_shell.py:348`). Other tool pages can
   adopt the same hook incrementally.
 
-- [ ] ⚪ **Router — page state resets on revisit.** The React router unmounts a
-  page on navigate-away; the vanilla router cached page instances, so a
-  half-filled form survived navigating away and back. *Deliberate — documented
-  at `src/router/Router.tsx:29`.* A keep-alive wrapper could restore the old
-  behavior if it turns out to matter in practice.
+- [x] ⚪ **Router — page state resets on revisit.** ~~The React router unmounts
+  a page on navigate-away; the vanilla router cached page instances, so a
+  half-filled form survived navigating away and back.~~ **Done:** `AppShell`
+  now keeps each visited route mounted and toggles `display:none` instead of
+  unmounting, restoring the vanilla cached-page behavior. Pages mount lazily
+  (only once visited); the router's busy guard still blocks navigation mid-op,
+  so hidden pages are inert. (`src/shell/AppShell.tsx`, `src/router/Router.tsx`)
 
 ## Confirmation to double-check (not a gap)
 
