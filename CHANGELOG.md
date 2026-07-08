@@ -1,6 +1,21 @@
 # Changelog
 ## Unreleased
 
+### Added
+- **Image metadata privacy analyzer (backend).** `pdf_analyze.py` can now scan
+  standalone JPEG/PNG image files for privacy-sensitive metadata, reusing the
+  same `Finding`/`AnalysisResult` machinery as the PDF analyzer so the report
+  shape (`to_dict()`) is identical. New `analyze_image(path)` validates the
+  file's magic bytes (JPEG `FF D8 FF` / PNG signature, `ValueError` otherwise)
+  and runs EXIF scanners over Pillow's IFDs: GPS coordinates (HIGH, decoded
+  DMS→decimal), camera make/model/capture-time/software (MEDIUM), an embedded
+  thumbnail (MEDIUM), and author/copyright metadata (LOW). A new
+  `analyze_file(path, password=None)` dispatcher sniffs the magic bytes and
+  routes to `analyze_document` (PDF) or `analyze_image` (JPEG/PNG). Backend +
+  tests only — not yet wired into the bridge/UI (Phase 2). No new dependencies
+  (Pillow was already required). Added `tests/test_pdf_analyze.py` coverage
+  (`TestAnalyzeImage`, `TestAnalyzeFileDispatch`, `TestImageHelpers`).
+
 ### Security
 - **Redaction of scanned (image-only) PDFs now works instead of blanking the page
   (RED-01).** `redact_pdf` applied redactions with `PDF_REDACT_IMAGE_REMOVE`,

@@ -2,7 +2,8 @@
 
 Covers ANL-02 (sanitiser must follow ``/Next`` action chains), ANL-01
 (in-place sanitise on Windows), ANL-03 (invisible render-mode-3 text
-detection), and ANL-04 (embedded-file detection + removal). pdf_analyze
+detection), ANL-04 (embedded-file detection + removal), and the Phase-1
+image metadata analyzer (analyze_image / analyze_file). pdf_analyze
 imports no Qt, so these run Qt-free (per CLAUDE.md).
 """
 
@@ -10,8 +11,17 @@ import os
 
 import pikepdf
 import pytest
+from PIL import Image
 
-from pdf_analyze import analyze_document, sanitize_pdf
+from pdf_analyze import (
+    AnalysisResult,
+    _dms_to_decimal,
+    _scan_image_thumbnail,
+    analyze_document,
+    analyze_file,
+    analyze_image,
+    sanitize_pdf,
+)
 
 try:
     import fitz  # noqa: F401  (PyMuPDF — optional; drives the ANL-03 scan)
@@ -359,3 +369,138 @@ class TestEmbeddedFiles:
         result = sanitize_pdf(src, out, {"embedded_files": True})
         assert result["removed"].get("file_attachment_annot", 0) == 0
         assert result["removed"].get("associated_file", 0) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Image metadata analyzer (analyze_image / analyze_file)
+# ═══════════════════════════════════════════════════════════════════
+
+# EXIF tag ids used to build fixtures (see Pillow ExifTags.TAGS).
+_TAG_MAKE, _TAG_MODEL, _TAG_DATETIME = 0x010F, 0x0110, 0x0132
+_TAG_GPSINFO = 0x8825
+
+
+def _jpeg(path, exif=None, *, color=(10, 120, 200)) -> str:
+    """Write a tiny JPEG, optionally carrying a PIL ``Image.Exif`` block."""
+    img = Image.new("RGB", (48, 32), color)
+    if exif is None:
+        img.save(str(path))
+    else:
+        img.save(str(path), exif=exif)
+    return str(path)
+
+
+def _finding(report: dict, fid: str):
+    return next((f for f in report["findings"] if f["id"] == fid), None)
+
+
+class TestAnalyzeImage:
+    def test_gps_jpeg_yields_high_location(self, tmp_path):
+        exif = Image.Exif()
+        exif[_TAG_MAKE] = "Canon"
+        exif[_TAG_MODEL] = "EOS"
+        # 40°44'54.38"N, 73°59'8.5"W  ->  ~40.748439, ~-73.985694
+        exif[_TAG_GPSINFO] = {1: "N", 2: (40.0, 44.0, 54.38),
+                              3: "W", 4: (73.0, 59.0, 8.5)}
+        src = _jpeg(tmp_path / "gps.jpg", exif)
+
+        report = analyze_image(src)
+        assert report["overallRisk"] == "high"
+        loc = _finding(report, "location.gps")
+        assert loc is not None and loc["severity"] == "high"
+        # Decoded coordinates are surfaced (to ~4 decimal places).
+        joined = " ".join(loc["items"]) + " " + loc["detail"]
+        assert "40.7484" in joined
+        assert "-73.9856" in joined or "-73.9857" in joined
+
+    def test_camera_jpeg_no_gps(self, tmp_path):
+        exif = Image.Exif()
+        exif[_TAG_MAKE] = "Nikon"
+        exif[_TAG_MODEL] = "D3500"
+        exif[_TAG_DATETIME] = "2020:01:01 00:00:00"
+        src = _jpeg(tmp_path / "cam.jpg", exif)
+
+        report = analyze_image(src)
+        ids = _finding_ids(report)
+        assert "location.gps" not in ids
+        cam = _finding(report, "metadata.camera")
+        assert cam is not None and cam["severity"] == "medium"
+        assert any("Nikon" in it and "D3500" in it for it in cam["items"])
+        assert report["overallRisk"] == "medium"
+
+    def test_clean_jpeg_no_findings(self, tmp_path):
+        report = analyze_image(_jpeg(tmp_path / "clean.jpg"))
+        assert report["findings"] == []
+        assert report["overallRisk"] == "info"
+
+    def test_png_runs_clean(self, tmp_path):
+        src = str(tmp_path / "x.png")
+        Image.new("RGB", (20, 20), (0, 0, 0)).save(src)
+        report = analyze_image(src)
+        assert report["findings"] == []
+        assert report["overallRisk"] == "info"
+
+    def test_rejects_non_image(self, tmp_path):
+        bad = str(tmp_path / "notimg.jpg")
+        with open(bad, "wb") as fh:
+            fh.write(b"this is plainly not an image")
+        with pytest.raises(ValueError):
+            analyze_image(bad)
+
+    def test_output_shape_matches_document(self, tmp_path):
+        # The image report exposes the same top-level keys as a PDF report,
+        # so the frontend can consume either shape unchanged.
+        pdf = pikepdf.Pdf.new()
+        _blank_page(pdf)
+        pdf_src = str(tmp_path / "d.pdf")
+        pdf.save(pdf_src)
+        pdf.close()
+
+        img_report = analyze_image(_jpeg(tmp_path / "s.jpg"))
+        assert set(img_report) == set(analyze_document(pdf_src))
+
+
+class TestAnalyzeFileDispatch:
+    def test_pdf_routes_to_analyze_document(self, tmp_path):
+        pdf = pikepdf.Pdf.new()
+        _blank_page(pdf)
+        src = str(tmp_path / "d.pdf")
+        pdf.save(src)
+        pdf.close()
+        assert analyze_file(src) == analyze_document(src)
+
+    def test_jpeg_routes_to_analyze_image(self, tmp_path):
+        exif = Image.Exif()
+        exif[_TAG_GPSINFO] = {1: "N", 2: (1.0, 0.0, 0.0),
+                              3: "E", 4: (1.0, 0.0, 0.0)}
+        src = _jpeg(tmp_path / "g.jpg", exif)
+        assert analyze_file(src) == analyze_image(src)
+        assert "location.gps" in _finding_ids(analyze_file(src))
+
+    def test_unsupported_type_raises(self, tmp_path):
+        bad = str(tmp_path / "note.txt")
+        with open(bad, "wb") as fh:
+            fh.write(b"plain text, not a supported file type")
+        with pytest.raises(ValueError):
+            analyze_file(bad)
+
+
+class TestImageHelpers:
+    # The DMS→decimal decode is version-independent, so pin it directly.
+    def test_dms_to_decimal_north_east_positive(self):
+        assert _dms_to_decimal((40.0, 44.0, 54.38), "N") == pytest.approx(40.748439, abs=1e-5)
+        assert _dms_to_decimal((73.0, 59.0, 8.5), "E") == pytest.approx(73.985694, abs=1e-5)
+
+    def test_dms_to_decimal_south_west_negative(self):
+        assert _dms_to_decimal((40.0, 44.0, 54.38), "S") == pytest.approx(-40.748439, abs=1e-5)
+        assert _dms_to_decimal((73.0, 59.0, 8.5), "W") == pytest.approx(-73.985694, abs=1e-5)
+
+    def test_thumbnail_scanner_flags_ifd1_with_thumbnail(self):
+        res = AnalysisResult()
+        _scan_image_thumbnail({513: 100, 514: 2048}, res)
+        assert [f.id for f in res.findings] == ["content.thumbnail"]
+
+    def test_thumbnail_scanner_ignores_empty_ifd1(self):
+        res = AnalysisResult()
+        _scan_image_thumbnail({}, res)
+        assert res.findings == []
