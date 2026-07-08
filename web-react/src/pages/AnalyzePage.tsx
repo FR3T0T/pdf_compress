@@ -35,6 +35,9 @@ export function AnalyzePage() {
   useWorkspaceBusy((status === 'loading' || sanitizing) && !!workspace.path);
 
   const filePath = workspace.path ?? files[0]?.path ?? null;
+  // Images (Phase 2) analyze fine but have no sanitiser yet, so the clean/
+  // Sanitize action stays PDF-only for now (Phase 3 adds image strip).
+  const isImage = filePath ? /\.(jpe?g|png)$/i.test(filePath) : false;
 
   useEffect(() => {
     bridgeApi
@@ -120,7 +123,8 @@ export function AnalyzePage() {
           files={files}
           onFilesChanged={setFiles}
           multiple={false}
-          title="Drop a PDF to analyze"
+          accept="PDF & Images (*.pdf *.jpg *.jpeg *.png)"
+          title="Drop a PDF or image to analyze"
           subtitle="or click to browse"
           disabled={status === 'loading'}
         />
@@ -147,7 +151,7 @@ export function AnalyzePage() {
             ))}
           </div>
 
-          {hasRisk && sanitizeDefaults && (
+          {hasRisk && sanitizeDefaults && !isImage && (
             <div style={{ marginTop: 'var(--space-4)' }}>
               <SanitizePanel
                 defaults={sanitizeDefaults}

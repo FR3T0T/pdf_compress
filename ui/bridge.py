@@ -50,7 +50,7 @@ from epdf_crypto import (
     epdf_read_metadata,
     is_epdf,
 )
-from pdf_analyze import DEFAULT_SANITIZE, analyze_document, sanitize_pdf
+from pdf_analyze import DEFAULT_SANITIZE, analyze_file, sanitize_pdf
 from pdf_ops import (
     add_page_numbers,
     add_watermark,
@@ -572,14 +572,17 @@ class Bridge(QObject):
 
     @Slot(str, result=str)
     def analyzeDocument(self, path: str) -> str:
-        """Run the privacy/security audit on a PDF. Returns JSON.
+        """Run the privacy/security audit on a PDF or image. Returns JSON.
 
-        Surfaces metadata leaks, embedded JavaScript, auto-run/launch
-        actions, external trackers, embedded files, form-submit actions,
-        hidden layers, and invisible text — all offline.
+        Dispatches by file type (via ``analyze_file``): for PDFs it surfaces
+        metadata leaks, embedded JavaScript, auto-run/launch actions, external
+        trackers, embedded files, form-submit actions, hidden layers, and
+        invisible text; for JPEG/PNG images it surfaces GPS location, camera
+        and capture metadata, embedded thumbnails, and author/copyright tags —
+        all offline. The report shape is identical for both.
         """
         try:
-            report = analyze_document(path)
+            report = analyze_file(path)
             return json.dumps({"success": True, "report": report},
                               ensure_ascii=False)
         except Exception as exc:

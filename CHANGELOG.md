@@ -15,6 +15,16 @@
   tests only — not yet wired into the bridge/UI (Phase 2). No new dependencies
   (Pillow was already required). Added `tests/test_pdf_analyze.py` coverage
   (`TestAnalyzeImage`, `TestAnalyzeFileDispatch`, `TestImageHelpers`).
+- **Analyze tool now accepts JPEG/PNG images and reports their privacy
+  metadata.** The `analyzeDocument` bridge slot now dispatches through
+  `analyze_file` (Phase 1), so dropping/browsing an image into **Analyze**
+  routes it to the image scanner while PDFs behave exactly as before. The
+  `AnalyzePage` drop zone accepts `.pdf .jpg .jpeg .png` ("Drop a PDF or image
+  to analyze"), the risk header omits the page-count segment when a file has
+  no pages (images report `pages: 0`), and the Sanitize / clean-copy action is
+  hidden for images (PDF-only until image stripping lands in Phase 3). Report
+  rendering is format-agnostic, so image findings display through the existing
+  risk header / finding rows. Frontend rebuilt (`web-react/dist/`).
 
 ### Security
 - **Redaction of scanned (image-only) PDFs now works instead of blanking the page
