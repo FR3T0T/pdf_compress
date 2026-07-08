@@ -2,19 +2,21 @@
 
 Covers TRN-03 (``translate_line`` must send real words in ANY script to the
 translator, not just Latin/Cyrillic, while still skipping pure
-separators/digits/punctuation) and TRN-01 (PDF→PDF translation must not
-abort the whole document when one block fails language auto-detection).
+separators/digits/punctuation), TRN-01 (PDF→PDF translation must not abort
+the whole document when one block fails language auto-detection), and TRN-02
+(the OCR fallback must not leak its temp PNG when the pixmap save fails).
 The TRN-03 tests are pure logic driven by a stub ``translate_fn``; the
-TRN-01 test needs PyMuPDF + a real PDF and is gated + monkeypatched so it
-runs offline and deterministically.
+TRN-01/TRN-02 tests need PyMuPDF and are gated + monkeypatched so they run
+offline and deterministically (no OCR models).
 """
 
 import os
+import tempfile
 
 import pytest
 
 import pdf_translate
-from pdf_translate import _translate_pdf_to_pdf, translate_line
+from pdf_translate import _extract_pages, _translate_pdf_to_pdf, translate_line
 
 try:
     import fitz  # noqa: F401  (PyMuPDF — required by _translate_pdf_to_pdf)
@@ -141,3 +143,45 @@ class TestTranslatePdfBlockResilience:
             combined = "".join(page.get_text() for page in doc)
         assert "XLATED" in combined        # sentence block was translated
         assert "2024" in combined          # undetectable block preserved, not dropped
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  OCR-fallback temp-PNG cleanup (TRN-02)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestExtractPagesTempCleanup:
+    def test_temp_png_removed_when_pixmap_save_fails(self, tmp_path, monkeypatch):
+        # A page with no text layer takes the OCR fallback, which mkstemp's a
+        # PNG and saves the pixmap to it. If pix.save raises (disk full, etc.)
+        # the temp file must still be cleaned up — before the fix the save ran
+        # outside the try/finally, so the mkstemp'd file leaked (TRN-02).
+        blank = str(tmp_path / "blank.pdf")
+        doc = fitz.open()
+        doc.new_page()                       # no text → OCR fallback path
+        doc.save(blank)
+        doc.close()
+
+        # Corral mkstemp into a dir we can inspect for leftovers.
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        real_mkstemp = tempfile.mkstemp
+
+        def _mkstemp_in_scratch(*args, **kwargs):
+            kwargs["dir"] = str(scratch)
+            return real_mkstemp(*args, **kwargs)
+
+        monkeypatch.setattr(tempfile, "mkstemp", _mkstemp_in_scratch)
+
+        def _boom(self, *args, **kwargs):
+            raise OSError("simulated save failure")
+
+        monkeypatch.setattr(fitz.Pixmap, "save", _boom)
+
+        # The OCR fallback fails per-page but is swallowed (txt=""); the call
+        # itself must not raise, and must leave no orphaned temp PNG.
+        pages = _extract_pages(blank)
+        assert pages == [""]
+        assert list(scratch.iterdir()) == []

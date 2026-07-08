@@ -441,8 +441,13 @@ def _extract_pages(path: str, ocr_fallback_source: str = "auto") -> list[str]:
                     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
                     fd, tmp = tempfile.mkstemp(suffix=".png")
                     os.close(fd)
-                    pix.save(tmp)
+                    # pix.save() is inside the try so the finally always cleans
+                    # up the mkstemp'd file: if the save itself raises (disk
+                    # full, PyMuPDF error) the temp .png still exists and would
+                    # otherwise leak (TRN-02). mkstemp/os.close stay outside so
+                    # `tmp` is defined for the finally.
                     try:
+                        pix.save(tmp)
                         txt = ocr_image(tmp, ocr_fallback_source)["text"]
                     finally:
                         if os.path.exists(tmp):
