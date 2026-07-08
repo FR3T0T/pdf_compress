@@ -156,7 +156,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | CRY-02 | 🟡 Low | crypto | Non-dict `kdf_params` bypasses validation → uncaught `TypeError` | `epdf_crypto.py:134` | Open |
 | TRN-02 | 🟡 Low | translate | Temp PNG leaks if `pix.save` fails before the cleanup try/finally | `pdf_translate.py:442` | Open |
 | BRG-02 | 🟡 Low | bridge | `deleteFile`/`copyFile` lack workspace-dir path containment | `ui/bridge.py:851` | ✅ Fixed |
-| BRG-03 | 🟡 Low | bridge | Slot-level param parse runs outside worker try/except → UI hangs | `ui/bridge.py:718` | Open |
+| BRG-03 | 🟡 Low | bridge | Slot-level param parse runs outside worker try/except → UI hangs | `ui/bridge.py:722` | ✅ Fixed |
 | CLI-02 | 🟡 Low | CLI | Batch: two inputs sharing a basename overwrite each other's output | `compress_pdf.py:128` | Open |
 | CLI-03 | 🟡 Low | CLI | `input()` at exit raises `EOFError` traceback on non-interactive stdin | `compress_pdf.py:211` | Open |
 | CLI-04 | 🟡 Low | CLI | Not-found inputs omitted from summary counts / failure tally | `compress_pdf.py:115` | Open |
@@ -665,20 +665,28 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `tests/test_pdf_ops.py::TestIsWithinDirectory` (incl. the sibling-prefix trap).
 - **Verification:** CONFIRMED; helper now covered by automated tests.
 
-#### BRG-03 — Slot param parse runs outside the worker try/except → UI hangs
-- **Location:** `ui/bridge.py:714-726` (`startTranslateText`), `:742-750`
+#### BRG-03 — Slot param parse runs outside the worker try/except → UI hangs ✅ Fixed
+- **Location:** `ui/bridge.py:722` (`startTranslateText`), `:744`
   (`startTranslateImage`).
-- **What:** These slots parse params and read required keys (`p["text"]`,
-  `p["path"]`, `p["target"]`) on the UI thread **before** `_run_in_thread`. Only
-  `_Worker.run` wraps the work body in try/except. A missing key → `KeyError` in
-  the slot; since no worker started, no `operationDone` is emitted and
-  `useOperation` (which has no timeout) leaves the spinner pending forever.
+- **What:** These slots read required keys (`p["text"]`, `p["path"]`,
+  `p["target"]`) on the UI thread **before** `_run_in_thread`. Only `_Worker.run`
+  wraps the work body in try/except. A missing key → `KeyError` in the slot;
+  since no worker started, no `operationDone` was emitted and `useOperation`
+  (which has no timeout) left the spinner pending forever.
 - **Impact:** Non-normal path (a frontend bug passing a missing key); malformed
   JSON is near-impossible since `JSON.stringify` produces it. Contrast `startMerge`,
   which reads its keys inside `_work` and so reports a failed `operationDone`.
-- **Fix:** Wrap the parse + required-key extraction at the slot head; on failure
-  emit `operationDone(success=False, …)` so the frontend resolves.
-- **Verification:** CONFIRMED.
+- **Fix (applied):** Moved the required-key extraction (`p["text"]`/`p["path"]`,
+  `p["target"]`, and the `.get()` optionals) INSIDE each slot's `_work` closure,
+  mirroring `startMerge`. A missing key now raises in the worker, where
+  `_Worker.run`'s try/except emits `operationDone(success=False, …)` and the
+  frontend resolves with an error instead of hanging. `_normalize_params`,
+  `tool_key` (`.get` with default), and `_make_cancel_event` stay at the slot
+  head (they don't raise on a missing tool key). `_run_in_thread`,
+  `_make_cancel_event`, `startMerge`, and the translate functions are unchanged.
+- **Verification:** CONFIRMED by inspection; not unit-tested because importing
+  `ui/` pulls the full PySide6 stack (the test suite is kept Qt-free, same
+  constraint as BRG-01). The pattern now matches `startMerge`.
 
 #### CLI-02 — Batch: same-basename inputs overwrite each other's output
 - **Location:** `compress_pdf.py:128-130`.

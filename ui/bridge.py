@@ -730,13 +730,17 @@ class Bridge(QObject):
         tool_key = p.get("toolKey", "translate")
         self._make_cancel_event(tool_key)
 
-        text = p["text"]
-        source = p.get("source", "auto")
-        target = p["target"]
-        protect_terms = p.get("protectTerms") or []
-
+        # Read the required keys INSIDE _work (BRG-03): a missing key must
+        # raise in the worker, where _Worker.run's try/except turns it into
+        # operationDone(success=False). Reading them here on the UI thread
+        # would raise KeyError before any worker starts -- no operationDone,
+        # so the frontend spinner hangs forever. Mirrors startMerge.
         def _work():
-            return translate_text(text, target, source or "auto", protect_terms)
+            text = p["text"]
+            target = p["target"]
+            source = p.get("source", "auto") or "auto"
+            protect_terms = p.get("protectTerms") or []
+            return translate_text(text, target, source, protect_terms)
 
         self._run_in_thread(tool_key, _work)
 
@@ -754,13 +758,17 @@ class Bridge(QObject):
         tool_key = p.get("toolKey", "translate")
         self._make_cancel_event(tool_key)
 
-        path = p["path"]
-        source = p.get("source", "auto")
-        target = p["target"]
-        protect_terms = p.get("protectTerms") or []
-
+        # Read the required keys INSIDE _work (BRG-03): a missing key must
+        # raise in the worker, where _Worker.run's try/except turns it into
+        # operationDone(success=False). Reading them here on the UI thread
+        # would raise KeyError before any worker starts -- no operationDone,
+        # so the frontend spinner hangs forever. Mirrors startMerge.
         def _work():
-            return translate_image(path, target, source or "auto", protect_terms)
+            path = p["path"]
+            target = p["target"]
+            source = p.get("source", "auto") or "auto"
+            protect_terms = p.get("protectTerms") or []
+            return translate_image(path, target, source, protect_terms)
 
         self._run_in_thread(tool_key, _work)
 

@@ -51,6 +51,14 @@
   to Fixed.
 
 ### Fixes
+- **Offline text/image translation no longer hangs the UI on a malformed request
+  (BRG-03).** `startTranslateText` / `startTranslateImage` read their required
+  params (`text`/`path`, `target`) on the UI thread before dispatching the
+  worker, so a missing key raised `KeyError` in the slot — no worker started, no
+  `operationDone` was emitted, and the frontend spinner (which has no timeout)
+  hung forever. Those reads now happen inside the worker's `_work` closure
+  (mirroring `startMerge`), so a missing key surfaces as
+  `operationDone(success=False, …)` and the UI resolves with an error.
 - **A cancelled-then-rerun operation is cancellable again (BRG-01).** The bridge's
   worker-cleanup handler removed tracking entries by `tool_key` string, not by the
   identity of the worker that finished. Because `_make_cancel_event` overlaps
