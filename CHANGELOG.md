@@ -25,6 +25,20 @@
   hidden for images (PDF-only until image stripping lands in Phase 3). Report
   rendering is format-agnostic, so image findings display through the existing
   risk header / finding rows. Frontend rebuilt (`web-react/dist/`).
+- **PDF analyzer now scans embedded images for EXIF/GPS metadata.** A phone
+  photo dropped into a PDF keeps its original EXIF — including GPS coordinates —
+  a common, easily-missed privacy leak the analyzer previously walked past. New
+  `_scan_embedded_image_metadata` (wired into `analyze_document`'s scanner list)
+  walks each page's image XObjects (recursing into form XObjects, deduplicating
+  by object identity so an image reused on many pages is reported once), and for
+  JPEG (`/DCTDecode`/`/JPXDecode`) images recovers the **original** stream bytes
+  via `read_raw_bytes()` — which preserves EXIF, unlike a re-encoded pixmap —
+  then reuses the Phase-1 EXIF parsing. Surfaces two findings: "Location data in
+  an embedded image" (HIGH, decoded coordinates + page/image location) and
+  "Camera metadata in an embedded image" (MEDIUM, device/capture-time/software).
+  Non-JPEG images (Flate/CCITT) don't carry EXIF and are skipped. The
+  EXIF-survives-embedding round-trip was verified empirically end-to-end. No new
+  dependencies. Added `tests/test_pdf_analyze.py::TestEmbeddedImageExif`.
 
 ### Security
 - **Redaction of scanned (image-only) PDFs now works instead of blanking the page
