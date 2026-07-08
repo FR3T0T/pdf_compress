@@ -1642,7 +1642,11 @@ def redact_pdf(
                         pass
                     page.delete_widget(wdg)
 
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
+            # PDF_REDACT_IMAGE_PIXELS blacks out only the pixels under each
+            # redaction rect; PDF_REDACT_IMAGE_REMOVE deletes any image the
+            # rect touches -- on a scanned page (one full-page image) that
+            # blanks the WHOLE page while still reporting success (RED-01).
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
             hit_count += added
             pages_touched.add(pno)
 
