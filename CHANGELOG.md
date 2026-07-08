@@ -42,6 +42,16 @@
   to Fixed.
 
 ### Fixes
+- **A cancelled-then-rerun operation is cancellable again (BRG-01).** The bridge's
+  worker-cleanup handler removed tracking entries by `tool_key` string, not by the
+  identity of the worker that finished. Because `_make_cancel_event` overlaps
+  same-key runs, a cancel-then-immediate-rerun let the *old* worker's finish
+  handler evict the *new* run's worker and cancel event, so `cancelOperation`
+  no-oped and the in-flight rerun could never be cancelled. `_on_finished` now
+  removes each entry only when it's still this run's object (identity check), so
+  a stale finish leaves the newer run intact. (Bridge/Qt path — not unit-tested,
+  as the test suite is kept Qt-free; verified by inspection + real-app
+  cancel→rerun.)
 - **File drag-drop is now scoped to the active tool page (FE-01).** Under the
   AppShell keep-alive (every visited page stays mounted), each mounted `DropZone`
   subscribed to the global `files-dropped` EventBus, so a single OS file-drop was

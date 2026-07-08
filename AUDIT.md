@@ -140,7 +140,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | ANL-03 | 🟠 Med | analyze | Invisible-text ("failed redaction") detector largely non-functional | `pdf_analyze.py:620` | ✅ Fixed |
 | ANL-04 | 🟠 Med | analyze | Embedded-file sanitiser leaves `/FileAttachment` & `/AF` files | `pdf_analyze.py:918` | ✅ Fixed |
 | TRN-01 | 🟠 Med | translate | PDF→PDF translate aborts entirely on one undetectable short block | `pdf_translate.py:600` | ✅ Fixed |
-| BRG-01 | 🟠 Med | bridge | Worker cleanup keyed by `tool_key` breaks cancel after rapid restart | `ui/bridge.py:322` | Open |
+| BRG-01 | 🟠 Med | bridge | Worker cleanup keyed by `tool_key` breaks cancel after rapid restart | `ui/bridge.py:327` | ✅ Fixed |
 | CLI-01 | 🟠 Med | CLI | CLI always exits 0 even when files fail | `compress_pdf.py:214` | Open |
 | FE-01 | 🟠 Med | frontend | Drag-drop not scoped to active page → pollutes every mounted page | `DropZone.tsx:66` | ✅ Fixed |
 | TST-01 | 🟠 Med | tests | Redaction (data-destruction) has zero test coverage | `pdf_ops.py:1517` | ✅ Fixed |
@@ -414,21 +414,31 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   (one block raises → document still saves, other block translated, number
   preserved).
 
-#### BRG-01 — Worker cleanup keyed by `tool_key` breaks cancel after restart
-- **Location:** `ui/bridge.py:322-331`.
-- **What:** `_on_finished` cleans up via `self._workers.pop(tool_key)` /
+#### BRG-01 — Worker cleanup keyed by `tool_key` breaks cancel after restart ✅ Fixed
+- **Location:** `ui/bridge.py:327-345` (`_run_in_thread`'s `_on_finished`).
+- **What:** `_on_finished` cleaned up via `self._workers.pop(tool_key)` /
   `self._cancel_events.pop(tool_key)` — by string, not by the captured `worker`
   identity. `_make_cancel_event` is explicitly designed to overlap same-key runs
   (signals the old event, installs a new one). After a cancel-then-rerun of the
-  same tool, the *old* worker's finished handler runs after the *new* worker
-  registered, so it pops the **new** worker/event out of the tracking dicts.
-- **Impact:** `cancelOperation(tool_key)` then finds no event and silently
-  no-ops — the in-flight second run becomes permanently uncancellable. The
+  same tool, the *old* worker's finished handler ran after the *new* worker
+  registered, so it popped the **new** worker/event out of the tracking dicts.
+- **Impact:** `cancelOperation(tool_key)` then found no event and silently
+  no-oped — the in-flight second run became permanently uncancellable. The
   frontend may also receive two `operationDone` payloads for one `tool_key`. UI
   logic race, not a crash (parent keeps the worker alive).
-- **Fix:** Guard the pops on identity: only pop if the tracked object **is** this
-  worker / this run's event.
-- **Verification:** CONFIRMED.
+- **Fix (applied):** Captured this run's cancel event (`my_evt`) at dispatch and
+  guarded both pops on identity — `_on_finished` removes a tracking-dict entry
+  only when `self._workers.get(tool_key) is worker` / `self._cancel_events.get(
+  tool_key) is my_evt`, so a stale old-worker finish leaves the newer run's
+  worker/event intact and cancellable. `_make_cancel_event`'s overlap design and
+  `cancelOperation` are unchanged. The double-`operationDone` on overlap is
+  inherent and left as-is (the critical fix is not evicting the new run's cancel
+  event).
+- **Verification:** CONFIRMED by inspection; not unit-tested because
+  `_run_in_thread` is bound to the Bridge QObject + `_Worker` QThread and
+  importing `ui/` pulls the full PySide6 stack (CLAUDE.md keeps the test suite
+  Qt-free). Real-app check: cancel a long op, immediately rerun the same tool,
+  confirm the rerun is still cancellable.
 
 #### CLI-01 — CLI always exits 0 even when files fail
 - **Location:** `compress_pdf.py:214` (`main` fall-through).
