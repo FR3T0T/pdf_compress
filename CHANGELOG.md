@@ -42,6 +42,15 @@
   to Fixed.
 
 ### Fixes
+- **Translation from non-Latin/Cyrillic scripts no longer returns the source text
+  unchanged (TRN-03).** `translate_line` gated on `_LETTER_RE =
+  re.compile(r'[A-Za-zÀ-ɏЀ-ӿ]')` (Latin + Cyrillic only), so any fragment with no
+  Latin/Cyrillic letter was treated as skippable punctuation and passed through
+  verbatim — silently returning the original for Chinese, Arabic, Hindi, and
+  Bengali (4 of 12 advertised source languages) while reporting success. The gate
+  is now the Unicode-aware `if not any(ch.isalpha() for ch in residual)`, so real
+  words in every script are translated while pure digits/punctuation/separators
+  stay skipped. Added `tests/test_pdf_translate.py`. Flips TRN-03 to Fixed.
 - **Invisible-text (fake-redaction) detector rebuilt (ANL-03).** The render-mode-3
   scan had a dead `rawdict` span loop and only inspected the *first* content
   stream with a naïve `b" 3 Tr"` substring test — missing `3 Tr` in later streams

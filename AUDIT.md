@@ -131,7 +131,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 |----|-----|------|-------|----------|--------|
 | ENG-01 | 🔴 High | engine | Only JPEG images are recompressed; non-JPEG silently skipped | `engine.py:909` | Open |
 | ENG-02 | 🔴 High | engine | `/SMask` deleted even when compositing failed → transparency lost | `engine.py:1052` | Open |
-| TRN-03 | 🔴 High | translate | Source text in non-Latin/Cyrillic scripts returned untranslated | `pdf_translate.py:308` | Open |
+| TRN-03 | 🔴 High | translate | Source text in non-Latin/Cyrillic scripts returned untranslated | `pdf_translate.py:305` | ✅ Fixed |
 | ANL-02 | 🔴 High | analyze | Sanitiser leaves JS/Launch/Submit in `/Next` action chains | `pdf_analyze.py:778` | ✅ Fixed |
 | ENG-03 | 🟠 Med | engine | `q Q` regex can corrupt text / inline images in uncompressed streams | `engine.py:1684` | Open |
 | ENG-04 | 🟠 Med | engine | Ghostscript pipes never drained → deadlock until 5-min timeout | `engine.py:1318` | Open |
@@ -222,23 +222,27 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   (`mask_img is not None`).
 - **Verification:** CONFIRMED.
 
-### TRN-03 — Non-Latin/Cyrillic source text returned untranslated 🔴
-- **Location:** `pdf_translate.py:289` (`_LETTER_RE`), applied at `:308` in
-  `translate_line`.
-- **What:** `_LETTER_RE = re.compile(r'[A-Za-zÀ-ɏЀ-ӿ]')` matches **only** Latin
+### TRN-03 — Non-Latin/Cyrillic source text returned untranslated 🔴 ✅ Fixed
+- **Location:** `pdf_translate.py:309` (the letter gate in `translate_line`).
+- **What:** `_LETTER_RE = re.compile(r'[A-Za-zÀ-ɏЀ-ӿ]')` matched **only** Latin
   (incl. Latin-1/Extended-A) and Cyrillic. In `translate_line`, any text part
-  whose residual contains no match is appended **verbatim** and skipped
+  whose residual contained no match was appended **verbatim** and skipped
   (`if not _LETTER_RE.search(residual): out.append(part); continue`).
 - **Impact:** When translating **from** Chinese, Arabic, Hindi, or Bengali — 4 of
   the 12 advertised source languages, none of which use Latin/Cyrillic — the gate
-  never matches, so every line is returned unchanged. The operation reports
-  success while producing the original text. (Greek, Hebrew, Thai, etc. would be
+  never matched, so every line was returned unchanged. The operation reported
+  success while producing the original text. (Greek, Hebrew, Thai, etc. were
   affected identically.)
-- **Fix:** Broaden `_LETTER_RE` to cover the supported scripts (CJK, Arabic,
-  Devanagari, Bengali, …), or invert the logic to skip only parts that are purely
-  separators/digits/punctuation rather than gating on a narrow "letter" class.
-- **Verification:** CONFIRMED (manually — this finding's automated verifier died
-  on a session limit; re-checked by hand against the source).
+- **Fix (applied):** Inverted the gate to a Unicode-aware test rather than an
+  enumerated letter table — `if not any(ch.isalpha() for ch in residual)`. A
+  fragment is skipped only when it holds no letter in *any* script (pure
+  digits/punctuation/whitespace/separators, still skipped as before); real words
+  in every script now reach the translator. `_LETTER_RE` (its only use) was
+  removed; `_protect`/`_restore`, `_SEP_RE` splitting, and residual stripping are
+  unchanged. Tests: `tests/test_pdf_translate.py::TestTranslateLineScriptGate`.
+- **Verification:** CONFIRMED; now covered by tests (CJK/Arabic/Hindi/Bengali/
+  mixed reach the translator; Latin still does; pure punctuation/numbers stay
+  skipped).
 
 ### ANL-02 — Sanitiser leaves JavaScript in `/Next` action chains 🔴 ✅ Fixed
 - **Location:** `pdf_analyze.py:778` (sanitiser annotation loop, `:775-796`);
