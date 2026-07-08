@@ -2,6 +2,15 @@
 ## Unreleased
 
 ### Security
+- **Redaction of scanned (image-only) PDFs now works instead of blanking the page
+  (RED-01).** `redact_pdf` applied redactions with `PDF_REDACT_IMAGE_REMOVE`,
+  which deletes any image a redaction rect touches. On a scanned page — whose
+  whole content is one full-page image — a small box therefore removed the entire
+  image and blanked the page, while still reporting `redaction_count` success
+  (the sensitive content silently discarded rather than precisely masked). It now
+  uses `PDF_REDACT_IMAGE_PIXELS`, which blacks out only the pixels under each
+  rect and preserves the rest of the scan. Added an image-only regression test to
+  `tests/test_pdf_ops.py::TestRedactPdf`.
 - **Redact no longer advances the workspace with a round-tripped path (FE-03).**
   `RedactPage`'s op-done handler fed `workspace.applyResult` the `output_path`
   read back out of the backend result. It now advances the workspace with the

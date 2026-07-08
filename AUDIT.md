@@ -145,7 +145,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | FE-01 | 🟠 Med | frontend | Drag-drop not scoped to active page → pollutes every mounted page | `DropZone.tsx:66` | ✅ Fixed |
 | TST-01 | 🟠 Med | tests | Redaction (data-destruction) has zero test coverage | `pdf_ops.py:1517` | ✅ Fixed |
 | TST-02 | 🟠 Med | tests | Path-containment guard `contained_output_path()` untested | `pdf_ops.py:22` | ✅ Fixed |
-| RED-01 | 🟠 Med | pdf_ops | Redaction destroys entire page on image-only (scanned) PDFs | `pdf_ops.py:1624` | Open |
+| RED-01 | 🟠 Med | pdf_ops | Redaction destroys entire page on image-only (scanned) PDFs | `pdf_ops.py:1649` | ✅ Fixed |
 | ENG-05 | 🟡 Low | engine | Size-benefit check compares uncompressed candidate vs compressed original | `engine.py:979` | Open |
 | ENG-06 | 🟡 Low | engine | Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px` | `engine.py:721` | Open |
 | OPS-01 | 🟡 Low | pdf_ops | `protect_pdf` sets owner password = user password → restrictions bypassable | `pdf_ops.py:430` | Open |
@@ -509,13 +509,13 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   running OS) raises `ValueError`. All pass.
 - **Verification:** CONFIRMED; now covered by automated tests.
 
-#### RED-01 — Redaction destroys entire page on image-only (scanned) PDFs
-- **Location:** `pdf_ops.py:1624` (`apply_redactions(images=PDF_REDACT_IMAGE_REMOVE)`).
-- **What:** On a page whose content is a single full-page image (scanned docs — `get_text()` empty, `get_images()` == 1), any redaction rect overlapping the image causes `PDF_REDACT_IMAGE_REMOVE` to remove the entire image, not just the region under the rect. The whole page is that image, so the result is blank.
-- **Impact:** Redacting a box on a scanned PDF wipes the page while reporting `redaction_count` success. Scanned docs are a primary redaction use case, so this is a high-value silent failure.
-- **Repro:** Direct `redact_pdf` call on `tests/test1.pdf` (images:1, text:0) with a small rect returns `redaction_count=1` but a blank output page. Discovered during FE-03 real-app smoke testing.
-- **Fix:** Use `PDF_REDACT_IMAGE_PIXELS` (masks only pixels under the rect) or rasterize-and-mask the boxed region; keep `_REMOVE` only when the rect covers the whole image. Add an image-only fixture to TST-01 (its text-only fixtures miss this).
-- **Status:** Open (tracked as a GitHub issue; new finding, not in original audit).
+#### RED-01 — Redaction destroys entire page on image-only (scanned) PDFs ✅ Fixed
+- **Location:** `pdf_ops.py:1649` (`apply_redactions(images=…)` in `redact_pdf`).
+- **What:** On a page whose content is a single full-page image (scanned docs — `get_text()` empty, `get_images()` == 1), any redaction rect overlapping the image caused `PDF_REDACT_IMAGE_REMOVE` to remove the entire image, not just the region under the rect. The whole page is that image, so the result was blank.
+- **Impact:** Redacting a box on a scanned PDF wiped the page while reporting `redaction_count` success. Scanned docs are a primary redaction use case, so this was a high-value silent failure.
+- **Repro:** Direct `redact_pdf` call on `tests/test1.pdf` (images:1, text:0) with a small rect returned `redaction_count=1` but a blank output page. Discovered during FE-03 real-app smoke testing.
+- **Fix (applied):** Changed the mode to `fitz.PDF_REDACT_IMAGE_PIXELS`, which blacks out only the pixels under each redaction rect and leaves the rest of the image intact (no whole-image-remove branching needed; `_PIXELS` universally). PyMuPDF pin `>=1.23.0` supports it. Text-redaction, AcroForm widget neutralisation, and everything else unchanged. Regression test: `tests/test_pdf_ops.py::TestRedactPdf::test_image_only_page_only_boxed_region_redacted` (builds a full-page image, redacts a small rect, asserts the boxed pixels are black while pixels outside stay intact and the image isn't removed).
+- **Status:** Fixed.
 
 ### 🟡 Low
 

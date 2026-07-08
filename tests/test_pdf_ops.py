@@ -1,9 +1,11 @@
 """Tests for pdf_ops.py — merge, split, page operations, and more."""
 
+import io
 import os
 
 import pikepdf
 import pytest
+from PIL import Image
 
 from pdf_ops import (
     MergeResult,
@@ -427,6 +429,19 @@ def _form_pdf(path, field_value: str, *, rect=(72, 72, 400, 120)) -> str:
     return str(path)
 
 
+def _image_only_pdf(path, *, size=300, color=(255, 0, 0)) -> str:
+    """A one-page PDF whose whole content is a single full-page solid-color
+    image — a scanned-document stand-in (no text, one image)."""
+    doc = fitz.open()
+    page = doc.new_page(width=size, height=size)
+    buf = io.BytesIO()
+    Image.new("RGB", (size, size), color).save(buf, format="PNG")
+    page.insert_image(page.rect, stream=buf.getvalue())
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
 def _get_text(path) -> str:
     doc = fitz.open(path)
     text = "".join(page.get_text() for page in doc)
@@ -523,3 +538,28 @@ class TestRedactPdf:
                    rects=[{"page": 0, "x0": 60, "y0": 60, "x1": 420, "y1": 130}])
         assert "SECRET_FIELD_VALUE" not in _get_text(out)       # not extractable
         assert "SECRET_FIELD_VALUE" not in "".join(_acroform_values(out))  # /V gone
+
+    @pytest.mark.integration
+    def test_image_only_page_only_boxed_region_redacted(self, tmp_path):
+        # RED-01: on a scanned page (one full-page image), a small redaction
+        # rect must black out ONLY the boxed region — not delete the whole
+        # image and blank the page (the PDF_REDACT_IMAGE_REMOVE bug).
+        src = _image_only_pdf(tmp_path / "scan.pdf", size=300, color=(255, 0, 0))
+        out = str(tmp_path / "scan_out.pdf")
+
+        result = redact_pdf(src, out, rects=[{"page": 0, "x0": 50, "y0": 50,
+                                              "x1": 100, "y1": 100}])
+        assert result.redaction_count == 1
+
+        with fitz.open(out) as doc:
+            page = doc[0]
+            assert len(page.get_images(full=True)) >= 1   # image NOT removed
+            pix = page.get_pixmap()                        # 300×300 @ 72 DPI (1pt=1px)
+            inside = pix.pixel(75, 75)                     # under the redaction rect
+            outside = pix.pixel(250, 250)                  # well outside it
+
+        # Boxed region blacked out…
+        assert max(inside) < 60, f"inside rect not redacted: {inside}"
+        # …and the rest of the scan is intact (still red), not blanked.
+        assert outside[0] > 200 and outside[1] < 60 and outside[2] < 60, \
+            f"outside rect not preserved: {outside}"
