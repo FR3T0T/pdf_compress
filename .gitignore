@@ -43,7 +43,6 @@ htmlcov/
 *.backup.old
 
 # Claude Code
-.claude/
 
 # Ad-hoc test artifacts (generated files, not fixtures)
 tests/*.pdf
@@ -54,3 +53,5 @@ tests/*_translated.docx
 # React build bundle (committed so it runs without Node)
 !web-react/dist/
 !web-react/dist/**
+
+.claude/
