@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
@@ -9,6 +9,8 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
+import { workspaceOutputPath } from '../../workspace/workspaceOutputPath';
 import type { PickedFile } from '../../types/bridge';
 
 interface PageOpsResult {
@@ -37,34 +39,45 @@ export function PageOpsPage() {
   const [deletePages, setDeletePages] = useState('');
   const op = useOperation<PageOpsResult>('page_ops');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // See WatermarkPage.tsx for the reference pattern this mirrors.
+  const workspace = useWorkspace();
+  const workspaceRunRef = useRef(false);
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useEffect(() => {
     if (op.status === 'done') {
+      if (workspaceRunRef.current) {
+        workspaceRunRef.current = false;
+        const outPath = op.result?.results?.output_path;
+        if (outPath) {
+          workspace.applyResult(outPath, `Page ops (${tab})`);
+          toast.success('Applied page operations to the working document.');
+        } else {
+          toast.error('Page operation failed — working document unchanged.');
+        }
+        return;
+      }
       toast.success('Page operations applied successfully!');
     } else if (op.status === 'error') {
+      workspaceRunRef.current = false;
       toast.error(op.error || 'Page operation failed.');
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [op.status, op.error, toast]);
 
   const file = files[0] ?? null;
-  const canRun = !!file && !!outputPath && op.status !== 'running';
+  const canRun = (workspace.path ? true : !!file && !!outputPath) && op.status !== 'running';
 
   const pickOutput = async () => {
     const path = await bridgeApi.saveFile('PDF Files (*.pdf)', 'output.pdf');
     if (path) setOutputPath(path);
   };
 
-  const run = () => {
-    if (!file) {
-      toast.warning('Please add a PDF file first.');
-      return;
-    }
-    if (!outputPath) {
-      toast.warning('Please choose an output file path.');
-      return;
-    }
-    const params: Record<string, unknown> = { file: file.path, output_path: outputPath };
+  const buildOpParams = (inputPath: string, outPath: string): Record<string, unknown> => {
+    const params: Record<string, unknown> = { file: inputPath, output_path: outPath };
     if (tab === 'rotate') {
       params.rotations = [{ pages: rotateRange.trim() || 'all', angle: parseInt(rotateAngle, 10) }];
     } else if (tab === 'reorder') {
@@ -77,23 +90,56 @@ export function PageOpsPage() {
     } else if (tab === 'delete') {
       params.delete_pages = deletePages.trim();
     }
-    op.run(() => bridgeApi.startPageOps(params));
+    return params;
   };
 
-  const r = op.status === 'done' ? op.result?.results : null;
+  const run = () => {
+    if (workspace.path) {
+      const wsPath = workspace.path;
+      const opIndex = workspace.ops.length + 1;
+      workspaceRunRef.current = true;
+      op.run(async () => {
+        const wsDir = await bridgeApi.getWorkspaceDir();
+        const outPath = workspaceOutputPath(wsDir, wsPath, opIndex);
+        bridgeApi.startPageOps(buildOpParams(wsPath, outPath));
+      });
+      return;
+    }
+
+    if (!file) {
+      toast.warning('Please add a PDF file first.');
+      return;
+    }
+    if (!outputPath) {
+      toast.warning('Please choose an output file path.');
+      return;
+    }
+    op.run(() => bridgeApi.startPageOps(buildOpParams(file.path, outputPath)));
+  };
+
+  const r = op.status === 'done' && !workspace.path ? op.result?.results : null;
 
   return (
     <div className="console">
       <PageHeader title="Page Operations" subtitle="Rotate, reorder, or delete pages in a PDF" backButton={false} />
 
-      <DropZone
-        files={files}
-        onFilesChanged={setFiles}
-        multiple={false}
-        title="Drop a PDF file here"
-        subtitle="or click to browse"
-        disabled={op.status === 'running'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — see the bar above to
+            Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <DropZone
+          files={files}
+          onFilesChanged={setFiles}
+          multiple={false}
+          title="Drop a PDF file here"
+          subtitle="or click to browse"
+          disabled={op.status === 'running'}
+        />
+      )}
 
       <div style={{ marginTop: 'var(--space-3)' }}>
         <Card>
@@ -154,18 +200,20 @@ export function PageOpsPage() {
         </Card>
       </div>
 
-      <div style={{ marginTop: 'var(--space-3)' }}>
-        <Card>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
-            <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
-              {outputPath ? bridgeApi.basename(outputPath) : 'Choose output file path…'}
-            </span>
-            <button onClick={pickOutput} disabled={op.status === 'running'} className="btn-ghost">
-              Browse
-            </button>
-          </div>
-        </Card>
-      </div>
+      {!workspace.path && (
+        <div style={{ marginTop: 'var(--space-3)' }}>
+          <Card>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
+              <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+                {outputPath ? bridgeApi.basename(outputPath) : 'Choose output file path…'}
+              </span>
+              <button onClick={pickOutput} disabled={op.status === 'running'} className="btn-ghost">
+                Browse
+              </button>
+            </div>
+          </Card>
+        </div>
+      )}
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 'var(--space-4)' }}>
         <button onClick={run} disabled={!canRun} className="btn-primary">

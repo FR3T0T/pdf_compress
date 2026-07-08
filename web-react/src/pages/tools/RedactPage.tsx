@@ -10,6 +10,8 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
+import { workspaceOutputPath } from '../../workspace/workspaceOutputPath';
 import type { PickedFile } from '../../types/bridge';
 
 interface RedactResult {
@@ -134,21 +136,30 @@ export function RedactPage() {
   const [confirming, setConfirming] = useState(false);
   const op = useOperation<RedactResult>('redact');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // See WatermarkPage.tsx for the reference pattern this mirrors. Redact's
+  // box-drawing mode renders whatever `effectivePath` points at, so it
+  // works against the workspace document exactly like search-terms mode.
+  const workspace = useWorkspace();
+  const workspaceRunRef = useRef(false);
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   const file = files[0] ?? null;
+  const effectivePath = workspace.path ?? file?.path ?? null;
 
   useEffect(() => {
-    if (!file) {
+    if (!effectivePath) {
       setPageImages([]);
       setBoxes([]);
       setPagesForPath(null);
       return;
     }
-    if (mode !== 'boxes' || pagesForPath === file.path) return;
+    if (mode !== 'boxes' || pagesForPath === effectivePath) return;
 
     setPagesLoading(true);
-    bridgeApi.getPageImages(file.path).then((res) => {
+    bridgeApi.getPageImages(effectivePath).then((res) => {
       setPagesLoading(false);
       if (!res.success || !res.pages) {
         toast.error(res.error || 'Could not render pages for box drawing.');
@@ -156,18 +167,26 @@ export function RedactPage() {
       }
       setPageImages(res.pages);
       setPageDpi(res.dpi ?? 150);
-      setPagesForPath(file.path);
+      setPagesForPath(effectivePath);
       setBoxes([]);
     });
-  }, [mode, file, pagesForPath, toast]);
+  }, [mode, effectivePath, pagesForPath, toast]);
 
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
-      const { redaction_count, pages_affected } = op.result.results;
+      const { output_path, redaction_count, pages_affected } = op.result.results;
+      if (workspaceRunRef.current) {
+        workspaceRunRef.current = false;
+        workspace.applyResult(output_path, `Redact (${mode})`);
+        toast.success(`Redaction complete: ${redaction_count} matches redacted across ${pages_affected} page(s).`);
+        return;
+      }
       toast.success(`Redaction complete: ${redaction_count} matches redacted across ${pages_affected} page(s).`);
     } else if (op.status === 'error') {
+      workspaceRunRef.current = false;
       toast.error(op.error || 'An error occurred during redaction.');
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [op.status, op.result, op.error, toast]);
 
   const searchTerms = terms
@@ -177,8 +196,8 @@ export function RedactPage() {
   const pagesWithBoxes = new Set(boxes.map((b) => b.page)).size;
 
   const canRun =
-    !!file &&
-    !!outputPath &&
+    !!effectivePath &&
+    (workspace.path ? true : !!outputPath) &&
     op.status !== 'running' &&
     (mode === 'terms' ? searchTerms.length > 0 : boxes.length > 0);
 
@@ -189,7 +208,7 @@ export function RedactPage() {
   };
 
   const requestRedact = () => {
-    if (!file) {
+    if (!effectivePath) {
       toast.warning('Please add a PDF file.');
       return;
     }
@@ -201,7 +220,7 @@ export function RedactPage() {
       toast.warning('Please draw at least one box.');
       return;
     }
-    if (!outputPath) {
+    if (!workspace.path && !outputPath) {
       toast.warning('Please choose an output location.');
       return;
     }
@@ -210,18 +229,36 @@ export function RedactPage() {
 
   const confirmRedact = () => {
     setConfirming(false);
-    if (!file || !outputPath) return;
+    if (!effectivePath) return;
+
+    if (workspace.path) {
+      const wsPath = workspace.path;
+      const opIndex = workspace.ops.length + 1;
+      workspaceRunRef.current = true;
+      op.run(async () => {
+        const wsDir = await bridgeApi.getWorkspaceDir();
+        const outPath = workspaceOutputPath(wsDir, wsPath, opIndex);
+        bridgeApi.startRedact(
+          mode === 'terms'
+            ? { file: wsPath, output_path: outPath, search_terms: searchTerms, case_sensitive: caseSensitive }
+            : { file: wsPath, output_path: outPath, rects: boxesToRects(boxes) }
+        );
+      });
+      return;
+    }
+
+    if (!outputPath) return;
     op.run(() =>
       bridgeApi.startRedact(
         mode === 'terms'
           ? {
-              file: file.path,
+              file: effectivePath,
               output_path: outputPath,
               search_terms: searchTerms,
               case_sensitive: caseSensitive,
             }
           : {
-              file: file.path,
+              file: effectivePath,
               output_path: outputPath,
               rects: boxesToRects(boxes),
             }
@@ -235,7 +272,7 @@ export function RedactPage() {
   const removeBox = (id: string) => setBoxes((prev) => prev.filter((b) => b.id !== id));
   const clearPageBoxes = (page: number) => setBoxes((prev) => prev.filter((b) => b.page !== page));
 
-  const r = op.status === 'done' ? op.result?.results : null;
+  const r = op.status === 'done' && !workspace.path ? op.result?.results : null;
   const results = r
     ? {
         files: [{ name: bridgeApi.basename(r.output_path), status: 'done' as const }],
@@ -265,14 +302,23 @@ export function RedactPage() {
         </span>
       </div>
 
-      <DropZone
-        files={files}
-        onFilesChanged={setFiles}
-        multiple={false}
-        title="Drop PDF file here"
-        subtitle="or click to browse"
-        disabled={op.status === 'running'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — see the bar above to
+            Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <DropZone
+          files={files}
+          onFilesChanged={setFiles}
+          multiple={false}
+          title="Drop PDF file here"
+          subtitle="or click to browse"
+          disabled={op.status === 'running'}
+        />
+      )}
 
       <div style={{ display: 'flex', gap: 8, marginTop: 'var(--space-3)' }}>
         <ModeButton active={mode === 'terms'} onClick={() => setMode('terms')} disabled={op.status === 'running'}>
@@ -326,14 +372,14 @@ export function RedactPage() {
           </Card>
 
           <div style={{ marginTop: 'var(--space-3)', maxHeight: 640, overflowY: 'auto' }}>
-            {!file && (
+            {!effectivePath && (
               <Card>
                 <span style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-sm)' }}>
                   Add a PDF file above to render its pages here.
                 </span>
               </Card>
             )}
-            {file && pagesLoading && (
+            {effectivePath && pagesLoading && (
               <Card>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-2)' }}>
                   <span className="spinner" /> Rendering pages…
@@ -356,18 +402,20 @@ export function RedactPage() {
         </div>
       )}
 
-      <div style={{ marginTop: 'var(--space-3)' }}>
-        <Card>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
-            <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
-              {outputPath ? bridgeApi.basename(outputPath) : 'No output file selected'}
-            </span>
-            <button onClick={pickOutput} disabled={op.status === 'running'} className="btn-ghost">
-              Browse…
-            </button>
-          </div>
-        </Card>
-      </div>
+      {!workspace.path && (
+        <div style={{ marginTop: 'var(--space-3)' }}>
+          <Card>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
+              <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+                {outputPath ? bridgeApi.basename(outputPath) : 'No output file selected'}
+              </span>
+              <button onClick={pickOutput} disabled={op.status === 'running'} className="btn-ghost">
+                Browse…
+              </button>
+            </div>
+          </Card>
+        </div>
+      )}
 
       {confirming ? (
         <div style={{ marginTop: 'var(--space-4)' }}>

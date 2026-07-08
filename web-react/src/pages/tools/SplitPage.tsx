@@ -11,6 +11,7 @@ import { useHotkeys } from '../../bridge/useHotkeys';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import type { PickedFile } from '../../types/bridge';
 
 interface TocEntry {
@@ -51,7 +52,14 @@ export function SplitPage() {
   const op = useOperation<SplitResult>('split');
   const dropRef = useRef<DropZoneHandle>(null);
 
+  // -- Workspace (persistent working document) -----------------------------
+  // Terminal tool: when a workspace document is loaded, Split reads it as
+  // input but its output is a normal side download — the workspace pointer
+  // is never advanced (see the Step B spec's terminal-tool list).
+  const workspace = useWorkspace();
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useEffect(() => {
     (async () => {
@@ -76,28 +84,29 @@ export function SplitPage() {
   }, [op.status, op.result, op.error, toast]);
 
   const file = files[0] ?? null;
+  const effectivePath = workspace.path ?? file?.path ?? null;
 
   useEffect(() => {
     setTocFetched(false);
     setToc([]);
     setSelectedChapters(new Set());
-    if (!file) {
+    if (!effectivePath) {
       setFileInfo(null);
       return;
     }
-    bridgeApi.analyzeFile(file.path).then((info) => {
+    bridgeApi.analyzeFile(effectivePath).then((info) => {
       const size = (info.size ?? info.file_size) as number | undefined;
       const pages = (info.pages ?? info.page_count) as number | undefined;
       setFileInfo({ size: size != null ? bridgeApi.formatSize(size) : undefined, pages });
     });
     bridgeApi
-      .getToc(file.path)
+      .getToc(effectivePath)
       .then((entries) => {
         setToc(entries as TocEntry[]);
         setSelectedChapters(new Set((entries as TocEntry[]).map((_, i) => i)));
       })
       .finally(() => setTocFetched(true));
-  }, [file]);
+  }, [effectivePath]);
 
   const saveSettings = (dir: string, tmpl: string, m: Mode, n: string) => {
     bridgeApi.saveSetting('split/outputDir', dir);
@@ -123,7 +132,7 @@ export function SplitPage() {
     });
   };
 
-  const canRun = !!file && op.status !== 'running';
+  const canRun = !!effectivePath && op.status !== 'running';
 
   useHotkeys({
     onAddFiles: () => dropRef.current?.open(),
@@ -132,13 +141,13 @@ export function SplitPage() {
   });
 
   const run = () => {
-    if (!file) {
+    if (!effectivePath) {
       toast.warning('Please add a PDF file first.');
       return;
     }
-    const dir = outputDir || bridgeApi.dirname(file.path);
+    const dir = outputDir || bridgeApi.dirname(effectivePath);
     const params: Record<string, unknown> = {
-      file: file.path,
+      file: effectivePath,
       output_dir: dir,
       mode,
       name_template: nameTemplate || '{filename}_page_{n}',
@@ -177,17 +186,26 @@ export function SplitPage() {
     <div className="console">
       <PageHeader title="Split PDF" subtitle="Split a PDF into individual pages, page ranges, or chapters" backButton={false} />
 
-      <DropZone
-        ref={dropRef}
-        files={files}
-        onFilesChanged={setFiles}
-        multiple={false}
-        title="Drop a PDF file here"
-        subtitle="or click to browse"
-        disabled={op.status === 'running'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — this reads from it without
+            changing it; see the bar above to Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <DropZone
+          ref={dropRef}
+          files={files}
+          onFilesChanged={setFiles}
+          multiple={false}
+          title="Drop a PDF file here"
+          subtitle="or click to browse"
+          disabled={op.status === 'running'}
+        />
+      )}
 
-      {file && (
+      {!workspace.path && file && (
         <div style={{ marginTop: 'var(--space-3)' }}>
           <Card>
             <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-4)' }}>

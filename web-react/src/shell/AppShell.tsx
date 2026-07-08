@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Sidebar } from './Sidebar';
 import { useRouter, PageActiveContext } from '../router/Router';
 import type { RouteDef } from '../router/Router';
+import { WorkspaceBar } from '../workspace/WorkspaceBar';
 
 /**
  * Top-level layout: sidebar + main content area, matching web/index.html's
@@ -35,19 +36,25 @@ export function AppShell({ routes }: { routes: Record<string, RouteDef> }) {
   return (
     <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
       <Sidebar />
-      <main style={{ flex: '1 1 auto', overflowY: 'auto' }}>
-        {mounted.map((key) => {
-          const Route = routes[key]?.component;
-          if (!Route) return null;
-          const active = key === currentRoute;
-          return (
-            <div key={key} style={{ display: active ? 'block' : 'none' }} aria-hidden={!active}>
-              <PageActiveContext.Provider value={active}>
-                <Route />
-              </PageActiveContext.Provider>
-            </div>
-          );
-        })}
+      <main style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        {/* Global, persistent across every tool page -- driven by
+            WorkspaceContext (wraps RouterProvider in App.tsx), not by
+            AppShell's per-route keep-alive below. */}
+        <WorkspaceBar />
+        <div style={{ flex: '1 1 auto', overflowY: 'auto' }}>
+          {mounted.map((key) => {
+            const Route = routes[key]?.component;
+            if (!Route) return null;
+            const active = key === currentRoute;
+            return (
+              <div key={key} style={{ display: active ? 'block' : 'none' }} aria-hidden={!active}>
+                <PageActiveContext.Provider value={active}>
+                  <Route />
+                </PageActiveContext.Provider>
+              </div>
+            );
+          })}
+        </div>
       </main>
     </div>
   );

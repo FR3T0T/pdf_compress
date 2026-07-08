@@ -8,6 +8,7 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import type { PickedFile } from '../../types/bridge';
 
 interface ExtractTextResult {
@@ -33,7 +34,14 @@ export function ExtractTextPage() {
   const [pageRange, setPageRange] = useState('');
   const op = useOperation<ExtractTextResult>('extract_text');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // Terminal tool: reads the workspace document as input when loaded, but
+  // its output is a normal side download — the workspace pointer is never
+  // advanced (see the Step B spec's terminal-tool list).
+  const workspace = useWorkspace();
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
@@ -45,7 +53,8 @@ export function ExtractTextPage() {
   }, [op.status, op.result, op.error, toast]);
 
   const file = files[0] ?? null;
-  const canRun = !!file && !!outputPath && op.status !== 'running';
+  const effectivePath = workspace.path ?? file?.path ?? null;
+  const canRun = !!effectivePath && !!outputPath && op.status !== 'running';
 
   const pickOutput = async () => {
     const defaultName = file ? bridgeApi.basename(file.path).replace(/\.pdf$/i, '.txt') : 'extracted.txt';
@@ -54,7 +63,7 @@ export function ExtractTextPage() {
   };
 
   const run = () => {
-    if (!file) {
+    if (!effectivePath) {
       toast.warning('Please add a PDF file.');
       return;
     }
@@ -64,7 +73,7 @@ export function ExtractTextPage() {
     }
     op.run(() =>
       bridgeApi.startExtractText({
-        file: file.path,
+        file: effectivePath,
         output_path: outputPath,
         page_range: pageRange.trim() || null,
       })
@@ -77,14 +86,23 @@ export function ExtractTextPage() {
     <div className="console">
       <PageHeader title="Extract Text" subtitle="Extract text content from a PDF" backButton={false} />
 
-      <DropZone
-        files={files}
-        onFilesChanged={setFiles}
-        multiple={false}
-        title="Drop PDF file here"
-        subtitle="or click to browse"
-        disabled={op.status === 'running'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — this reads from it without
+            changing it; see the bar above to Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <DropZone
+          files={files}
+          onFilesChanged={setFiles}
+          multiple={false}
+          title="Drop PDF file here"
+          subtitle="or click to browse"
+          disabled={op.status === 'running'}
+        />
+      )}
 
       <div style={{ marginTop: 'var(--space-3)' }}>
         <Card>

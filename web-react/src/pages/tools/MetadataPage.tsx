@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
@@ -8,6 +8,8 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
+import { workspaceOutputPath } from '../../workspace/workspaceOutputPath';
 import type { PickedFile } from '../../types/bridge';
 
 const FIELDS: Array<{ key: 'title' | 'author' | 'subject' | 'keywords' | 'creator' | 'producer'; label: string }> = [
@@ -40,13 +42,21 @@ export function MetadataPage() {
   });
   const op = useOperation<{ outputPath: string }>('metadata');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // See WatermarkPage.tsx for the reference pattern this mirrors. Metadata
+  // is (re)loaded from whichever file is in play, local or workspace.
+  const workspace = useWorkspace();
+  const workspaceRunRef = useRef(false);
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   const file = files[0] ?? null;
+  const effectivePath = workspace.path ?? file?.path ?? null;
 
   useEffect(() => {
-    if (!file) return;
-    bridgeApi.getMetadata(file.path).then((meta) => {
+    if (!effectivePath) return;
+    bridgeApi.getMetadata(effectivePath).then((meta) => {
       setFields((prev) => {
         const next = { ...prev };
         for (const f of FIELDS) {
@@ -57,20 +67,34 @@ export function MetadataPage() {
       });
       toast.info('Metadata loaded from file.');
     });
-    // Deliberately keyed on `file` only — toast is stable (see Toast.tsx)
-    // so including it wouldn't change behavior, and fields/setFields
-    // shouldn't retrigger a reload of the just-loaded metadata.
-  }, [file, toast]);
+    // Deliberately keyed on `effectivePath` only — toast is stable (see
+    // Toast.tsx) so including it wouldn't change behavior, and
+    // fields/setFields shouldn't retrigger a reload of the just-loaded
+    // metadata.
+  }, [effectivePath, toast]);
 
   useEffect(() => {
     if (op.status === 'done') {
+      if (workspaceRunRef.current) {
+        workspaceRunRef.current = false;
+        const outPath = op.result?.results?.outputPath;
+        if (outPath) {
+          workspace.applyResult(outPath, 'Edit metadata');
+          toast.success('Saved metadata to the working document.');
+        } else {
+          toast.error('Metadata save failed — working document unchanged.');
+        }
+        return;
+      }
       toast.success('Metadata saved successfully.');
     } else if (op.status === 'error') {
+      workspaceRunRef.current = false;
       toast.error(op.error || 'An error occurred while saving metadata.');
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [op.status, op.error, toast]);
 
-  const canRun = !!file && !!outputPath && op.status !== 'running';
+  const canRun = !!effectivePath && (workspace.path ? true : !!outputPath) && op.status !== 'running';
 
   const pickOutput = async () => {
     const defaultName = file ? bridgeApi.basename(file.path).replace(/\.pdf$/i, '_metadata.pdf') : 'metadata.pdf';
@@ -79,6 +103,21 @@ export function MetadataPage() {
   };
 
   const run = () => {
+    if (workspace.path) {
+      const wsPath = workspace.path;
+      const opIndex = workspace.ops.length + 1;
+      workspaceRunRef.current = true;
+      op.run(async () => {
+        const wsDir = await bridgeApi.getWorkspaceDir();
+        bridgeApi.startWriteMetadata({
+          inputPath: wsPath,
+          outputPath: workspaceOutputPath(wsDir, wsPath, opIndex),
+          fields,
+        });
+      });
+      return;
+    }
+
     if (!file) {
       toast.warning('Please add a PDF file.');
       return;
@@ -90,22 +129,31 @@ export function MetadataPage() {
     op.run(() => bridgeApi.startWriteMetadata({ inputPath: file.path, outputPath, fields }));
   };
 
-  const r = op.status === 'done' ? op.result?.results : null;
+  const r = op.status === 'done' && !workspace.path ? op.result?.results : null;
 
   return (
     <div className="console">
       <PageHeader title="Metadata" subtitle="View and edit PDF metadata" backButton={false} />
 
-      <DropZone
-        files={files}
-        onFilesChanged={setFiles}
-        multiple={false}
-        title="Drop PDF file here"
-        subtitle="or click to browse"
-        disabled={op.status === 'running'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — see the bar above to
+            Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <DropZone
+          files={files}
+          onFilesChanged={setFiles}
+          multiple={false}
+          title="Drop PDF file here"
+          subtitle="or click to browse"
+          disabled={op.status === 'running'}
+        />
+      )}
 
-      {file && (
+      {effectivePath && (
         <div style={{ marginTop: 'var(--space-3)' }}>
           <Card>
             <div style={{ fontWeight: 700, fontSize: 'var(--font-size-md)', marginBottom: 'var(--space-4)' }}>
@@ -127,18 +175,20 @@ export function MetadataPage() {
         </div>
       )}
 
-      <div style={{ marginTop: 'var(--space-3)' }}>
-        <Card>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
-            <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
-              {outputPath ? bridgeApi.basename(outputPath) : 'No output file selected'}
-            </span>
-            <button onClick={pickOutput} disabled={op.status === 'running'} className="btn-ghost">
-              Browse…
-            </button>
-          </div>
-        </Card>
-      </div>
+      {!workspace.path && (
+        <div style={{ marginTop: 'var(--space-3)' }}>
+          <Card>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
+              <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+                {outputPath ? bridgeApi.basename(outputPath) : 'No output file selected'}
+              </span>
+              <button onClick={pickOutput} disabled={op.status === 'running'} className="btn-ghost">
+                Browse…
+              </button>
+            </div>
+          </Card>
+        </div>
+      )}
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 'var(--space-4)' }}>
         <button onClick={run} disabled={!canRun} className="btn-primary">

@@ -12,6 +12,7 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import type { PickedFile } from '../../types/bridge';
 
 interface MergeResult {
@@ -43,7 +44,21 @@ export function MergePage() {
   const analyzedPaths = useRef<Set<string>>(new Set());
   const dropRef = useRef<DropZoneHandle>(null);
 
+  // -- Workspace (persistent working document) -----------------------------
+  // Multi-input tool: the workspace document (if any) can be added as ONE
+  // of the files to merge, alongside the normal multi-file flow — it's
+  // never required and the workspace pointer is never advanced (merge's
+  // output is a brand-new file, not a transform of a single document).
+  const workspace = useWorkspace();
+  const workspaceIncluded = !!workspace.path && files.some((f) => f.path === workspace.path);
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && workspaceIncluded);
+
+  const addWorkspaceFile = () => {
+    if (!workspace.path || workspaceIncluded) return;
+    setFiles((fs) => [...fs, { path: workspace.path!, name: workspace.originalName || bridgeApi.basename(workspace.path!) }]);
+  };
 
   useEffect(() => {
     bridgeApi.loadSetting('merge/outputDir').then((v) => v && setOutputDir(v));
@@ -149,6 +164,14 @@ export function MergePage() {
         subtitle="or click to browse — add as many as you need"
         disabled={op.status === 'running'}
       />
+
+      {workspace.path && !workspaceIncluded && (
+        <div style={{ marginTop: 8 }}>
+          <button onClick={addWorkspaceFile} disabled={op.status === 'running'} className="btn-ghost">
+            Add workspace document ({workspace.originalName})
+          </button>
+        </div>
+      )}
 
       <div style={{ marginTop: 8 }}>
         <FileList

@@ -14,6 +14,7 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import type { PickedFile, Preset } from '../../types/bridge';
 
 interface CompressResultItem {
@@ -64,7 +65,17 @@ export function CompressPage() {
   const [analyses, setAnalyses] = useState<Record<string, FileAnalysis>>({});
   const analyzedPaths = useRef<Set<string>>(new Set());
 
+  // -- Workspace (persistent working document) -----------------------------
+  // Same pattern as WatermarkPage: when a workspace document is loaded, this
+  // page skips its own drop zone and Compress runs against workspace.path,
+  // advancing the workspace pointer to a new temp file on success. With no
+  // workspace document, this page is byte-for-byte the original standalone
+  // behavior below.
+  const workspace = useWorkspace();
+  const workspaceRunRef = useRef(false);
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useEffect(() => {
     bridgeApi.getPresets().then((res) => {
@@ -134,16 +145,29 @@ export function CompressPage() {
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
       const results = op.result.results;
+      if (workspaceRunRef.current) {
+        workspaceRunRef.current = false;
+        const item = results[0];
+        if (item?.output_path) {
+          workspace.applyResult(item.output_path, `Compress (${preset})`);
+          toast.success('Compressed the working document.');
+        } else {
+          toast.error('Compression failed — working document unchanged.');
+        }
+        return;
+      }
       const totalSaved = results.reduce((s, r) => s + (r.skipped ? 0 : r.original_size - r.compressed_size), 0);
       toast.success(
         `Saved ${bridgeApi.formatSize(totalSaved)} across ${results.length} file${results.length === 1 ? '' : 's'}.`
       );
     } else if (op.status === 'error') {
+      workspaceRunRef.current = false;
       toast.error(op.error || 'Compression failed.');
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [op.status, op.result, op.error, toast]);
 
-  const canRun = files.length > 0 && op.status !== 'running';
+  const canRun = (workspace.path ? true : files.length > 0) && op.status !== 'running';
 
   useHotkeys({
     onAddFiles: () => dropRef.current?.open(),
@@ -152,6 +176,24 @@ export function CompressPage() {
   });
 
   const run = () => {
+    if (workspace.path) {
+      const wsPath = workspace.path;
+      const opIndex = workspace.ops.length + 1;
+      workspaceRunRef.current = true;
+      setStartTime(Date.now());
+      op.run(async () => {
+        const wsDir = await bridgeApi.getWorkspaceDir();
+        bridgeApi.startCompress({
+          files: [wsPath],
+          preset,
+          use_gs: useGs,
+          output_dir: wsDir,
+          naming: `{name}_ws${opIndex}`,
+        });
+      });
+      return;
+    }
+
     if (files.length === 0) {
       toast.warning('Please add at least one PDF file.');
       return;
@@ -160,7 +202,7 @@ export function CompressPage() {
     op.run(() => bridgeApi.startCompress({ files: files.map((f) => f.path), preset, use_gs: useGs }));
   };
 
-  const r = op.status === 'done' ? op.result?.results : null;
+  const r = op.status === 'done' && !workspace.path ? op.result?.results : null;
   const results = r
     ? {
         files: r.map((item) => ({
@@ -179,29 +221,40 @@ export function CompressPage() {
     <div className="console">
       <PageHeader title="Compress PDF" subtitle="Reduce file size while preserving quality" backButton={false} />
 
-      <DropZone
-        ref={dropRef}
-        files={files}
-        onFilesChanged={setFiles}
-        multiple
-        compact={files.length > 0}
-        title="Drop PDF files here"
-        subtitle="or click to browse — add as many as you need"
-        disabled={op.status === 'running'}
-      />
-      {files.length > 0 && (
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {files.map((f, i) => (
-            <CompressFileCard
-              key={f.path}
-              file={f}
-              analysis={analyses[f.path]}
-              presetKey={preset}
-              disabled={op.status === 'running'}
-              onRemove={() => setFiles((fs) => fs.filter((_, idx) => idx !== i))}
-            />
-          ))}
-        </div>
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — see the bar above to
+            Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <>
+          <DropZone
+            ref={dropRef}
+            files={files}
+            onFilesChanged={setFiles}
+            multiple
+            compact={files.length > 0}
+            title="Drop PDF files here"
+            subtitle="or click to browse — add as many as you need"
+            disabled={op.status === 'running'}
+          />
+          {files.length > 0 && (
+            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {files.map((f, i) => (
+                <CompressFileCard
+                  key={f.path}
+                  file={f}
+                  analysis={analyses[f.path]}
+                  presetKey={preset}
+                  disabled={op.status === 'running'}
+                  onRemove={() => setFiles((fs) => fs.filter((_, idx) => idx !== i))}
+                />
+              ))}
+            </div>
+          )}
+        </>
       )}
 
       <div style={{ marginTop: 'var(--space-4)' }}>

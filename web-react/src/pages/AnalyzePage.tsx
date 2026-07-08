@@ -10,6 +10,8 @@ import { useToast } from '../components/shared/Toast';
 import { RiskHeader } from '../components/RiskHeader';
 import { FindingRow } from '../components/FindingRow';
 import { SanitizePanel } from '../components/SanitizePanel';
+import { Card } from '../components/shared/Card';
+import { useWorkspace, useWorkspaceBusy } from '../workspace/WorkspaceContext';
 
 type Status = 'idle' | 'loading' | 'ready' | 'error';
 
@@ -24,7 +26,15 @@ export function AnalyzePage() {
   const [sanitizeDefaults, setSanitizeDefaults] = useState<SanitizeOptions | null>(null);
   const [sanitizing, setSanitizing] = useState(false);
 
-  const filePath = files[0]?.path ?? null;
+  // -- Workspace (persistent working document) -----------------------------
+  // Read-only: analysis can run against the workspace document, and Sanitize
+  // can still write a separate "clean copy" the user picks a path for, but
+  // neither ever advances the workspace pointer or touches the working
+  // file itself — this page only ever reads it.
+  const workspace = useWorkspace();
+  useWorkspaceBusy((status === 'loading' || sanitizing) && !!workspace.path);
+
+  const filePath = workspace.path ?? files[0]?.path ?? null;
 
   useEffect(() => {
     bridgeApi
@@ -98,14 +108,23 @@ export function AnalyzePage() {
     <div className="console">
       <PageHeader title="Analyze Document" subtitle="Offline privacy & security audit" backButton={false} />
 
-      <DropZone
-        files={files}
-        onFilesChanged={setFiles}
-        multiple={false}
-        title="Drop a PDF to analyze"
-        subtitle="or click to browse"
-        disabled={status === 'loading'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Analyzing the workspace document ({workspace.originalName}) — read-only; this never changes
+            the working document. See the bar above to Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <DropZone
+          files={files}
+          onFilesChanged={setFiles}
+          multiple={false}
+          title="Drop a PDF to analyze"
+          subtitle="or click to browse"
+          disabled={status === 'loading'}
+        />
+      )}
 
       {status === 'loading' && (
         <div

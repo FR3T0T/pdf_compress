@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
@@ -11,6 +11,7 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import type { PickedFile } from '../../types/bridge';
 
 interface FileResult {
@@ -80,7 +81,13 @@ export function ProtectPage() {
   const [naming, setNaming] = useState('{name}_protected');
   const op = useOperation<ProtectResult>('protect');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // See WatermarkPage.tsx for the reference pattern this mirrors.
+  const workspace = useWorkspace();
+  const workspaceRunRef = useRef(false);
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useEffect(() => {
     (async () => {
@@ -98,47 +105,43 @@ export function ProtectPage() {
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
       const res = op.result.results;
+      if (workspaceRunRef.current) {
+        workspaceRunRef.current = false;
+        const fr = res.files[0];
+        if (fr?.status === 'ok' && fr.outputPath) {
+          workspace.applyResult(fr.outputPath, `Protect (${mode})`);
+          toast.success('Protected the working document.');
+        } else {
+          toast.error(fr?.details || 'Protection failed — working document unchanged.');
+        }
+        return;
+      }
       const nOk = res.files.filter((f) => f.status === 'ok').length;
       const nErr = res.files.length - nOk;
       if (nOk > 0) toast.success(`${nOk} file${nOk === 1 ? '' : 's'} protected successfully!`);
       if (nErr > 0 && nOk === 0) toast.error('Protection failed for all files.');
     } else if (op.status === 'error') {
+      workspaceRunRef.current = false;
       toast.error(op.error || 'Protection failed.');
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [op.status, op.result, op.error, toast]);
 
-  const canRun = files.length > 0 && userPassword.length > 0 && op.status !== 'running';
+  const canRun = (workspace.path ? true : files.length > 0) && userPassword.length > 0 && op.status !== 'running';
 
   const pickOutputDir = async () => {
     const dir = await bridgeApi.openFolder();
     if (dir) setOutputDir(dir);
   };
 
-  const run = () => {
-    if (files.length === 0) {
-      toast.warning('Please add at least one PDF file.');
-      return;
-    }
-    if (!userPassword) {
-      toast.warning('Please enter a password.');
-      return;
-    }
-    const trimmedNaming = naming.trim() || '{name}_protected';
-
-    bridgeApi.saveSetting('protect/mode', mode);
-    bridgeApi.saveSetting('protect/naming', trimmedNaming);
-    if (mode === 'enhanced') {
-      bridgeApi.saveSetting('protect/cipher', cipher);
-      bridgeApi.saveSetting('protect/kdf', kdf);
-    }
-
+  const buildParams = (filePaths: string[], outDir: string, namingTemplate: string): Record<string, unknown> => {
     const params: Record<string, unknown> = {
-      files: files.map((f) => f.path),
+      files: filePaths,
       user_password: userPassword,
       owner_password: ownerPassword,
       mode,
-      output_dir: outputDir,
-      naming: trimmedNaming,
+      output_dir: outDir,
+      naming: namingTemplate,
     };
     if (mode === 'standard') {
       params.encryption = encryption;
@@ -152,11 +155,43 @@ export function ProtectPage() {
       params.cipher = cipher;
       params.kdf = kdf;
     }
-
-    op.run(() => bridgeApi.startProtect(params));
+    return params;
   };
 
-  const r = op.status === 'done' ? op.result?.results : null;
+  const run = () => {
+    if (!userPassword) {
+      toast.warning('Please enter a password.');
+      return;
+    }
+
+    if (workspace.path) {
+      const wsPath = workspace.path;
+      const opIndex = workspace.ops.length + 1;
+      workspaceRunRef.current = true;
+      op.run(async () => {
+        const wsDir = await bridgeApi.getWorkspaceDir();
+        bridgeApi.startProtect(buildParams([wsPath], wsDir, `{name}_ws${opIndex}`));
+      });
+      return;
+    }
+
+    if (files.length === 0) {
+      toast.warning('Please add at least one PDF file.');
+      return;
+    }
+    const trimmedNaming = naming.trim() || '{name}_protected';
+
+    bridgeApi.saveSetting('protect/mode', mode);
+    bridgeApi.saveSetting('protect/naming', trimmedNaming);
+    if (mode === 'enhanced') {
+      bridgeApi.saveSetting('protect/cipher', cipher);
+      bridgeApi.saveSetting('protect/kdf', kdf);
+    }
+
+    op.run(() => bridgeApi.startProtect(buildParams(files.map((f) => f.path), outputDir, trimmedNaming)));
+  };
+
+  const r = op.status === 'done' && !workspace.path ? op.result?.results : null;
   const results = r
     ? {
         files: r.files.map((fr) => ({
@@ -176,18 +211,29 @@ export function ProtectPage() {
     <div className="console">
       <PageHeader title="Protect PDF" subtitle="Add password protection with standard or enhanced encryption" backButton={false} />
 
-      <DropZone
-        files={files}
-        onFilesChanged={setFiles}
-        multiple
-        compact={files.length > 0}
-        title="Drop PDF files here"
-        subtitle="or click to browse"
-        disabled={op.status === 'running'}
-      />
-      <div style={{ marginTop: 8 }}>
-        <FileList files={files} onRemove={(i) => setFiles((fs) => fs.filter((_, idx) => idx !== i))} />
-      </div>
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — see the bar above to
+            Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <>
+          <DropZone
+            files={files}
+            onFilesChanged={setFiles}
+            multiple
+            compact={files.length > 0}
+            title="Drop PDF files here"
+            subtitle="or click to browse"
+            disabled={op.status === 'running'}
+          />
+          <div style={{ marginTop: 8 }}>
+            <FileList files={files} onRemove={(i) => setFiles((fs) => fs.filter((_, idx) => idx !== i))} />
+          </div>
+        </>
+      )}
 
       <div style={{ marginTop: 'var(--space-3)' }}>
         <Card>
@@ -271,37 +317,39 @@ export function ProtectPage() {
         </Card>
       </div>
 
-      <div style={{ marginTop: 'var(--space-3)' }}>
-        <Card>
-          <SectionLabel>Output</SectionLabel>
-          <Field label="Output folder">
-            <div style={{ display: 'flex', gap: 8 }}>
-              <span
-                className="mono"
-                style={{
-                  flex: 1,
-                  color: 'var(--text-2)',
-                  fontSize: 'var(--font-size-sm)',
-                  padding: '7px 10px',
-                  background: 'var(--panel-bg-elevated)',
-                  border: '1px solid var(--border-strong)',
-                  borderRadius: 'var(--radius-panel-sm)',
-                }}
-              >
-                {outputDir || 'Same folder as input'}
-              </span>
-              <button onClick={pickOutputDir} disabled={op.status === 'running'} className="btn-ghost">
-                Browse
-              </button>
-            </div>
-          </Field>
-          <div style={{ marginTop: 'var(--space-3)' }}>
-            <Field label="Naming template" help="Variables: {name}, {cipher}, {mode}">
-              <TextInput value={naming} onChange={setNaming} placeholder="{name}_protected" />
+      {!workspace.path && (
+        <div style={{ marginTop: 'var(--space-3)' }}>
+          <Card>
+            <SectionLabel>Output</SectionLabel>
+            <Field label="Output folder">
+              <div style={{ display: 'flex', gap: 8 }}>
+                <span
+                  className="mono"
+                  style={{
+                    flex: 1,
+                    color: 'var(--text-2)',
+                    fontSize: 'var(--font-size-sm)',
+                    padding: '7px 10px',
+                    background: 'var(--panel-bg-elevated)',
+                    border: '1px solid var(--border-strong)',
+                    borderRadius: 'var(--radius-panel-sm)',
+                  }}
+                >
+                  {outputDir || 'Same folder as input'}
+                </span>
+                <button onClick={pickOutputDir} disabled={op.status === 'running'} className="btn-ghost">
+                  Browse
+                </button>
+              </div>
             </Field>
-          </div>
-        </Card>
-      </div>
+            <div style={{ marginTop: 'var(--space-3)' }}>
+              <Field label="Naming template" help="Variables: {name}, {cipher}, {mode}">
+                <TextInput value={naming} onChange={setNaming} placeholder="{name}_protected" />
+              </Field>
+            </div>
+          </Card>
+        </div>
+      )}
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 'var(--space-4)' }}>
         <button onClick={run} disabled={!canRun} className="btn-primary">

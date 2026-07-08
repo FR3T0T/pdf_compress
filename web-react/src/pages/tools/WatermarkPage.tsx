@@ -7,21 +7,14 @@ import type { DropZoneHandle } from '../../components/shared/DropZone';
 import { FileList } from '../../components/shared/FileList';
 import { ProgressPanel } from '../../components/shared/ProgressPanel';
 import { ResultsPanel } from '../../components/shared/ResultsPanel';
-import { Checkbox, Select, Slider, TextInput } from '../../components/shared/formControls';
+import { Select, Slider, TextInput } from '../../components/shared/formControls';
 import { useToast } from '../../components/shared/Toast';
 import { useHotkeys } from '../../bridge/useHotkeys';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
-import { useWorkspace } from '../../workspace/WorkspaceContext';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import type { PickedFile } from '../../types/bridge';
-
-interface WorkspacePageImage {
-  index: number;
-  dataUrl: string;
-  width: number;
-  height: number;
-}
 
 interface WatermarkFileResult {
   file: string;
@@ -98,6 +91,15 @@ const SETTINGS_KEYS = {
  *
  * Settings persistence (9 watermark/* keys) and preset switching
  * preserved; keyboard shortcuts intentionally not carried over.
+ *
+ * Workspace integration: loading a document into the workspace is now a
+ * global action (the WorkspaceBar in AppShell, above every tool page), not
+ * a per-page toggle. When a workspace document is loaded, this page skips
+ * its own drop zone and Apply Watermark runs against workspace.path
+ * directly, advancing the workspace pointer to a new temp file on success
+ * (running-result model — see WorkspaceContext.tsx). With no workspace
+ * document loaded, this page is byte-for-byte the original standalone
+ * behavior below.
  */
 export function WatermarkPage() {
   const toast = useToast();
@@ -117,39 +119,16 @@ export function WatermarkPage() {
   const dropRef = useRef<DropZoneHandle>(null);
 
   // -- Workspace (persistent working document) -----------------------------
-  // See WorkspaceContext.tsx. `keepLoaded` only matters while the workspace
-  // has no document yet -- it decides whether the next file dropped here
-  // becomes the shared working document. Once workspace.path is set, this
-  // page shows the "already loaded" indicator instead of the drop zone,
-  // and Apply Watermark runs against the workspace document (running-result
-  // model) instead of the local `files` list. None of this touches the
-  // `files`-array code path below, which is exactly the pre-workspace
-  // normal-mode behavior.
+  // See WorkspaceContext.tsx / WorkspaceBar.tsx. Loading a document into the
+  // workspace happens globally via the bar; this page only reads
+  // workspace.path/ops and, when set, runs against it instead of the local
+  // `files` list below (which is exactly the pre-workspace standalone
+  // behavior).
   const workspace = useWorkspace();
-  const [keepLoaded, setKeepLoaded] = useState(false);
   const workspaceRunRef = useRef(false);
-  const [previewPages, setPreviewPages] = useState<WorkspacePageImage[]>([]);
-  const [previewLoading, setPreviewLoading] = useState(false);
 
   usePageBusy(op.status === 'running');
-
-  // A file was dropped/picked while "keep loaded across tools" is checked
-  // and no workspace document exists yet -- that file becomes the working
-  // document. Local `files` is cleared since the workspace indicator takes
-  // over from here.
-  useEffect(() => {
-    if (keepLoaded && !workspace.path && files.length > 0) {
-      workspace.load(files[0].path);
-      setFiles([]);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [keepLoaded, files, workspace.path]);
-
-  // A stale preview from before the latest run would misleadingly look
-  // current, so drop it as soon as the working document pointer moves.
-  useEffect(() => {
-    setPreviewPages([]);
-  }, [workspace.path]);
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useHotkeys({
     onAddFiles: () => dropRef.current?.open(),
@@ -311,31 +290,9 @@ export function WatermarkPage() {
     );
   };
 
-  const handlePreview = async () => {
-    if (!workspace.path) return;
-    setPreviewLoading(true);
-    const res = await bridgeApi.getPageImages(workspace.path);
-    setPreviewLoading(false);
-    if (!res.success || !res.pages) {
-      toast.error(res.error || 'Could not render a preview.');
-      return;
-    }
-    setPreviewPages(res.pages);
-  };
-
-  const handleExport = async () => {
-    if (!workspace.path) return;
-    const defaultName = (workspace.originalName || 'document.pdf').replace(/\.pdf$/i, '_workspace.pdf');
-    const dest = await bridgeApi.saveFile('PDF Files (*.pdf)', defaultName);
-    if (!dest) return;
-    const ok = await workspace.exportTo(dest);
-    if (ok) toast.success(`Exported to ${bridgeApi.basename(dest)}.`);
-    else toast.error('Export failed.');
-  };
-
-  // Suppressed in workspace mode -- the "already loaded" indicator card
-  // (ops count, Preview) communicates the result instead of the
-  // normal-mode batch ResultsPanel, which assumes a `files` array.
+  // Suppressed in workspace mode -- the WorkspaceBar's ops count/Preview
+  // communicates the result instead of the normal-mode batch ResultsPanel,
+  // which assumes a `files` array.
   const r = op.status === 'done' && !workspace.path ? op.result?.results : null;
   const results = r
     ? {
@@ -355,49 +312,10 @@ export function WatermarkPage() {
 
       {workspace.path ? (
         <Card>
-          <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)' }}>
-            Working document: {workspace.originalName} ({workspace.ops.length} operation
-            {workspace.ops.length === 1 ? '' : 's'} applied)
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — see the bar above to
+            Preview, Export, or Clear it.
           </div>
-          <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginTop: 4 }}>
-            Loaded across tools — Apply Watermark below builds on this file instead of a fresh upload.
-          </div>
-          <div style={{ display: 'flex', gap: 8, marginTop: 'var(--space-3)', flexWrap: 'wrap' }}>
-            <button onClick={handlePreview} disabled={previewLoading} className="btn-ghost">
-              {previewLoading ? 'Rendering…' : 'Preview'}
-            </button>
-            <button onClick={handleExport} className="btn-ghost">
-              Export…
-            </button>
-            <button
-              onClick={() => {
-                workspace.clear();
-                setKeepLoaded(false);
-              }}
-              disabled={op.status === 'running'}
-              className="btn-ghost"
-            >
-              Clear working document
-            </button>
-          </div>
-          {previewPages.length > 0 && (
-            <div style={{ marginTop: 'var(--space-3)', display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
-              {previewPages.map((p) => (
-                <div key={p.index}>
-                  <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginBottom: 4 }}>
-                    Page {p.index + 1}
-                  </div>
-                  <img
-                    src={p.dataUrl}
-                    width={p.width}
-                    height={p.height}
-                    alt={`Working document page ${p.index + 1}`}
-                    style={{ display: 'block', maxWidth: '100%', height: 'auto', border: '1px solid var(--border)' }}
-                  />
-                </div>
-              ))}
-            </div>
-          )}
         </Card>
       ) : (
         <>
@@ -405,16 +323,12 @@ export function WatermarkPage() {
             ref={dropRef}
             files={files}
             onFilesChanged={setFiles}
-            multiple={!keepLoaded}
+            multiple
             compact={files.length > 0}
             title="Drop PDF files here"
             subtitle="or click to browse — add as many as you need"
             disabled={op.status === 'running'}
           />
-
-          <div style={{ marginTop: 4 }}>
-            <Checkbox checked={keepLoaded} onChange={setKeepLoaded} label="Keep this file loaded across tools" />
-          </div>
 
           <div style={{ marginTop: 8 }}>
             <FileList files={files} onRemove={(i) => setFiles((fs) => fs.filter((_, idx) => idx !== i))} />

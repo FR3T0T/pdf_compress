@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
@@ -8,6 +8,8 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
+import { workspaceOutputPath } from '../../workspace/workspaceOutputPath';
 import type { PickedFile } from '../../types/bridge';
 
 interface Language {
@@ -119,7 +121,17 @@ export function TranslatePage() {
   // actions themselves.
   const statusOp = useOperation<TranslationStatus>('translationStatus');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // See WatermarkPage.tsx for the reference pattern this mirrors. A
+  // workspace document is always a PDF, so only the PDF flow (never the
+  // image auto-translate flow) applies. The output-format choice decides
+  // whether the run advances the workspace pointer (PDF output) or is a
+  // terminal side-output (docx/txt) — see workspacePdfMode below.
+  const workspace = useWorkspace();
+  const workspaceRunRef = useRef(false);
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useEffect(() => {
     statusOp.run(() => bridgeApi.startGetTranslationStatus({ toolKey: 'translationStatus' }));
@@ -141,7 +153,23 @@ export function TranslatePage() {
     if (op.status === 'done' && op.result?.results) {
       setModelWarmedUp(true);
       if (lastMode === 'pdf') {
-        const { pages, note } = op.result.results as PdfTranslateResult;
+        const { pages, note, output } = op.result.results as PdfTranslateResult;
+        if (workspaceRunRef.current) {
+          workspaceRunRef.current = false;
+          // pdf_translate.py can redirect certain scripts (ar/hi/bn) from
+          // PDF to .docx output regardless of the requested format — only
+          // advance the workspace pointer if the actual output is a PDF,
+          // never point the working document at a non-PDF file.
+          if (output && output.toLowerCase().endsWith('.pdf')) {
+            workspace.applyResult(output, `Translate (${source} → ${target})`);
+            toast.success(`Translated ${pages} page${pages === 1 ? '' : 's'} — working document updated.`);
+          } else {
+            toast.success(`Translated ${pages} page${pages === 1 ? '' : 's'}.`);
+            toast.info('Output was not a PDF, so the working document was left unchanged.');
+          }
+          if (note) toast.info(note);
+          return;
+        }
         toast.success(`Translated ${pages} page${pages === 1 ? '' : 's'}.`);
         // e.g. ar/hi/bn redirected from PDF to .docx — see pdf_translate.py.
         if (note) toast.info(note);
@@ -150,12 +178,16 @@ export function TranslatePage() {
         if (note) toast.info(note);
       }
     } else if (op.status === 'error') {
+      workspaceRunRef.current = false;
       toast.error(op.error || 'Translation failed.');
       setModelWarmedUp(true);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [op.status, op.result, op.error, lastMode, toast]);
 
   const file = files[0] ?? null;
+  const effectivePath = workspace.path ?? file?.path ?? null;
+  const workspacePdfMode = !!workspace.path && outputFormat === 'pdf';
 
   const runImage = (path: string, src: string, tgt: string, terms: string[]) => {
     setLastMode('image');
@@ -202,7 +234,7 @@ export function TranslatePage() {
   };
 
   const pickOutput = async () => {
-    const base = file ? bridgeApi.basename(file.path).replace(/\.[^.]+$/, '') : 'document';
+    const base = effectivePath ? bridgeApi.basename(effectivePath).replace(/\.[^.]+$/, '') : 'document';
     const { filter, ext } = FORMAT_OPTIONS[outputFormat];
     const path = await bridgeApi.saveFile(filter, `${base}_translated${ext}`);
     if (path) setOutputPath(path);
@@ -217,19 +249,38 @@ export function TranslatePage() {
   };
 
   const runPdf = () => {
-    if (!file) {
+    if (!effectivePath) {
       toast.warning('Add a file first.');
       return;
     }
+    setLastMode('pdf');
+
+    if (workspacePdfMode) {
+      const wsPath = effectivePath;
+      const opIndex = workspace.ops.length + 1;
+      workspaceRunRef.current = true;
+      op.run(async () => {
+        const wsDir = await bridgeApi.getWorkspaceDir();
+        bridgeApi.startTranslatePdf({
+          toolKey: 'translate',
+          inputPath: wsPath,
+          outputPath: workspaceOutputPath(wsDir, wsPath, opIndex),
+          source,
+          target,
+          protectTerms,
+        });
+      });
+      return;
+    }
+
     if (!outputPath) {
       toast.warning('Choose an output location.');
       return;
     }
-    setLastMode('pdf');
     op.run(() =>
       bridgeApi.startTranslatePdf({
         toolKey: 'translate',
-        inputPath: file.path,
+        inputPath: effectivePath,
         outputPath,
         source,
         target,
@@ -355,19 +406,30 @@ export function TranslatePage() {
         </Card>
       </div>
 
-      <div style={{ marginTop: 'var(--space-4)' }}>
-        <DropZone
-          files={files}
-          onFilesChanged={setFiles}
-          multiple={false}
-          title="Drop a PDF or an image"
-          subtitle="PDF, PNG, JPG, TIFF…"
-          accept="PDF & Images (*.pdf *.png *.jpg *.jpeg *.tiff *.bmp *.gif)"
-          disabled={running}
-        />
-      </div>
+      {workspace.path ? (
+        <div style={{ marginTop: 'var(--space-4)' }}>
+          <Card>
+            <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+              Operating on the workspace document ({workspace.originalName}) — see the bar above to
+              Preview, Export, or Clear it.
+            </div>
+          </Card>
+        </div>
+      ) : (
+        <div style={{ marginTop: 'var(--space-4)' }}>
+          <DropZone
+            files={files}
+            onFilesChanged={setFiles}
+            multiple={false}
+            title="Drop a PDF or an image"
+            subtitle="PDF, PNG, JPG, TIFF…"
+            accept="PDF & Images (*.pdf *.png *.jpg *.jpeg *.tiff *.bmp *.gif)"
+            disabled={running}
+          />
+        </div>
+      )}
 
-      {file && isPdf(file.path) && (
+      {(workspace.path || (file && isPdf(file.path))) && (
         <div style={{ marginTop: 'var(--space-4)' }}>
           <Card>
             <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
@@ -384,23 +446,37 @@ export function TranslatePage() {
                 />
               </div>
             </div>
+            {workspacePdfMode ? (
+              <div style={{ marginTop: 'var(--space-3)', color: 'var(--text-3)', fontSize: 'var(--font-size-xs)' }}>
+                PDF output updates the workspace working document directly — no output location needed.
+              </div>
+            ) : (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 'var(--space-3)',
+                  flexWrap: 'wrap',
+                  marginTop: 'var(--space-3)',
+                }}
+              >
+                <span style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)' }}>Save translation as:</span>
+                <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+                  {outputPath ? bridgeApi.basename(outputPath) : 'No output file selected'}
+                </span>
+                <button onClick={pickOutput} disabled={running} className="btn-ghost">
+                  Output…
+                </button>
+              </div>
+            )}
             <div
               style={{
                 display: 'flex',
-                alignItems: 'center',
-                gap: 'var(--space-3)',
-                flexWrap: 'wrap',
+                justifyContent: 'flex-end',
                 marginTop: 'var(--space-3)',
               }}
             >
-              <span style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)' }}>Save translation as:</span>
-              <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
-                {outputPath ? bridgeApi.basename(outputPath) : 'No output file selected'}
-              </span>
-              <button onClick={pickOutput} disabled={running} className="btn-ghost">
-                Output…
-              </button>
-              <button onClick={runPdf} disabled={running || !outputPath} className="btn-primary">
+              <button onClick={runPdf} disabled={running || (!workspacePdfMode && !outputPath)} className="btn-primary">
                 {running && lastMode === 'pdf' ? (
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
                     <span className="spinner" />

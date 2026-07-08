@@ -8,6 +8,7 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import type { PickedFile } from '../../types/bridge';
 
 interface PdfToWordResult {
@@ -28,7 +29,14 @@ export function PdfToWordPage() {
   const [outputPath, setOutputPath] = useState<string | null>(null);
   const op = useOperation<PdfToWordResult>('pdf_to_word');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // Terminal tool: reads the workspace document as input when loaded, but
+  // its output is a normal side download — the workspace pointer is never
+  // advanced (see the Step B spec's terminal-tool list).
+  const workspace = useWorkspace();
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useEffect(() => {
     if (op.status === 'done') {
@@ -39,7 +47,8 @@ export function PdfToWordPage() {
   }, [op.status, op.error, toast]);
 
   const file = files[0] ?? null;
-  const canRun = !!file && !!outputPath && op.status !== 'running';
+  const effectivePath = workspace.path ?? file?.path ?? null;
+  const canRun = !!effectivePath && !!outputPath && op.status !== 'running';
 
   const pickOutput = async () => {
     const defaultName = file ? bridgeApi.basename(file.path).replace(/\.pdf$/i, '.docx') : 'converted.docx';
@@ -48,7 +57,7 @@ export function PdfToWordPage() {
   };
 
   const run = () => {
-    if (!file) {
+    if (!effectivePath) {
       toast.warning('Please add a PDF file.');
       return;
     }
@@ -56,7 +65,7 @@ export function PdfToWordPage() {
       toast.warning('Please choose an output file.');
       return;
     }
-    op.run(() => bridgeApi.startPdfToWord({ file: file.path, output_path: outputPath }));
+    op.run(() => bridgeApi.startPdfToWord({ file: effectivePath, output_path: outputPath }));
   };
 
   const r = op.status === 'done' ? op.result?.results : null;
@@ -71,14 +80,23 @@ export function PdfToWordPage() {
     <div className="console">
       <PageHeader title="PDF to Word" subtitle="Convert a PDF file to a Word document" backButton={false} />
 
-      <DropZone
-        files={files}
-        onFilesChanged={setFiles}
-        multiple={false}
-        title="Drop PDF file here"
-        subtitle="or click to browse"
-        disabled={op.status === 'running'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — this reads from it without
+            changing it; see the bar above to Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <DropZone
+          files={files}
+          onFilesChanged={setFiles}
+          multiple={false}
+          title="Drop PDF file here"
+          subtitle="or click to browse"
+          disabled={op.status === 'running'}
+        />
+      )}
 
       <div style={{ marginTop: 'var(--space-3)' }}>
         <Card>

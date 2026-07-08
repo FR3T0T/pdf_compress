@@ -9,6 +9,7 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import type { PickedFile } from '../../types/bridge';
 
 interface ExtractImagesResult {
@@ -34,7 +35,14 @@ export function ExtractImagesPage() {
   const [minSize, setMinSize] = useState('0');
   const op = useOperation<ExtractImagesResult>('extract_images');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // Terminal tool: reads the workspace document as input when loaded, but
+  // its output is a normal side download — the workspace pointer is never
+  // advanced (see the Step B spec's terminal-tool list).
+  const workspace = useWorkspace();
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
@@ -45,7 +53,8 @@ export function ExtractImagesPage() {
   }, [op.status, op.result, op.error, toast]);
 
   const file = files[0] ?? null;
-  const canRun = !!file && !!outputDir && op.status !== 'running';
+  const effectivePath = workspace.path ?? file?.path ?? null;
+  const canRun = !!effectivePath && !!outputDir && op.status !== 'running';
 
   const pickOutputDir = async () => {
     const dir = await bridgeApi.openFolder();
@@ -53,7 +62,7 @@ export function ExtractImagesPage() {
   };
 
   const run = () => {
-    if (!file) {
+    if (!effectivePath) {
       toast.warning('Please add a PDF file.');
       return;
     }
@@ -63,7 +72,7 @@ export function ExtractImagesPage() {
     }
     op.run(() =>
       bridgeApi.startExtractImages({
-        file: file.path,
+        file: effectivePath,
         output_dir: outputDir,
         format,
         min_size: parseInt(minSize, 10) || 0,
@@ -83,14 +92,23 @@ export function ExtractImagesPage() {
     <div className="console">
       <PageHeader title="Extract Images" subtitle="Extract all images from a PDF file" backButton={false} />
 
-      <DropZone
-        files={files}
-        onFilesChanged={setFiles}
-        multiple={false}
-        title="Drop PDF file here"
-        subtitle="or click to browse"
-        disabled={op.status === 'running'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — this reads from it without
+            changing it; see the bar above to Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <DropZone
+          files={files}
+          onFilesChanged={setFiles}
+          multiple={false}
+          title="Drop PDF file here"
+          subtitle="or click to browse"
+          disabled={op.status === 'running'}
+        />
+      )}
 
       <div style={{ marginTop: 'var(--space-3)' }}>
         <Card>

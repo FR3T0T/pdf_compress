@@ -7,6 +7,7 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import type { PickedFile } from '../../types/bridge';
 
 interface PageDiff {
@@ -42,7 +43,23 @@ export function ComparePage() {
   const [fileB, setFileB] = useState<PickedFile[]>([]);
   const op = useOperation<CompareResult>('compare');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // Multi-input tool: the workspace document (if any) can be offered as
+  // either PDF A or PDF B, alongside the normal two-slot flow — it's never
+  // required and the workspace pointer is never advanced.
+  const workspace = useWorkspace();
+  const usedAsA = !!workspace.path && fileA[0]?.path === workspace.path;
+  const usedAsB = !!workspace.path && fileB[0]?.path === workspace.path;
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && (usedAsA || usedAsB));
+
+  const useWorkspaceAs = (slot: 'a' | 'b') => {
+    if (!workspace.path) return;
+    const picked: PickedFile = { path: workspace.path, name: workspace.originalName || bridgeApi.basename(workspace.path) };
+    if (slot === 'a') setFileA([picked]);
+    else setFileB([picked]);
+  };
 
   useEffect(() => {
     if (op.status === 'done') {
@@ -86,6 +103,13 @@ export function ComparePage() {
             subtitle="or click to browse"
             disabled={op.status === 'running'}
           />
+          {workspace.path && !usedAsA && (
+            <div style={{ marginTop: 8 }}>
+              <button onClick={() => useWorkspaceAs('a')} disabled={op.status === 'running'} className="btn-ghost">
+                Use workspace document
+              </button>
+            </div>
+          )}
         </div>
         <div>
           <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)', marginBottom: 8 }}>PDF B</div>
@@ -98,6 +122,13 @@ export function ComparePage() {
             subtitle="or click to browse"
             disabled={op.status === 'running'}
           />
+          {workspace.path && !usedAsB && (
+            <div style={{ marginTop: 8 }}>
+              <button onClick={() => useWorkspaceAs('b')} disabled={op.status === 'running'} className="btn-ghost">
+                Use workspace document
+              </button>
+            </div>
+          )}
         </div>
       </div>
 

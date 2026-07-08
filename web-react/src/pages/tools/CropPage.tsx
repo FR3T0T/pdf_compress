@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
@@ -9,6 +9,8 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
+import { workspaceOutputPath } from '../../workspace/workspaceOutputPath';
 import type { PickedFile } from '../../types/bridge';
 
 /**
@@ -28,18 +30,37 @@ export function CropPage() {
   const [bottom, setBottom] = useState('0');
   const op = useOperation<{ outputPath: string }>('crop');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // See WatermarkPage.tsx for the reference pattern this mirrors.
+  const workspace = useWorkspace();
+  const workspaceRunRef = useRef(false);
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useEffect(() => {
     if (op.status === 'done') {
+      if (workspaceRunRef.current) {
+        workspaceRunRef.current = false;
+        const outPath = op.result?.results?.outputPath;
+        if (outPath) {
+          workspace.applyResult(outPath, 'Crop');
+          toast.success('Cropped the working document.');
+        } else {
+          toast.error('Crop failed — working document unchanged.');
+        }
+        return;
+      }
       toast.success('Crop complete.');
     } else if (op.status === 'error') {
+      workspaceRunRef.current = false;
       toast.error(op.error || 'An error occurred during cropping.');
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [op.status, op.error, toast]);
 
   const file = files[0] ?? null;
-  const canRun = !!file && !!outputPath && op.status !== 'running';
+  const canRun = (workspace.path ? true : !!file && !!outputPath) && op.status !== 'running';
 
   const pickOutput = async () => {
     const defaultName = file ? bridgeApi.basename(file.path).replace(/\.pdf$/i, '_cropped.pdf') : 'cropped.pdf';
@@ -47,7 +68,30 @@ export function CropPage() {
     if (path) setOutputPath(path);
   };
 
+  const margins = {
+    left: parseFloat(left) || 0,
+    right: parseFloat(right) || 0,
+    top: parseFloat(top) || 0,
+    bottom: parseFloat(bottom) || 0,
+  };
+
   const run = () => {
+    if (workspace.path) {
+      const wsPath = workspace.path;
+      const opIndex = workspace.ops.length + 1;
+      workspaceRunRef.current = true;
+      op.run(async () => {
+        const wsDir = await bridgeApi.getWorkspaceDir();
+        bridgeApi.startCrop({
+          file: wsPath,
+          output_path: workspaceOutputPath(wsDir, wsPath, opIndex),
+          margins,
+          unit,
+        });
+      });
+      return;
+    }
+
     if (!file) {
       toast.warning('Please add a PDF file.');
       return;
@@ -60,18 +104,13 @@ export function CropPage() {
       bridgeApi.startCrop({
         file: file.path,
         output_path: outputPath,
-        margins: {
-          left: parseFloat(left) || 0,
-          right: parseFloat(right) || 0,
-          top: parseFloat(top) || 0,
-          bottom: parseFloat(bottom) || 0,
-        },
+        margins,
         unit,
       })
     );
   };
 
-  const results = op.status === 'done' && op.result
+  const results = op.status === 'done' && op.result && !workspace.path
     ? {
         files: [{ name: bridgeApi.basename(op.result.results?.outputPath ?? ''), status: 'done' as const }],
         outputDir: op.result.results?.outputPath ? bridgeApi.dirname(op.result.results.outputPath) : undefined,
@@ -82,14 +121,23 @@ export function CropPage() {
     <div className="console">
       <PageHeader title="Crop" subtitle="Crop page margins from a PDF" backButton={false} />
 
-      <DropZone
-        files={files}
-        onFilesChanged={setFiles}
-        multiple={false}
-        title="Drop PDF file here"
-        subtitle="or click to browse"
-        disabled={op.status === 'running'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — see the bar above to
+            Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <DropZone
+          files={files}
+          onFilesChanged={setFiles}
+          multiple={false}
+          title="Drop PDF file here"
+          subtitle="or click to browse"
+          disabled={op.status === 'running'}
+        />
+      )}
 
       <div style={{ marginTop: 'var(--space-3)' }}>
         <Card>
@@ -119,18 +167,20 @@ export function CropPage() {
         </Card>
       </div>
 
-      <div style={{ marginTop: 'var(--space-3)' }}>
-        <Card>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
-            <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
-              {outputPath ? bridgeApi.basename(outputPath) : 'No output file selected'}
-            </span>
-            <button onClick={pickOutput} disabled={op.status === 'running'} className="btn-ghost">
-              Browse…
-            </button>
-          </div>
-        </Card>
-      </div>
+      {!workspace.path && (
+        <div style={{ marginTop: 'var(--space-3)' }}>
+          <Card>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
+              <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+                {outputPath ? bridgeApi.basename(outputPath) : 'No output file selected'}
+              </span>
+              <button onClick={pickOutput} disabled={op.status === 'running'} className="btn-ghost">
+                Browse…
+              </button>
+            </div>
+          </Card>
+        </div>
+      )}
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 'var(--space-4)' }}>
         <button onClick={run} disabled={!canRun} className="btn-primary">

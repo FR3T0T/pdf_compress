@@ -10,6 +10,7 @@ import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import type { PickedFile } from '../../types/bridge';
 
 interface PdfToImagesResult {
@@ -36,7 +37,14 @@ export function PdfToImagesPage() {
   const [pageRange, setPageRange] = useState('');
   const op = useOperation<PdfToImagesResult>('pdf_to_images');
 
+  // -- Workspace (persistent working document) -----------------------------
+  // Terminal tool: reads the workspace document as input when loaded, but
+  // its output is a normal side download — the workspace pointer is never
+  // advanced (see the Step B spec's terminal-tool list).
+  const workspace = useWorkspace();
+
   usePageBusy(op.status === 'running');
+  useWorkspaceBusy(op.status === 'running' && !!workspace.path);
 
   useEffect(() => {
     if (op.status === 'done') {
@@ -47,7 +55,8 @@ export function PdfToImagesPage() {
   }, [op.status, op.error, toast]);
 
   const file = files[0] ?? null;
-  const canRun = !!file && !!outputDir && op.status !== 'running';
+  const effectivePath = workspace.path ?? file?.path ?? null;
+  const canRun = !!effectivePath && !!outputDir && op.status !== 'running';
 
   const pickOutputDir = async () => {
     const dir = await bridgeApi.openFolder();
@@ -55,7 +64,7 @@ export function PdfToImagesPage() {
   };
 
   const run = () => {
-    if (!file) {
+    if (!effectivePath) {
       toast.warning('Please add a PDF file.');
       return;
     }
@@ -65,7 +74,7 @@ export function PdfToImagesPage() {
     }
     op.run(() =>
       bridgeApi.startPdfToImages({
-        file: file.path,
+        file: effectivePath,
         output_dir: outputDir,
         format,
         dpi: parseInt(dpi, 10) || 150,
@@ -87,14 +96,23 @@ export function PdfToImagesPage() {
     <div className="console">
       <PageHeader title="PDF to Images" subtitle="Convert PDF pages to image files" backButton={false} />
 
-      <DropZone
-        files={files}
-        onFilesChanged={setFiles}
-        multiple={false}
-        title="Drop PDF file here"
-        subtitle="or click to browse"
-        disabled={op.status === 'running'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+            Operating on the workspace document ({workspace.originalName}) — this reads from it without
+            changing it; see the bar above to Preview, Export, or Clear it.
+          </div>
+        </Card>
+      ) : (
+        <DropZone
+          files={files}
+          onFilesChanged={setFiles}
+          multiple={false}
+          title="Drop PDF file here"
+          subtitle="or click to browse"
+          disabled={op.status === 'running'}
+        />
+      )}
 
       <div style={{ marginTop: 'var(--space-3)' }}>
         <Card>
