@@ -32,8 +32,9 @@ export function RiskHeader({ report }: { report: AnalyzeReport }) {
           RISK: {sev.short}
         </div>
         <div className="mono" style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
-          {report.fileName} · {report.pages} page{report.pages === 1 ? '' : 's'} ·{' '}
-          {report.fileSizeStr}
+          {report.fileName}
+          {report.pages > 0 ? ` · ${report.pages} page${report.pages === 1 ? '' : 's'}` : ''}
+          {` · ${report.fileSizeStr}`}
           {report.pdfVersion ? ` · PDF ${report.pdfVersion}` : ''}
           {report.encrypted ? ' · encrypted' : ''}
         </div>
