@@ -62,6 +62,9 @@ interface RawBridge {
   startCompare(paramsJson: string): void;
   startNup(paramsJson: string): void;
   cancelOperation(toolKey: string): void;
+  getWorkspaceDir(): Promise<string>;
+  deleteFile(path: string): Promise<string>;
+  copyFile(srcPath: string, destPath: string): Promise<string>;
   openFolder(path: string): void;
   openFile(path: string): void;
   saveSetting(key: string, value: string): void;
@@ -270,6 +273,15 @@ export function connectQWebChannel(): Promise<void> {
         },
         cancel(toolKey) {
           raw.cancelOperation(toolKey);
+        },
+        async getWorkspaceDir() {
+          return safeJsonParse(await raw.getWorkspaceDir(), '');
+        },
+        async deleteFile(path) {
+          return safeJsonParse(await raw.deleteFile(path), { success: false });
+        },
+        async copyFile(srcPath, destPath) {
+          return safeJsonParse(await raw.copyFile(srcPath, destPath), { success: false });
         },
         openFolderPath(path) {
           raw.openFolder(path);

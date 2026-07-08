@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import platform
+import shutil
 import subprocess
+import tempfile
 import threading
 from dataclasses import asdict, is_dataclass
 from typing import Any
@@ -303,6 +305,7 @@ class Bridge(QObject):
         self._workers: dict[str, _Worker] = {}
         self._settings = QSettings("PDFCompress", "PDFCompress")
         self._qwebchannel_js_path = ""
+        self._workspace_dir: str | None = None
 
     def set_qwebchannel_js_path(self, path: str):
         """Store the path to qwebchannel.js for potential JS queries."""
@@ -852,6 +855,52 @@ class Bridge(QObject):
                 subprocess.Popen(["xdg-open", path])
         except Exception:
             log.exception("Failed to open file: %s", path)
+
+    # ── Workspace (persistent working document) ────────────────────
+    # Backs the frontend's WorkspaceContext: a single working document
+    # whose successive transform outputs replace each other in place
+    # (running-result model) rather than accumulating. All three slots
+    # are best-effort/synchronous, matching getMetadata/getToc's style.
+
+    @Slot(result=str)
+    def getWorkspaceDir(self) -> str:
+        """Return a per-process temp directory for workspace working
+        files, creating it on first use. Reused for the app's lifetime;
+        superseded working files are deleted individually by deleteFile
+        as the workspace advances (see WorkspaceContext.applyResult), so
+        this directory doesn't accumulate more than the current working
+        file(s) in normal use. Not removed on exit -- ordinary OS temp
+        directory cleanup handles it, same as any other tempfile
+        consumer.
+        """
+        if not self._workspace_dir or not os.path.isdir(self._workspace_dir):
+            self._workspace_dir = tempfile.mkdtemp(prefix="pdfcompress_workspace_")
+        return json.dumps(self._workspace_dir, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def deleteFile(self, path: str) -> str:
+        """Best-effort delete of a workspace-superseded temp file. Returns
+        JSON {success, error}. A missing file is not an error.
+        """
+        try:
+            if path and os.path.isfile(path):
+                os.remove(path)
+            return json.dumps({"success": True}, ensure_ascii=False)
+        except Exception as exc:
+            log.warning("deleteFile failed for %s: %s", path, exc)
+            return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, str, result=str)
+    def copyFile(self, src_path: str, dest_path: str) -> str:
+        """Copy the workspace's current working file out to a user-chosen
+        export path. Returns JSON {success, error}.
+        """
+        try:
+            shutil.copy2(src_path, dest_path)
+            return json.dumps({"success": True}, ensure_ascii=False)
+        except Exception as exc:
+            log.error("copyFile failed for %s -> %s: %s", src_path, dest_path, exc)
+            return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
     # ── Theme toggle (JS -> Python shell) ─────────────────────────
 

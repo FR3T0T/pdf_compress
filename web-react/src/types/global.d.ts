@@ -108,6 +108,14 @@ export interface RealBridgeAPI {
 
   cancel(toolKey: string): void;
 
+  // -- Workspace (persistent working document) ---------------------------
+  // Backs WorkspaceContext's running-result model: a per-process temp dir
+  // for successive transform outputs, plus best-effort cleanup/export of
+  // individual files. See ui/bridge.py's "Workspace" section.
+  getWorkspaceDir(): Promise<string>;
+  deleteFile(path: string): Promise<{ success: boolean; error?: string }>;
+  copyFile(srcPath: string, destPath: string): Promise<{ success: boolean; error?: string }>;
+
   // -- Shell helpers -----------------------------------------------------
   openFolderPath(path: string): void;
   openFilePath(path: string): void;

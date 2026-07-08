@@ -7,13 +7,21 @@ import type { DropZoneHandle } from '../../components/shared/DropZone';
 import { FileList } from '../../components/shared/FileList';
 import { ProgressPanel } from '../../components/shared/ProgressPanel';
 import { ResultsPanel } from '../../components/shared/ResultsPanel';
-import { Select, Slider, TextInput } from '../../components/shared/formControls';
+import { Checkbox, Select, Slider, TextInput } from '../../components/shared/formControls';
 import { useToast } from '../../components/shared/Toast';
 import { useHotkeys } from '../../bridge/useHotkeys';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
 import { usePageBusy } from '../../router/Router';
+import { useWorkspace } from '../../workspace/WorkspaceContext';
 import type { PickedFile } from '../../types/bridge';
+
+interface WorkspacePageImage {
+  index: number;
+  dataUrl: string;
+  width: number;
+  height: number;
+}
 
 interface WatermarkFileResult {
   file: string;
@@ -108,7 +116,40 @@ export function WatermarkPage() {
   const op = useOperation<WatermarkResult>('watermark');
   const dropRef = useRef<DropZoneHandle>(null);
 
+  // -- Workspace (persistent working document) -----------------------------
+  // See WorkspaceContext.tsx. `keepLoaded` only matters while the workspace
+  // has no document yet -- it decides whether the next file dropped here
+  // becomes the shared working document. Once workspace.path is set, this
+  // page shows the "already loaded" indicator instead of the drop zone,
+  // and Apply Watermark runs against the workspace document (running-result
+  // model) instead of the local `files` list. None of this touches the
+  // `files`-array code path below, which is exactly the pre-workspace
+  // normal-mode behavior.
+  const workspace = useWorkspace();
+  const [keepLoaded, setKeepLoaded] = useState(false);
+  const workspaceRunRef = useRef(false);
+  const [previewPages, setPreviewPages] = useState<WorkspacePageImage[]>([]);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
   usePageBusy(op.status === 'running');
+
+  // A file was dropped/picked while "keep loaded across tools" is checked
+  // and no workspace document exists yet -- that file becomes the working
+  // document. Local `files` is cleared since the workspace indicator takes
+  // over from here.
+  useEffect(() => {
+    if (keepLoaded && !workspace.path && files.length > 0) {
+      workspace.load(files[0].path);
+      setFiles([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keepLoaded, files, workspace.path]);
+
+  // A stale preview from before the latest run would misleadingly look
+  // current, so drop it as soon as the working document pointer moves.
+  useEffect(() => {
+    setPreviewPages([]);
+  }, [workspace.path]);
 
   useHotkeys({
     onAddFiles: () => dropRef.current?.open(),
@@ -143,6 +184,17 @@ export function WatermarkPage() {
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
       const res = op.result.results;
+      if (workspaceRunRef.current) {
+        workspaceRunRef.current = false;
+        const fr = res.files[0];
+        if (fr?.status === 'ok' && fr.outputPath) {
+          workspace.applyResult(fr.outputPath, `Watermark: "${text.trim()}" (${position})`);
+          toast.success('Watermark applied to the working document.');
+        } else {
+          toast.error(fr?.details || 'Watermark failed — working document unchanged.');
+        }
+        return;
+      }
       const okCount = res.files.filter((f) => f.status === 'ok').length;
       const errCount = res.files.length - okCount;
       if (errCount === 0) {
@@ -153,8 +205,10 @@ export function WatermarkPage() {
         toast.error('All files failed.');
       }
     } else if (op.status === 'error') {
+      workspaceRunRef.current = false;
       toast.error(op.error || 'An error occurred while applying watermark.');
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [op.status, op.result, op.error, toast]);
 
   function applyPreset(key: string) {
@@ -177,7 +231,7 @@ export function WatermarkPage() {
     }
   };
 
-  const canRun = files.length > 0 && op.status !== 'running';
+  const canRun = (workspace.path ? true : files.length > 0) && op.status !== 'running';
 
   const saveAllSettings = () => {
     bridgeApi.saveSetting(SETTINGS_KEYS.naming, naming);
@@ -200,13 +254,43 @@ export function WatermarkPage() {
   };
 
   const run = () => {
-    if (files.length === 0) {
-      toast.warning('Please add at least one PDF file.');
-      return;
-    }
     const trimmedText = text.trim();
     if (!trimmedText) {
       toast.warning('Please enter watermark text.');
+      return;
+    }
+
+    if (workspace.path) {
+      // Workspace mode: run on the current working document and, on
+      // success, advance the workspace pointer to a NEW temp file (never
+      // overwrite the previous working file — see WorkspaceContext).
+      const wsPath = workspace.path;
+      const opIndex = workspace.ops.length + 1;
+      workspaceRunRef.current = true;
+      op.run(async () => {
+        const wsDir = await bridgeApi.getWorkspaceDir();
+        bridgeApi.startWatermark({
+          files: [wsPath],
+          text: trimmedText,
+          opacity: opacityPct / 100,
+          rotation: parseInt(rotation, 10),
+          font_size: parseInt(fontSize, 10),
+          color: color.trim() || '#808080',
+          position,
+          mode,
+          page_range: pageRange.trim() || null,
+          output_dir: wsDir,
+          // Unique per call (regardless of input basename) so each run's
+          // output is a genuinely new file — contained_output_path doesn't
+          // dedupe, so a repeated name would silently overwrite.
+          naming: `{name}_ws${opIndex}`,
+        });
+      });
+      return;
+    }
+
+    if (files.length === 0) {
+      toast.warning('Please add at least one PDF file.');
       return;
     }
     saveAllSettings();
@@ -227,7 +311,32 @@ export function WatermarkPage() {
     );
   };
 
-  const r = op.status === 'done' ? op.result?.results : null;
+  const handlePreview = async () => {
+    if (!workspace.path) return;
+    setPreviewLoading(true);
+    const res = await bridgeApi.getPageImages(workspace.path);
+    setPreviewLoading(false);
+    if (!res.success || !res.pages) {
+      toast.error(res.error || 'Could not render a preview.');
+      return;
+    }
+    setPreviewPages(res.pages);
+  };
+
+  const handleExport = async () => {
+    if (!workspace.path) return;
+    const defaultName = (workspace.originalName || 'document.pdf').replace(/\.pdf$/i, '_workspace.pdf');
+    const dest = await bridgeApi.saveFile('PDF Files (*.pdf)', defaultName);
+    if (!dest) return;
+    const ok = await workspace.exportTo(dest);
+    if (ok) toast.success(`Exported to ${bridgeApi.basename(dest)}.`);
+    else toast.error('Export failed.');
+  };
+
+  // Suppressed in workspace mode -- the "already loaded" indicator card
+  // (ops count, Preview) communicates the result instead of the
+  // normal-mode batch ResultsPanel, which assumes a `files` array.
+  const r = op.status === 'done' && !workspace.path ? op.result?.results : null;
   const results = r
     ? {
         files: r.files.map((fr) => ({
@@ -244,20 +353,74 @@ export function WatermarkPage() {
     <div className="console">
       <PageHeader title="Watermark" subtitle="Add text watermarks to PDF pages" backButton={false} />
 
-      <DropZone
-        ref={dropRef}
-        files={files}
-        onFilesChanged={setFiles}
-        multiple
-        compact={files.length > 0}
-        title="Drop PDF files here"
-        subtitle="or click to browse — add as many as you need"
-        disabled={op.status === 'running'}
-      />
+      {workspace.path ? (
+        <Card>
+          <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)' }}>
+            Working document: {workspace.originalName} ({workspace.ops.length} operation
+            {workspace.ops.length === 1 ? '' : 's'} applied)
+          </div>
+          <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginTop: 4 }}>
+            Loaded across tools — Apply Watermark below builds on this file instead of a fresh upload.
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 'var(--space-3)', flexWrap: 'wrap' }}>
+            <button onClick={handlePreview} disabled={previewLoading} className="btn-ghost">
+              {previewLoading ? 'Rendering…' : 'Preview'}
+            </button>
+            <button onClick={handleExport} className="btn-ghost">
+              Export…
+            </button>
+            <button
+              onClick={() => {
+                workspace.clear();
+                setKeepLoaded(false);
+              }}
+              disabled={op.status === 'running'}
+              className="btn-ghost"
+            >
+              Clear working document
+            </button>
+          </div>
+          {previewPages.length > 0 && (
+            <div style={{ marginTop: 'var(--space-3)', display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+              {previewPages.map((p) => (
+                <div key={p.index}>
+                  <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginBottom: 4 }}>
+                    Page {p.index + 1}
+                  </div>
+                  <img
+                    src={p.dataUrl}
+                    width={p.width}
+                    height={p.height}
+                    alt={`Working document page ${p.index + 1}`}
+                    style={{ display: 'block', maxWidth: '100%', height: 'auto', border: '1px solid var(--border)' }}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      ) : (
+        <>
+          <DropZone
+            ref={dropRef}
+            files={files}
+            onFilesChanged={setFiles}
+            multiple={!keepLoaded}
+            compact={files.length > 0}
+            title="Drop PDF files here"
+            subtitle="or click to browse — add as many as you need"
+            disabled={op.status === 'running'}
+          />
 
-      <div style={{ marginTop: 8 }}>
-        <FileList files={files} onRemove={(i) => setFiles((fs) => fs.filter((_, idx) => idx !== i))} />
-      </div>
+          <div style={{ marginTop: 4 }}>
+            <Checkbox checked={keepLoaded} onChange={setKeepLoaded} label="Keep this file loaded across tools" />
+          </div>
+
+          <div style={{ marginTop: 8 }}>
+            <FileList files={files} onRemove={(i) => setFiles((fs) => fs.filter((_, idx) => idx !== i))} />
+          </div>
+        </>
+      )}
 
       <div style={{ marginTop: 'var(--space-3)' }}>
         <Card>
@@ -332,47 +495,53 @@ export function WatermarkPage() {
         </Card>
       </div>
 
-      <div style={{ marginTop: 'var(--space-3)' }}>
-        <Card>
-          <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)', marginBottom: 'var(--space-3)' }}>
-            Output
-          </div>
-          <div style={{ marginBottom: 'var(--space-3)' }}>
-            <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-2)', marginBottom: 6 }}>
-              Output folder
+      {!workspace.path && (
+        <div style={{ marginTop: 'var(--space-3)' }}>
+          <Card>
+            <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)', marginBottom: 'var(--space-3)' }}>
+              Output
             </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <span
-                className="mono"
-                style={{
-                  flex: 1,
-                  color: 'var(--text-2)',
-                  fontSize: 'var(--font-size-sm)',
-                  padding: '7px 10px',
-                  background: 'var(--panel-bg-elevated)',
-                  border: '1px solid var(--border-strong)',
-                  borderRadius: 'var(--radius-panel-sm)',
-                }}
-              >
-                {outputDir || 'Same as source file'}
-              </span>
-              <button onClick={pickOutputDir} disabled={op.status === 'running'} className="btn-ghost">
-                Browse
-              </button>
+            <div style={{ marginBottom: 'var(--space-3)' }}>
+              <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-2)', marginBottom: 6 }}>
+                Output folder
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <span
+                  className="mono"
+                  style={{
+                    flex: 1,
+                    color: 'var(--text-2)',
+                    fontSize: 'var(--font-size-sm)',
+                    padding: '7px 10px',
+                    background: 'var(--panel-bg-elevated)',
+                    border: '1px solid var(--border-strong)',
+                    borderRadius: 'var(--radius-panel-sm)',
+                  }}
+                >
+                  {outputDir || 'Same as source file'}
+                </span>
+                <button onClick={pickOutputDir} disabled={op.status === 'running'} className="btn-ghost">
+                  Browse
+                </button>
+              </div>
             </div>
-          </div>
-          <Field label="Naming template">
-            <TextInput value={naming} onChange={setNaming} placeholder="{name}_watermarked" />
-          </Field>
-          <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginTop: 4 }}>
-            Use {'{name}'} for original filename.
-          </div>
-        </Card>
-      </div>
+            <Field label="Naming template">
+              <TextInput value={naming} onChange={setNaming} placeholder="{name}_watermarked" />
+            </Field>
+            <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginTop: 4 }}>
+              Use {'{name}'} for original filename.
+            </div>
+          </Card>
+        </div>
+      )}
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 'var(--space-4)' }}>
         <span style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-sm)' }}>
-          {files.length > 0 ? `${files.length} file${files.length === 1 ? '' : 's'} selected` : ''}
+          {workspace.path
+            ? `Working document loaded${workspace.ops.length > 0 ? ` — ${workspace.ops.length} operation${workspace.ops.length === 1 ? '' : 's'} applied` : ''}`
+            : files.length > 0
+              ? `${files.length} file${files.length === 1 ? '' : 's'} selected`
+              : ''}
         </span>
         <button onClick={run} disabled={!canRun} className="btn-primary">
           {op.status === 'running' ? 'Applying…' : 'Apply Watermark'}
@@ -388,6 +557,7 @@ export function WatermarkPage() {
             filename={op.progress?.filename}
             onCancel={() => {
               bridgeApi.cancel('watermark');
+              workspaceRunRef.current = false;
               op.reset();
               toast.info('Watermark cancelled.');
             }}

@@ -650,6 +650,20 @@ export const bridgeApi = {
     window.BridgeAPI?.cancel(toolKey);
   },
 
+  // -- Workspace (persistent working document) -----------------------------
+  async getWorkspaceDir(): Promise<string> {
+    if (window.BridgeAPI) return window.BridgeAPI.getWorkspaceDir();
+    return 'C:\\Users\\demo\\AppData\\Local\\Temp\\pdfcompress_workspace_mock';
+  },
+  async deleteFile(path: string): Promise<{ success: boolean; error?: string }> {
+    if (window.BridgeAPI) return window.BridgeAPI.deleteFile(path);
+    return { success: true };
+  },
+  async copyFile(srcPath: string, destPath: string): Promise<{ success: boolean; error?: string }> {
+    if (window.BridgeAPI) return window.BridgeAPI.copyFile(srcPath, destPath);
+    return { success: true };
+  },
+
   // -- Shell helpers -------------------------------------------------------
   openFolderPath(path: string): void {
     window.BridgeAPI?.openFolderPath(path);

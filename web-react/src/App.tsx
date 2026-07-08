@@ -26,6 +26,7 @@ import { ToastProvider } from './components/shared/Toast';
 import { RouterProvider } from './router/Router';
 import type { RouteDef } from './router/Router';
 import { AppShell } from './shell/AppShell';
+import { WorkspaceProvider } from './workspace/WorkspaceContext';
 
 const routes: Record<string, RouteDef> = {
   home: { key: 'home', component: HomePage },
@@ -59,9 +60,15 @@ const routes: Record<string, RouteDef> = {
 export function App() {
   return (
     <ToastProvider>
-      <RouterProvider routes={routes}>
-        <AppShell routes={routes} />
-      </RouterProvider>
+      {/* Above RouterProvider/AppShell (not inside a tool page) so the
+          workspace's single working document survives navigating from
+          tool to tool — see WorkspaceContext.tsx. Phase 1: Watermark only;
+          Phase 2 turns the single document into an array of a few. */}
+      <WorkspaceProvider>
+        <RouterProvider routes={routes}>
+          <AppShell routes={routes} />
+        </RouterProvider>
+      </WorkspaceProvider>
     </ToastProvider>
   );
 }
