@@ -154,7 +154,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | CRY-01 | 🟡 Low | crypto | Decrypt raises non-`EPDFError` types on malformed headers | `epdf_crypto.py:442` | Open |
 | CRY-02 | 🟡 Low | crypto | Non-dict `kdf_params` bypasses validation → uncaught `TypeError` | `epdf_crypto.py:134` | Open |
 | TRN-02 | 🟡 Low | translate | Temp PNG leaks if `pix.save` fails before the cleanup try/finally | `pdf_translate.py:442` | Open |
-| BRG-02 | 🟡 Low | bridge | `deleteFile`/`copyFile` lack workspace-dir path containment | `ui/bridge.py:849` | Open |
+| BRG-02 | 🟡 Low | bridge | `deleteFile`/`copyFile` lack workspace-dir path containment | `ui/bridge.py:851` | ✅ Fixed |
 | BRG-03 | 🟡 Low | bridge | Slot-level param parse runs outside worker try/except → UI hangs | `ui/bridge.py:718` | Open |
 | CLI-02 | 🟡 Low | CLI | Batch: two inputs sharing a basename overwrite each other's output | `compress_pdf.py:128` | Open |
 | CLI-03 | 🟡 Low | CLI | `input()` at exit raises `EOFError` traceback on non-interactive stdin | `compress_pdf.py:211` | Open |
@@ -605,22 +605,28 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Fix:** Move `pix.save(tmp)` inside the try so the finally always runs.
 - **Verification:** CONFIRMED.
 
-#### BRG-02 — `deleteFile`/`copyFile` lack workspace-dir path containment
-- **Location:** `ui/bridge.py:849` (`deleteFile`), `:862` (`copyFile`).
-- **What:** `deleteFile`'s docstring scopes it to "a workspace-superseded temp
-  file", but the body does `if path and os.path.isfile(path): os.remove(path)`
-  with no check that `path` is inside `self._workspace_dir`. `copyFile` likewise
-  has no containment on `dest`. `contained_output_path` exists for exactly this but
-  isn't applied.
+#### BRG-02 — `deleteFile`/`copyFile` lack workspace-dir path containment ✅ Fixed
+- **Location:** `ui/bridge.py:851` (`deleteFile`), `:873` (`copyFile`); helper
+  `is_within_directory` at `pdf_ops.py:43`.
+- **What:** `deleteFile`'s docstring scoped it to "a workspace-superseded temp
+  file", but the body did `if path and os.path.isfile(path): os.remove(path)`
+  with no check that `path` was inside `self._workspace_dir`. `copyFile` likewise
+  had no containment on its source. `contained_output_path` existed for exactly
+  this but wasn't applied.
 - **Impact:** Defense-in-depth gap, **not** a demonstrated vuln: the only caller is
   the committed frontend which passes only workspace-dir paths; `os.remove` is
   guarded by `isfile` (no dir/glob); `copyFile`'s dest is a user-chosen export
   path. Unrelated to the network/offline invariant despite the finder's category.
-- **Fix:** Resolve `realpath` and require it inside `self._workspace_dir` (reuse
-  the `commonpath` check) before removing; consider the same for `copyFile`'s dest
-  or document it as an intentional export sink.
-- **Verification:** CONFIRMED. (Finder rated Medium/offline-invariant; downgraded
-  to Low/hardening.)
+- **Fix (applied):** Added a Qt-free boolean guard `is_within_directory(path,
+  base)` in `pdf_ops.py` (realpath + `commonpath`, never `startswith`, returns
+  `False` — never raises — on escape or a cross-root `commonpath` ValueError).
+  `deleteFile` now refuses (`{"success": False, "error": "refused: path outside
+  workspace"}`) unless `self._workspace_dir` is set and `path` is within it — the
+  "missing file is not an error" behaviour is kept for in-workspace paths.
+  `copyFile` requires `src_path` within the workspace; `dest_path` is left
+  deliberately unconstrained (the user's export sink). Tests:
+  `tests/test_pdf_ops.py::TestIsWithinDirectory` (incl. the sibling-prefix trap).
+- **Verification:** CONFIRMED; helper now covered by automated tests.
 
 #### BRG-03 — Slot param parse runs outside the worker try/except → UI hangs
 - **Location:** `ui/bridge.py:714-726` (`startTranslateText`), `:742-750`

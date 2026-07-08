@@ -2,6 +2,15 @@
 ## Unreleased
 
 ### Security
+- **Workspace file ops are now scoped to the workspace temp dir (BRG-02).** The
+  bridge's `deleteFile`/`copyFile` slots deleted/read whatever path they were
+  handed with no containment check. They now use a new Qt-free
+  `is_within_directory()` guard (`pdf_ops.py`, realpath + `commonpath` — not
+  `startswith`, so a sibling like `…/ws_evil` isn't treated as inside `…/ws`):
+  `deleteFile` refuses any path outside `self._workspace_dir`, and `copyFile`
+  requires its **source** to be inside it (the export **destination** stays
+  unconstrained by design). Defense-in-depth — no known exploit path. Added
+  `tests/test_pdf_ops.py::TestIsWithinDirectory`.
 - **Sanitiser now neutralises JavaScript/Launch/Submit hidden in `/Next` action
   chains (ANL-02).** `sanitize_pdf` judged each annotation only by its top-level
   `/A` `/S`, so an annotation with a benign `/URI` head (kept when
