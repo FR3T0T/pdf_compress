@@ -286,9 +286,6 @@ def _restore(text, saved):
     return text
 
 
-_LETTER_RE = re.compile(r'[A-Za-zÀ-ɏЀ-ӿ]')
-
-
 def translate_line(line, translate_fn, protect_terms=None):
     """Translate one line, protecting separators/emails/phones/acronyms/
     numbers/caller-supplied terms from the model. See module docstring
@@ -305,7 +302,11 @@ def translate_line(line, translate_fn, protect_terms=None):
         residual = masked
         for k in saved:
             residual = residual.replace(k, "")
-        if not _LETTER_RE.search(residual):
+        # Skip a fragment only when it holds no letter in ANY script -- i.e.
+        # it's purely digits/punctuation/whitespace/separators. str.isalpha()
+        # is Unicode-aware, so real words in CJK, Arabic, Devanagari, Bengali,
+        # etc. get translated too, not just Latin/Cyrillic (TRN-03).
+        if not any(ch.isalpha() for ch in residual):
             out.append(part)
             continue
         out.append(_restore(translate_fn(masked), saved))
