@@ -42,6 +42,16 @@
   to Fixed.
 
 ### Fixes
+- **PDF→PDF translation no longer aborts the whole document over one undetectable
+  block (TRN-01).** In `_translate_pdf_to_pdf`, a block that failed
+  `detect_language` under `source='auto'` (a page number, a year like `2024`, or a
+  <3-char fragment) raised `TranslationError` out of the loop, so `out.save()` was
+  never reached and no output was produced. Now, once the document language is
+  detected from an earlier block it's reused for later blocks, and the per-block
+  `translate_text` call is wrapped so an undetectable block is copied through
+  verbatim (logged at debug) instead of aborting — the document always reaches
+  `save()`. Added `tests/test_pdf_translate.py::TestTranslatePdfBlockResilience`.
+  Flips TRN-01 to Fixed.
 - **Translation from non-Latin/Cyrillic scripts no longer returns the source text
   unchanged (TRN-03).** `translate_line` gated on `_LETTER_RE =
   re.compile(r'[A-Za-zÀ-ɏЀ-ӿ]')` (Latin + Cyrillic only), so any fragment with no

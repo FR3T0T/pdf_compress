@@ -1,12 +1,26 @@
 """Tests for pdf_translate.py — the offline translation line router.
 
-Centred on TRN-03: ``translate_line`` must send real words in ANY script
-to the translator (not just Latin/Cyrillic) while still skipping fragments
-that are purely separators/digits/punctuation. Pure logic driven by a stub
-``translate_fn`` — no model, no network, Qt-free.
+Covers TRN-03 (``translate_line`` must send real words in ANY script to the
+translator, not just Latin/Cyrillic, while still skipping pure
+separators/digits/punctuation) and TRN-01 (PDF→PDF translation must not
+abort the whole document when one block fails language auto-detection).
+The TRN-03 tests are pure logic driven by a stub ``translate_fn``; the
+TRN-01 test needs PyMuPDF + a real PDF and is gated + monkeypatched so it
+runs offline and deterministically.
 """
 
-from pdf_translate import translate_line
+import os
+
+import pytest
+
+import pdf_translate
+from pdf_translate import _translate_pdf_to_pdf, translate_line
+
+try:
+    import fitz  # noqa: F401  (PyMuPDF — required by _translate_pdf_to_pdf)
+    _HAS_FITZ = True
+except Exception:
+    _HAS_FITZ = False
 
 
 class _Recorder:
@@ -77,3 +91,53 @@ class TestTranslateLineScriptGate:
             out = translate_line(frag, rec)
             assert rec.calls == []
             assert out == frag
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PDF→PDF block resilience (TRN-01)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _two_block_pdf(path) -> str:
+    """One-page PDF with two separate text blocks: a normal sentence and a
+    bare number (the kind that fails auto-detection)."""
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Hello world this is a full sentence here")
+    page.insert_text((72, 400), "2024")   # far apart → its own block
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestTranslatePdfBlockResilience:
+    def test_undetectable_block_does_not_abort_document(self, tmp_path, monkeypatch):
+        # The regression: a block that fails detect_language (a bare number,
+        # under source='auto') raised out of translate_text and aborted the
+        # whole document, so out.save() was never reached. Monkeypatch
+        # translate_text to raise on the number and translate the sentence,
+        # then assert the document still saves and both blocks survive.
+        src = _two_block_pdf(tmp_path / "in.pdf")
+        out = str(tmp_path / "out.pdf")
+
+        def _stub(text, target, source, protect_terms=None):
+            if "2024" in text:
+                raise pdf_translate.TranslationError("undetectable short block")
+            return {"translated": "XLATED", "source": "en", "target": target}
+
+        monkeypatch.setattr(pdf_translate, "translate_text", _stub)
+
+        result = _translate_pdf_to_pdf(src, out, target="es", source="auto",
+                                       progress=None, should_cancel=None)
+
+        # Core regression: the document completed and an output file exists.
+        assert os.path.isfile(out)
+        assert result["output"] == out
+        assert result["pages"] == 1
+
+        with fitz.open(out) as doc:
+            combined = "".join(page.get_text() for page in doc)
+        assert "XLATED" in combined        # sentence block was translated
+        assert "2024" in combined          # undetectable block preserved, not dropped
