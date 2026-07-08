@@ -28,6 +28,7 @@ imported lazily inside the functions that need them.
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
@@ -725,8 +726,11 @@ def analyze_document(path: str, password: Optional[str] = None) -> dict:
             ))
 
         # Run every scanner defensively — one failure must not abort the rest.
+        # (_scan_embedded_image_metadata is defined lower, in the image
+        # section, so it can reuse the standalone-image EXIF helpers.)
         for scan in (_scan_metadata, _scan_scripts_and_actions, _scan_links,
-                     _scan_embedded_files, _scan_forms, _scan_optional_content):
+                     _scan_embedded_files, _scan_forms, _scan_optional_content,
+                     _scan_embedded_image_metadata):
             try:
                 scan(pdf, res)
             except Exception as exc:
@@ -890,6 +894,41 @@ def _scan_image_authorship(tags: dict, res: AnalysisResult) -> None:
     ))
 
 
+def _read_exif_blocks(img) -> tuple[dict, dict, dict]:
+    """Resolve an open PIL image's EXIF into plain ``(tags, gps, ifd1)`` dicts.
+
+    Shared by :func:`analyze_image` (standalone files) and
+    :func:`_scan_embedded_image_metadata` (images pulled out of a PDF) so the
+    EXIF parsing lives in exactly one place. Each block is read defensively —
+    a malformed sub-IFD yields an empty dict rather than aborting the read.
+    """
+    from PIL import ExifTags
+
+    tags: dict = {}
+    gps: dict = {}
+    ifd1: dict = {}
+    try:
+        exif = img.getexif()
+        for tag_id, val in exif.items():
+            tags[ExifTags.TAGS.get(tag_id, tag_id)] = val
+        try:
+            for tag_id, val in exif.get_ifd(ExifTags.IFD.Exif).items():
+                tags.setdefault(ExifTags.TAGS.get(tag_id, tag_id), val)
+        except Exception:
+            pass
+        try:
+            gps = dict(exif.get_ifd(ExifTags.IFD.GPSInfo))
+        except Exception:
+            gps = {}
+        try:
+            ifd1 = dict(exif.get_ifd(ExifTags.IFD.IFD1))
+        except Exception:
+            ifd1 = {}
+    except Exception as exc:
+        log.warning("EXIF read failed: %s", exc)
+    return tags, gps, ifd1
+
+
 def analyze_image(path: str) -> dict:
     """Run the image privacy audit and return a JSON-ready dict.
 
@@ -917,7 +956,7 @@ def analyze_image(path: str) -> dict:
         file_size=size,
     )
 
-    from PIL import ExifTags, Image
+    from PIL import Image
 
     # Resolve the EXIF blocks once, then hand plain dicts to each scanner so
     # a single malformed block can't abort the rest.
@@ -926,22 +965,7 @@ def analyze_image(path: str) -> dict:
     ifd1: dict = {}
     try:
         with Image.open(path) as img:
-            exif = img.getexif()
-            for tag_id, val in exif.items():
-                tags[ExifTags.TAGS.get(tag_id, tag_id)] = val
-            try:
-                for tag_id, val in exif.get_ifd(ExifTags.IFD.Exif).items():
-                    tags.setdefault(ExifTags.TAGS.get(tag_id, tag_id), val)
-            except Exception:
-                pass
-            try:
-                gps = dict(exif.get_ifd(ExifTags.IFD.GPSInfo))
-            except Exception:
-                gps = {}
-            try:
-                ifd1 = dict(exif.get_ifd(ExifTags.IFD.IFD1))
-            except Exception:
-                ifd1 = {}
+            tags, gps, ifd1 = _read_exif_blocks(img)
     except Exception as exc:
         log.warning("EXIF read failed for %s: %s", path, exc)
 
@@ -958,6 +982,146 @@ def analyze_image(path: str) -> dict:
             log.warning("image scanner %s failed: %s", scan.__name__, exc)
 
     return res.to_dict()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Embedded-image EXIF (photos dropped into a PDF keep their metadata)
+# ════════════════════════════════════════════════════════════════════
+#
+#  A phone photo placed into a PDF is stored as a /DCTDecode (JPEG) stream
+#  whose bytes are the *original* file, EXIF and all -- so its GPS/camera
+#  metadata rides along invisibly. We recover the original bytes with
+#  read_raw_bytes() (NOT a re-encoded pixmap, which would strip EXIF) and
+#  reuse the standalone-image EXIF parsing. Verified empirically: EXIF/GPS
+#  survives round-tripping through PDF embedding. Non-JPEG images
+#  (Flate/CCITT/etc.) don't carry EXIF and are skipped.
+
+# Stream filters whose raw bytes are a complete, EXIF-bearing image file.
+_EXIF_IMAGE_FILTERS = {"/DCTDecode", "/JPXDecode"}
+
+
+def _image_filter_names(xobj) -> list:
+    """Return an image XObject's /Filter entries as a list of ``str`` names
+    (handles the single-Name and Array-of-Names forms)."""
+    filt = xobj.get("/Filter")
+    if filt is None:
+        return []
+    try:
+        if isinstance(filt, pikepdf.Array):
+            return [str(f) for f in filt]
+    except Exception:
+        pass
+    return [str(filt)]
+
+
+def _iter_image_xobjects(pdf: pikepdf.Pdf):
+    """Yield ``(page_index, name, xobject)`` for every image XObject reachable
+    from a page's resources, recursing into form XObjects.
+
+    Deduplicates by indirect-object identity (``objgen``) so an image reused
+    on many pages is visited exactly once — the caller gets each distinct
+    embedded image a single time.
+    """
+    seen = set()
+
+    def walk(resources, page_index, depth=0):
+        if resources is None or depth > 8:
+            return
+        try:
+            xobjs = resources.get("/XObject")
+        except Exception:
+            return
+        if xobjs is None:
+            return
+        for name, xobj in xobjs.items():
+            try:
+                subtype = str(xobj.get("/Subtype"))
+            except Exception:
+                continue
+            if subtype == "/Image":
+                og = xobj.objgen
+                if og in seen:
+                    continue
+                seen.add(og)
+                yield page_index, name, xobj
+            elif subtype == "/Form":
+                yield from walk(xobj.get("/Resources"), page_index, depth + 1)
+
+    for pi, page in enumerate(pdf.pages, 1):
+        try:
+            resources = page.get("/Resources")
+        except Exception:
+            continue
+        yield from walk(resources, pi)
+
+
+def _scan_embedded_image_metadata(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
+    """Surface EXIF GPS/camera metadata carried by embedded JPEG images."""
+    try:
+        from PIL import Image
+    except Exception:
+        return
+
+    gps_hits: list[str] = []
+    cam_hits: list[str] = []
+
+    for page_index, name, xobj in _iter_image_xobjects(pdf):
+        if not (_EXIF_IMAGE_FILTERS & set(_image_filter_names(xobj))):
+            continue
+        try:
+            raw = xobj.read_raw_bytes()          # original bytes — EXIF intact
+        except Exception:
+            continue
+        try:
+            with Image.open(io.BytesIO(raw)) as img:
+                tags, gps, _ifd1 = _read_exif_blocks(img)
+        except Exception:
+            continue
+
+        where = f"page {page_index}, image {str(name).lstrip('/')}"
+
+        lat, lon = gps.get(_GPS_LAT), gps.get(_GPS_LON)
+        if lat is not None and lon is not None:
+            try:
+                lat_dd = _dms_to_decimal(lat, gps.get(_GPS_LAT_REF))
+                lon_dd = _dms_to_decimal(lon, gps.get(_GPS_LON_REF))
+                gps_hits.append(f"{where}: {lat_dd:.6f}, {lon_dd:.6f}")
+            except Exception:
+                gps_hits.append(f"{where}: GPS coordinates present")
+
+        cam_bits: list[str] = []
+        device = (_exif_text(tags.get("Make")) + " " + _exif_text(tags.get("Model"))).strip()
+        if device:
+            cam_bits.append(device)
+        captured = _exif_text(tags.get("DateTimeOriginal")) or _exif_text(tags.get("DateTime"))
+        if captured:
+            cam_bits.append(captured)
+        software = _exif_text(tags.get("Software"))
+        if software:
+            cam_bits.append(software)
+        if cam_bits:
+            cam_hits.append(f"{where}: {' · '.join(cam_bits)}")
+
+    if gps_hits:
+        res.add(Finding(
+            id="location.embedded_image", category="location", severity="high",
+            title="Location data in an embedded image",
+            detail=(f"{len(gps_hits)} embedded image(s) carry GPS coordinates in "
+                    f"their EXIF metadata — revealing where the photo was taken. "
+                    f"A photo dropped into a PDF keeps its original camera "
+                    f"metadata even though it isn't visible on the page."),
+            count=len(gps_hits), items=gps_hits,
+        ))
+    if cam_hits:
+        res.add(Finding(
+            id="metadata.embedded_image", category="metadata", severity="medium",
+            title="Camera metadata in an embedded image",
+            detail=(f"{len(cam_hits)} embedded image(s) carry EXIF camera/capture "
+                    f"metadata (device, capture time, and/or editing software) "
+                    f"that can identify the source of the photo and when it was "
+                    f"taken."),
+            count=len(cam_hits), items=cam_hits,
+        ))
 
 
 # ════════════════════════════════════════════════════════════════════

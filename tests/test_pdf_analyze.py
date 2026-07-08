@@ -2,9 +2,10 @@
 
 Covers ANL-02 (sanitiser must follow ``/Next`` action chains), ANL-01
 (in-place sanitise on Windows), ANL-03 (invisible render-mode-3 text
-detection), ANL-04 (embedded-file detection + removal), and the Phase-1
-image metadata analyzer (analyze_image / analyze_file). pdf_analyze
-imports no Qt, so these run Qt-free (per CLAUDE.md).
+detection), ANL-04 (embedded-file detection + removal), the Phase-1 image
+metadata analyzer (analyze_image / analyze_file), and the embedded-image
+EXIF scanner (GPS/camera metadata inside JPEGs stored in a PDF).
+pdf_analyze imports no Qt, so these run Qt-free (per CLAUDE.md).
 """
 
 import os
@@ -504,3 +505,102 @@ class TestImageHelpers:
         res = AnalysisResult()
         _scan_image_thumbnail({}, res)
         assert res.findings == []
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Embedded-image EXIF (photos dropped into a PDF keep their metadata)
+# ═══════════════════════════════════════════════════════════════════
+#
+#  These need PyMuPDF to embed a JPEG as a /DCTDecode stream (the form that
+#  preserves the original EXIF bytes). The empirical round-trip — GPS
+#  written by PIL, embedded, then recovered by the scanner — is the whole
+#  point of the feature, so the tests exercise it end-to-end.
+
+
+def _gps_jpeg(path, *, with_gps: bool = True, camera: bool = True) -> str:
+    exif = Image.Exif()
+    if camera:
+        exif[0x010F] = "Canon"                       # Make
+        exif[0x0110] = "EOS 5D"                       # Model
+        exif[0x0132] = "2021:07:04 09:30:00"          # DateTime
+    if with_gps:
+        # 40°44'54.38"N, 73°59'8.5"W -> ~40.748439, ~-73.985694
+        exif[0x8825] = {1: "N", 2: (40.0, 44.0, 54.38),
+                        3: "W", 4: (73.0, 59.0, 8.5)}
+    kwargs = {"quality": 90}
+    if len(exif):
+        kwargs["exif"] = exif
+    Image.new("RGB", (64, 48), (10, 120, 200)).save(str(path), **kwargs)
+    return str(path)
+
+
+def _embed_jpeg_pdf(jpeg_path: str, out_path, *, pages: int = 1) -> str:
+    """Embed a JPEG into a PDF via PyMuPDF (stores it as a /DCTDecode stream,
+    preserving the original bytes + EXIF)."""
+    doc = fitz.open()
+    with open(jpeg_path, "rb") as fh:
+        data = fh.read()
+    for _ in range(pages):
+        page = doc.new_page(width=300, height=300)
+        page.insert_image(fitz.Rect(20, 20, 200, 160), stream=data)
+    doc.save(str(out_path))
+    doc.close()
+    return str(out_path)
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestEmbeddedImageExif:
+    def test_gps_jpeg_embedded_yields_high_location(self, tmp_path):
+        jpg = _gps_jpeg(tmp_path / "geo.jpg")
+        pdf = _embed_jpeg_pdf(jpg, tmp_path / "geo.pdf")
+
+        report = analyze_document(pdf)
+        assert report["overallRisk"] == "high"
+        loc = _finding(report, "location.embedded_image")
+        assert loc is not None and loc["severity"] == "high"
+        # EXIF survived embedding: the decoded coordinates are surfaced.
+        text = " ".join(loc["items"])
+        assert "40.7484" in text
+        assert "-73.9856" in text or "-73.9857" in text
+        assert "page 1" in text
+
+    def test_camera_metadata_surfaced_for_embedded_image(self, tmp_path):
+        jpg = _gps_jpeg(tmp_path / "cam.jpg", with_gps=False)
+        pdf = _embed_jpeg_pdf(jpg, tmp_path / "cam.pdf")
+
+        report = analyze_document(pdf)
+        assert "location.embedded_image" not in _finding_ids(report)
+        cam = _finding(report, "metadata.embedded_image")
+        assert cam is not None and cam["severity"] == "medium"
+        assert any("Canon" in it and "EOS 5D" in it for it in cam["items"])
+
+    def test_clean_embedded_jpeg_has_no_finding(self, tmp_path):
+        jpg = _gps_jpeg(tmp_path / "clean.jpg", with_gps=False, camera=False)
+        pdf = _embed_jpeg_pdf(jpg, tmp_path / "clean.pdf")
+
+        ids = _finding_ids(analyze_document(pdf))
+        assert "location.embedded_image" not in ids
+        assert "metadata.embedded_image" not in ids
+
+    def test_pdf_without_images_has_no_finding_and_no_error(self, tmp_path):
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), "just some text, no images")
+        src = str(tmp_path / "text.pdf")
+        doc.save(src)
+        doc.close()
+
+        ids = _finding_ids(analyze_document(src))
+        assert "location.embedded_image" not in ids
+        assert "metadata.embedded_image" not in ids
+
+    def test_same_image_on_two_pages_reported_once(self, tmp_path):
+        # The image reused on both pages is one shared XObject — dedup must
+        # collapse it to a single finding entry, not two.
+        jpg = _gps_jpeg(tmp_path / "dup.jpg")
+        pdf = _embed_jpeg_pdf(jpg, tmp_path / "dup.pdf", pages=2)
+
+        loc = _finding(analyze_document(pdf), "location.embedded_image")
+        assert loc is not None
+        assert loc["count"] == 1
+        assert len(loc["items"]) == 1
