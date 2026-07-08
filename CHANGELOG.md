@@ -2,6 +2,13 @@
 ## Unreleased
 
 ### Security
+- **Redact no longer advances the workspace with a round-tripped path (FE-03).**
+  `RedactPage`'s op-done handler fed `workspace.applyResult` the `output_path`
+  read back out of the backend result. It now advances the workspace with the
+  known-good path the frontend itself computed via `workspaceOutputPath()`
+  (stashed in a ref when the run launches), guarded on truthiness; the toast's
+  match/page counts still come from the backend result, and the non-workspace
+  file-output branch is unchanged. Frontend-only; `dist/` rebuilt.
 - **Workspace file ops are now scoped to the workspace temp dir (BRG-02).** The
   bridge's `deleteFile`/`copyFile` slots deleted/read whatever path they were
   handed with no containment check. They now use a new Qt-free

@@ -160,7 +160,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | CLI-03 | 🟡 Low | CLI | `input()` at exit raises `EOFError` traceback on non-interactive stdin | `compress_pdf.py:211` | Open |
 | CLI-04 | 🟡 Low | CLI | Not-found inputs omitted from summary counts / failure tally | `compress_pdf.py:115` | Open |
 | FE-02 | 🟡 Low | frontend | Workspace risk badge/findings never refreshed after a transform | `WorkspaceContext.tsx:123` | Open |
-| FE-03 | 🟡 Low | frontend | `RedactPage` advances workspace with an unguarded `output_path` | `RedactPage.tsx:180` | Open |
+| FE-03 | 🟡 Low | frontend | `RedactPage` advances workspace with an unguarded `output_path` | `RedactPage.tsx:191` | ✅ Fixed |
 | TST-03 | 🟡 Low | tests | Password protect/unlock round-trip untested | `pdf_ops.py:408` | Open |
 | TST-04 | 🟡 Low | tests | Backup-on-overwrite test asserts nothing when compression skips | `tests/test_engine.py:239` | Open |
 | DOC-01 | 🟡 Low | docs | README advertises a Windows context-menu + About dialog that no longer exist | `README.md:180` | Open |
@@ -690,19 +690,24 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   like `load`), or reset `scan` to a neutral state. *(Requires a `dist/` rebuild.)*
 - **Verification:** CONFIRMED.
 
-#### FE-03 — `RedactPage` advances workspace with an unguarded `output_path`
-- **Location:** `web-react/src/pages/tools/RedactPage.tsx:176-182`.
-- **What:** The done handler calls `workspace.applyResult(output_path, …)` without
-  first checking `output_path` is truthy — unlike every sibling page
-  (Crop/PageOps/Flatten/Nup/Metadata/Compress all guard it). If the backend ever
-  reported success with an empty `output_path`, the working document would be
-  silently dropped while a 'Redact' op is still appended.
+#### FE-03 — `RedactPage` advances workspace with an unguarded `output_path` ✅ Fixed
+- **Location:** `web-react/src/pages/tools/RedactPage.tsx:181-200` (done handler).
+- **What:** The done handler called `workspace.applyResult(output_path, …)` with
+  `output_path` read out of the **backend result** (`op.result.results`) — a value
+  that round-tripped through the bridge — rather than the known-good path the
+  frontend itself computed via `workspaceOutputPath(wsDir, wsPath, opIndex)`. It
+  also didn't guard truthiness, unlike every sibling page.
 - **Impact:** Defensive-consistency gap; **effectively unreachable** today (the
   backend echoes the caller-supplied path and any write failure raises → status
-  'error', not 'done'). One-line fix to match siblings.
-- **Fix:** Guard on `output_path` before `applyResult`; emit a failure toast
-  otherwise. *(Requires a `dist/` rebuild.)*
-- **Verification:** CONFIRMED.
+  'error', not 'done').
+- **Fix (applied):** `confirmRedact` now stashes the frontend-computed `outPath`
+  in `workspaceOutPathRef` when the workspace run launches; the done handler
+  advances the workspace with **that** trusted path (never the backend echo),
+  guarded on truthiness (failure toast otherwise). Counts for the toast still
+  come from the backend result. The non-workspace file-output branch is
+  unchanged. `dist/` rebuilt.
+- **Verification:** CONFIRMED. (No unit test on this path — validated by build +
+  a real-app redact→advance check.)
 
 #### TST-03 — Password protect/unlock round-trip untested
 - **Location:** `pdf_ops.py:408` (`protect_pdf`), `:452` (`unlock_pdf`).

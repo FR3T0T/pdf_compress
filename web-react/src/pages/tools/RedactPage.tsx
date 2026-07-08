@@ -142,6 +142,11 @@ export function RedactPage() {
   // works against the workspace document exactly like search-terms mode.
   const workspace = useWorkspace();
   const workspaceRunRef = useRef(false);
+  // The frontend-computed, known-good output path for the in-flight workspace
+  // run (inside the workspace dir, via workspaceOutputPath). The done handler
+  // advances the workspace with THIS, never the path echoed back in the
+  // backend result — never trust a round-tripped path (FE-03).
+  const workspaceOutPathRef = useRef<string | null>(null);
 
   usePageBusy(op.status === 'running');
   useWorkspaceBusy(op.status === 'running' && !!workspace.path);
@@ -174,16 +179,26 @@ export function RedactPage() {
 
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
-      const { output_path, redaction_count, pages_affected } = op.result.results;
+      const { redaction_count, pages_affected } = op.result.results;
       if (workspaceRunRef.current) {
         workspaceRunRef.current = false;
-        workspace.applyResult(output_path, `Redact (${mode})`);
-        toast.success(`Redaction complete: ${redaction_count} matches redacted across ${pages_affected} page(s).`);
+        // Advance the workspace with the path THIS page computed, not the one
+        // the backend echoed back in the result (FE-03). Counts for the toast
+        // still come from the backend result.
+        const trustedOut = workspaceOutPathRef.current;
+        workspaceOutPathRef.current = null;
+        if (trustedOut) {
+          workspace.applyResult(trustedOut, `Redact (${mode})`);
+          toast.success(`Redaction complete: ${redaction_count} matches redacted across ${pages_affected} page(s).`);
+        } else {
+          toast.error('Redaction succeeded but the working document could not be updated.');
+        }
         return;
       }
       toast.success(`Redaction complete: ${redaction_count} matches redacted across ${pages_affected} page(s).`);
     } else if (op.status === 'error') {
       workspaceRunRef.current = false;
+      workspaceOutPathRef.current = null;
       toast.error(op.error || 'An error occurred during redaction.');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -238,6 +253,8 @@ export function RedactPage() {
       op.run(async () => {
         const wsDir = await bridgeApi.getWorkspaceDir();
         const outPath = workspaceOutputPath(wsDir, wsPath, opIndex);
+        // Stash the known-good path for the done handler (FE-03).
+        workspaceOutPathRef.current = outPath;
         bridgeApi.startRedact(
           mode === 'terms'
             ? { file: wsPath, output_path: outPath, search_terms: searchTerms, case_sensitive: caseSensitive }
