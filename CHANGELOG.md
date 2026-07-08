@@ -51,6 +51,12 @@
   to Fixed.
 
 ### Fixes
+- **OCR fallback no longer leaks a temp PNG when the page rasterize/save fails
+  (TRN-02).** In `_extract_pages`, `pix.save(tmp)` ran before the try/finally that
+  unlinks the mkstemp'd file, so if the save raised (disk full, PyMuPDF error) the
+  temp `.png` was orphaned — accumulating on large scanned docs where saves
+  repeatedly fail. The save is now inside the try, so cleanup always runs. Added
+  `tests/test_pdf_translate.py::TestExtractPagesTempCleanup`.
 - **Offline text/image translation no longer hangs the UI on a malformed request
   (BRG-03).** `startTranslateText` / `startTranslateImage` read their required
   params (`text`/`path`, `target`) on the UI thread before dispatching the

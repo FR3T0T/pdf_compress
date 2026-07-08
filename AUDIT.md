@@ -154,7 +154,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | OPS-05 | 🟡 Low | pdf_ops | `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality" | `pdf_ops.py:593` | Open |
 | CRY-01 | 🟡 Low | crypto | Decrypt raises non-`EPDFError` types on malformed headers | `epdf_crypto.py:442` | Open |
 | CRY-02 | 🟡 Low | crypto | Non-dict `kdf_params` bypasses validation → uncaught `TypeError` | `epdf_crypto.py:134` | Open |
-| TRN-02 | 🟡 Low | translate | Temp PNG leaks if `pix.save` fails before the cleanup try/finally | `pdf_translate.py:442` | Open |
+| TRN-02 | 🟡 Low | translate | Temp PNG leaks if `pix.save` fails before the cleanup try/finally | `pdf_translate.py:450` | ✅ Fixed |
 | BRG-02 | 🟡 Low | bridge | `deleteFile`/`copyFile` lack workspace-dir path containment | `ui/bridge.py:851` | ✅ Fixed |
 | BRG-03 | 🟡 Low | bridge | Slot-level param parse runs outside worker try/except → UI hangs | `ui/bridge.py:722` | ✅ Fixed |
 | CLI-02 | 🟡 Low | CLI | Batch: two inputs sharing a basename overwrite each other's output | `compress_pdf.py:128` | Open |
@@ -631,16 +631,20 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   otherwise) before the merge.
 - **Verification:** CONFIRMED.
 
-#### TRN-02 — Temp PNG leak if `pix.save` fails
-- **Location:** `pdf_translate.py:441-448` (`_extract_pages`, OCR fallback).
-- **What:** `mkstemp()` creates the file, then `pix.save(tmp)` runs **before** the
-  try/finally that guarantees `os.unlink(tmp)`. If `pix.save` raises (disk full,
-  PyMuPDF error), the temp file is orphaned; the outer handler logs but doesn't
+#### TRN-02 — Temp PNG leak if `pix.save` fails ✅ Fixed
+- **Location:** `pdf_translate.py:450` (`_extract_pages`, OCR fallback).
+- **What:** `mkstemp()` creates the file, then `pix.save(tmp)` ran **before** the
+  try/finally that guarantees `os.unlink(tmp)`. If `pix.save` raised (disk full,
+  PyMuPDF error), the temp file was orphaned; the outer handler logged but didn't
   clean up.
 - **Impact:** One leaked temp PNG per failing page; accumulates on a large scanned
   doc where saves repeatedly fail. Offline app, no security angle.
-- **Fix:** Move `pix.save(tmp)` inside the try so the finally always runs.
-- **Verification:** CONFIRMED.
+- **Fix (applied):** Moved `pix.save(tmp)` inside the try so the finally always
+  runs; `mkstemp`/`os.close(fd)` stay before it so `tmp` is defined for the
+  finally. Regression test:
+  `tests/test_pdf_translate.py::TestExtractPagesTempCleanup` (monkeypatches
+  `fitz.Pixmap.save` to raise and asserts no temp PNG is left behind).
+- **Verification:** CONFIRMED; now covered by an automated test.
 
 #### BRG-02 — `deleteFile`/`copyFile` lack workspace-dir path containment ✅ Fixed
 - **Location:** `ui/bridge.py:851` (`deleteFile`), `:873` (`copyFile`); helper
