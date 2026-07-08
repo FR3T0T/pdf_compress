@@ -1,17 +1,45 @@
 # Changelog
-## Unreleased
+## v4.22
 
-Frontend parity pass — brought the React app to full parity with the old
-vanilla-JS frontend, then retired the latter.
+A new **multi-tool workspace**, a frontend parity pass (the React app reached
+full parity with the old vanilla-JS frontend, now retired), and a Linux CI fix.
+
+### Multi-tool workspace (new)
+- **Load a document once and carry it across tools (running-result model).** A
+  persistent workspace bar holds one working document. Transforming tools
+  (Watermark, Compress, Page Numbers, Rotate, Crop, Flatten, Redact, Protect,
+  Metadata, N-up, Repair, Unlock) advance it in place; terminal tools (Split,
+  PDF-to-Images, PDF-to-Word, Extract Text/Images) produce side-outputs without
+  changing it; Analyze reads it read-only. Includes an enlargeable full-screen
+  preview with keyboard paging, and an automatic scan-on-load risk audit that
+  warns on load (framed as detection, not a safety guarantee). New bridge slots
+  `getWorkspaceDir` / `deleteFile` / `copyFile` back it with a per-process temp
+  working directory, cleaning up superseded working files as the workspace
+  advances.
 
 ### Fixes
 - **Batch compression no longer overwrites a single output path.**
   `startCompress` applied one explicit `outputPath` to every file in a batch,
   so all files wrote to the same path. It now builds a distinct per-file path
-  from an optional `outputDir` + `naming` template (`_compress_output_path` in
-  `ui/bridge.py`), applies an explicit `outputPath` only to single-file calls,
-  and otherwise defaults to `<name>_compressed.pdf` beside the source. Added
-  `tests/test_bridge.py`.
+  from an optional `outputDir` + `naming` template (`compress_output_path` in
+  `compress_paths.py`), applies an explicit `outputPath` only to single-file
+  calls, and otherwise defaults to `<name>_compressed.pdf` beside the source.
+  Added `tests/test_bridge.py`.
+- **Linux CI no longer fails at test collection.** `tests/test_bridge.py`
+  imported the compress path helper from `ui.bridge`, which pulls in the PySide6
+  GUI stack (`ui/__init__` → `web_shell` → Qt). On the headless Ubuntu runner
+  those libraries can't load (`libEGL.so.1` missing), so pytest errored the whole
+  test job at collection — on both Python 3.10 and 3.12 — before any test ran.
+  (Latent since the test was introduced with the batch-compression fix above;
+  the workspace merge surfaced it, but did not cause it — the Linux matrix had
+  been red on `main` for a while.) The pure helper now lives in the Qt-free
+  `compress_paths.py`, so the suite imports no Qt at all, and the PyInstaller
+  spec's `hiddenimports` gains `compress_paths`. As defense-in-depth the CI
+  workflow also installs Qt's runtime libs (`libegl1`, `libgl1`, `libxkbcommon0`,
+  `libdbus-1-3`) and sets `QT_QPA_PLATFORM=offscreen` on Linux, so future
+  integration tests that construct the Bridge or a `QApplication` can run
+  headless. The README gains a **Development** section documenting the
+  test/lint/CI workflow and the Qt-free-helper convention.
 
 ### React frontend parity
 - **Merge** shows each file's page count as it's added.

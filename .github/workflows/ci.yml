@@ -44,10 +44,24 @@ jobs:
             requirements-dev.txt
       - name: Install dependencies
         # requirements.txt pulls the full runtime (incl. numpy + python-docx,
-        # which several tests exercise). The GUI/Qt stack installs but the test
-        # suite never imports it, so no display server is needed.
+        # which several tests exercise). The unit suite itself is pure-Python
+        # and imports no Qt -- the compress path helper lives in the Qt-free
+        # compress_paths.py precisely so tests/test_bridge.py can run headless.
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
+      - name: Install Qt runtime libraries (Linux)
+        # Not needed by the current pure-Python suite, but installed so future
+        # integration tests can `import PySide6` / construct the Bridge or a
+        # QApplication on the headless Ubuntu runner. Qt's shared libraries
+        # dlopen these at import time (e.g. libEGL.so.1), which the slim runner
+        # image doesn't ship. No-op on Windows (Qt bundles its own DLLs).
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
       - name: Run tests
+        # QT_QPA_PLATFORM=offscreen lets any Qt objects a future test builds
+        # run without a display server. Harmless for the current suite, which
+        # never constructs a QApplication.
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: pytest -q --cov=. --cov-report=term-missing

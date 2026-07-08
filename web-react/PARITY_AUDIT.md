@@ -89,8 +89,8 @@ Severity: 🟡 minor UX · ⚪ cosmetic/behavioral. None are functional breakage
 - [x] **Compress output controls / batch overwrite.** ~~The vanilla page's
   "Output Folder" / "Output Suffix" controls were silently non-functional:
   `startCompress` read `outputPath` (singular) and applied it to every file in
-  a batch, so a shared path would overwrite.~~ **Fixed in `ui/bridge.py`:**
-  `_compress_output_path()` honors `outputDir` + a `naming` template to build a
+  a batch, so a shared path would overwrite.~~ **Fixed in `compress_paths.py`:**
+  `compress_output_path()` honors `outputDir` + a `naming` template to build a
   distinct path per file, applies a single explicit `outputPath` only to
   single-file calls, and otherwise defaults to `<name>_compressed.pdf` beside
   the source. Covered by `tests/test_bridge.py`. The React page doesn't yet

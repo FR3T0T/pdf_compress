@@ -64,6 +64,7 @@ hiddenimports = [
     "numpy",
     "docx",
     # App modules
+    "compress_paths",
     "engine",
     "pdf_ops",
     "epdf_crypto",

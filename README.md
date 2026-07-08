@@ -2,7 +2,7 @@
 
 Fully offline PDF toolkit with 22 professional tools — compress, merge, split, convert, protect, redact, watermark, and more. DPI-aware image recompression, AES-256 encryption, and PDF/A compliance. No cloud services, no accounts, no tracking.
 
-**v4.21**
+**v4.22**
 
 ---
 
@@ -39,6 +39,24 @@ npm run build
 ```
 
 The original vanilla-JS frontend has been fully retired now that the React app is at feature parity.
+
+---
+
+## Development
+
+Tests and linting run in CI on a matrix of Linux + Windows, Python 3.10 and 3.12:
+
+```bash
+pip install -r requirements-dev.txt   # pytest, pytest-cov, ruff
+pytest                                 # run the test suite
+ruff check .                           # lint (import order, unused code, bugbear)
+```
+
+Pure, unit-testable logic is kept in **top-level modules that import no Qt/PySide6**
+(e.g. `compress_paths.py`), so the suite runs headless without a graphics stack.
+Importing anything under `ui/` pulls in the Qt GUI stack (`ui/__init__` → `web_shell`
+→ QtWebEngine), which a headless CI runner can't load — so tests import the pure
+helpers directly instead of through `ui.bridge`.
 
 ---
 
@@ -227,6 +245,7 @@ Text and vector graphics are never modified.
 |------|---------|
 | `app.py` | Application entry point and icon generation |
 | `engine.py` | Compression engine (shared by GUI and CLI) |
+| `compress_paths.py` | Pure compression output-path resolution (Qt-free; unit-tested by `tests/test_bridge.py`) |
 | `pdf_ops.py` | PDF operations (merge, split, protect, watermark, etc.) |
 | `epdf_crypto.py` | Enhanced encryption engine (.epdf format — ChaCha20, AES-256, Camellia; header-authenticated v2) |
 | `pdf_analyze.py` | Offline privacy/security audit + sanitizer engine |
@@ -241,7 +260,10 @@ Text and vector graphics are never modified.
 | `ui/tool_registry.py` | Centralized tool metadata and categories |
 | `web-react/` | Frontend — React + Vite + TypeScript (source + committed `dist/` build) |
 | `assets/fonts/` | Bundled fonts (DejaVu Sans) for image-preserving PDF translation output |
-| `requirements.txt` | Python dependencies |
+| `tests/` | Pytest suite (pure-Python, no Qt import required) |
+| `.github/workflows/ci.yml` | CI — ruff lint + pytest matrix (Linux/Windows, py3.10/3.12) |
+| `requirements.txt` | Python runtime dependencies |
+| `requirements-dev.txt` | Dev/test dependencies (pytest, pytest-cov, ruff) |
 
 ---
 

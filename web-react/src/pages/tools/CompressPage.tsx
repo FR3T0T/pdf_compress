@@ -44,7 +44,7 @@ interface CompressResultItem {
  * Output location: this page sends no output path, so each file is written
  * as `<name>_compressed.pdf` beside its source. The backend now supports
  * per-file batch output too — startCompress honors `outputDir` and a
- * `naming` template (via `_compress_output_path` in ui/bridge.py), and only
+ * `naming` template (via `compress_output_path` in compress_paths.py), and only
  * applies a single explicit `outputPath` to single-file calls (a batch used
  * to overwrite one shared path — fixed). Output Folder / naming controls
  * could be re-added here on top of that; deliberately left out for now.
