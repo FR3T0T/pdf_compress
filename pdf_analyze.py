@@ -750,6 +750,239 @@ def analyze_document(path: str, password: Optional[str] = None) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════
+#  Image analysis (JPEG / PNG metadata privacy)
+# ════════════════════════════════════════════════════════════════════
+#
+#  Reuses Finding / AnalysisResult so analyze_image() returns the exact
+#  same JSON shape as analyze_document() -- the frontend renders both
+#  identically. Uses Pillow (already a dependency); nothing here makes a
+#  network request. Phase 1 is backend + tests only (no bridge/UI wiring).
+
+_JPEG_MAGIC = b"\xff\xd8\xff"
+_PNG_MAGIC = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
+
+# EXIF tag ids inside the GPS sub-IFD (see PIL.ExifTags.GPSTAGS).
+_GPS_LAT_REF, _GPS_LAT, _GPS_LON_REF, _GPS_LON = 1, 2, 3, 4
+# Thumbnail markers in the IFD1 (first-IFD) block.
+_THUMB_OFFSET, _THUMB_LENGTH = 513, 514  # JPEGInterchangeFormat[/Length]
+
+
+def _exif_text(v: Any) -> str:
+    """Coerce an EXIF value to a clean display string.
+
+    Handles the Windows ``XP*`` tags (UTF-16LE, delivered as raw ``bytes``
+    or a tuple of byte ints) and ordinary string/byte tags; strips embedded
+    NULs and surrounding whitespace.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        for enc in ("utf-16-le", "utf-8", "latin-1"):
+            try:
+                return v.decode(enc).replace("\x00", "").strip()
+            except Exception:
+                continue
+        return ""
+    if isinstance(v, tuple):
+        try:
+            raw = bytes(b & 0xFF for b in v)
+            return raw.decode("utf-16-le", "ignore").replace("\x00", "").strip()
+        except Exception:
+            return str(v).strip()
+    return str(v).replace("\x00", "").strip()
+
+
+def _dms_to_decimal(dms, ref) -> float:
+    """Convert an EXIF GPS (degrees, minutes, seconds) triple + hemisphere
+    ref ('N'/'S'/'E'/'W') to signed decimal degrees."""
+    deg, minute, sec = (float(x) for x in dms)
+    dd = deg + minute / 60.0 + sec / 3600.0
+    if ref is not None and str(ref).strip().upper() in ("S", "W"):
+        dd = -dd
+    return dd
+
+
+def _scan_image_gps(gps: dict, res: AnalysisResult) -> None:
+    """GPS coordinates — the headline privacy leak in a photo."""
+    if not gps:
+        return
+    lat, lat_ref = gps.get(_GPS_LAT), gps.get(_GPS_LAT_REF)
+    lon, lon_ref = gps.get(_GPS_LON), gps.get(_GPS_LON_REF)
+    if lat is None or lon is None:
+        return
+    try:
+        lat_dd = _dms_to_decimal(lat, lat_ref)
+        lon_dd = _dms_to_decimal(lon, lon_ref)
+        detail = (f"GPS coordinates are embedded in this image "
+                  f"({lat_dd:.6f}, {lon_dd:.6f}). Anyone with the file can see "
+                  f"exactly where the photo was taken.")
+        items = [f"Latitude: {lat_dd:.6f}", f"Longitude: {lon_dd:.6f}"]
+    except Exception:
+        detail = ("GPS location tags are embedded in this image, revealing "
+                  "where the photo was taken.")
+        items = []
+    res.add(Finding(
+        id="location.gps", category="location", severity="high",
+        title="Photo location embedded",
+        detail=detail, count=1, items=items,
+    ))
+
+
+def _scan_image_camera(tags: dict, res: AnalysisResult) -> None:
+    """Camera make/model, capture timestamp, and editing-software traces."""
+    items: list[str] = []
+    make = _exif_text(tags.get("Make"))
+    model = _exif_text(tags.get("Model"))
+    device = (make + " " + model).strip()
+    if device:
+        items.append(f"Device: {device}")
+    captured = _exif_text(tags.get("DateTimeOriginal")) or _exif_text(tags.get("DateTime"))
+    if captured:
+        items.append(f"Captured: {captured}")
+    software = _exif_text(tags.get("Software"))
+    if software:
+        items.append(f"Software: {software}")
+    if not items:
+        return
+    res.add(Finding(
+        id="metadata.camera", category="metadata", severity="medium",
+        title="Camera and capture details",
+        detail="EXIF metadata reveals the device, capture time, and/or "
+               "editing software. This can identify the source of the photo "
+               "and when it was taken.",
+        count=len(items), items=items,
+    ))
+
+
+def _scan_image_thumbnail(ifd1: dict, res: AnalysisResult) -> None:
+    """Embedded thumbnail (in the EXIF IFD1 block). It may show a pre-edit /
+    pre-crop version of the picture, since thumbnails aren't always
+    regenerated when the main image is changed."""
+    if not ifd1 or not (_THUMB_OFFSET in ifd1 or _THUMB_LENGTH in ifd1):
+        return
+    res.add(Finding(
+        id="content.thumbnail", category="content", severity="medium",
+        title="Embedded thumbnail",
+        detail="The image contains an embedded thumbnail preview. Thumbnails "
+               "are often not updated when the main image is edited or "
+               "cropped, so they can reveal an earlier version of the picture.",
+        count=1,
+    ))
+
+
+def _scan_image_authorship(tags: dict, res: AnalysisResult) -> None:
+    """Author / copyright / description metadata."""
+    items: list[str] = []
+    for tag, label in (("Artist", "Artist"), ("Copyright", "Copyright"),
+                       ("XPAuthor", "Author"), ("XPComment", "Comment"),
+                       ("ImageDescription", "Description")):
+        text = _exif_text(tags.get(tag))
+        if text:
+            items.append(f"{label}: {text}")
+    if not items:
+        return
+    res.add(Finding(
+        id="metadata.authorship", category="metadata", severity="low",
+        title="Author / copyright metadata",
+        detail="The image carries authorship or descriptive metadata that "
+               "can identify the creator or add hidden notes.",
+        count=len(items), items=items,
+    ))
+
+
+def analyze_image(path: str) -> dict:
+    """Run the image privacy audit and return a JSON-ready dict.
+
+    Mirrors :func:`analyze_document` exactly (same AnalysisResult / Finding
+    shape) for JPEG and PNG files. Surfaces GPS location, camera/capture
+    details, embedded thumbnails, and authorship metadata. A file with no
+    sensitive metadata yields no findings (overallRisk "info"), same as a
+    clean PDF.
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+
+    size = os.path.getsize(path)
+    if size > MAX_FILE_SIZE:
+        raise ValueError(f"File too large: {_fmt_size(size)} (max 2 GB)")
+
+    with open(path, "rb") as fh:
+        head = fh.read(8)
+    if not (head.startswith(_JPEG_MAGIC) or head.startswith(_PNG_MAGIC)):
+        raise ValueError("Not a supported image (expected JPEG or PNG)")
+
+    res = AnalysisResult(
+        file_name=os.path.basename(path),
+        file_path=path,
+        file_size=size,
+    )
+
+    from PIL import ExifTags, Image
+
+    # Resolve the EXIF blocks once, then hand plain dicts to each scanner so
+    # a single malformed block can't abort the rest.
+    tags: dict = {}
+    gps: dict = {}
+    ifd1: dict = {}
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            for tag_id, val in exif.items():
+                tags[ExifTags.TAGS.get(tag_id, tag_id)] = val
+            try:
+                for tag_id, val in exif.get_ifd(ExifTags.IFD.Exif).items():
+                    tags.setdefault(ExifTags.TAGS.get(tag_id, tag_id), val)
+            except Exception:
+                pass
+            try:
+                gps = dict(exif.get_ifd(ExifTags.IFD.GPSInfo))
+            except Exception:
+                gps = {}
+            try:
+                ifd1 = dict(exif.get_ifd(ExifTags.IFD.IFD1))
+            except Exception:
+                ifd1 = {}
+    except Exception as exc:
+        log.warning("EXIF read failed for %s: %s", path, exc)
+
+    scanners = (
+        (_scan_image_gps, gps),
+        (_scan_image_camera, tags),
+        (_scan_image_thumbnail, ifd1),
+        (_scan_image_authorship, tags),
+    )
+    for scan, data in scanners:
+        try:
+            scan(data, res)
+        except Exception as exc:
+            log.warning("image scanner %s failed: %s", scan.__name__, exc)
+
+    return res.to_dict()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Public API — dispatcher (PDF vs image)
+# ════════════════════════════════════════════════════════════════════
+
+def analyze_file(path: str, password: Optional[str] = None) -> dict:
+    """Sniff the file type and route to the right analyzer.
+
+    ``%PDF-`` → :func:`analyze_document`; JPEG/PNG → :func:`analyze_image`.
+    Raises ValueError for anything else. (Phase 1: defined but not yet wired
+    into the bridge — that's Phase 2.)
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    with open(path, "rb") as fh:
+        head = fh.read(8)
+    if head.startswith(b"%PDF-"):
+        return analyze_document(path, password=password)
+    if head.startswith(_JPEG_MAGIC) or head.startswith(_PNG_MAGIC):
+        return analyze_image(path)
+    raise ValueError("Unsupported file type (expected PDF, JPEG, or PNG)")
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Public API — sanitize
 # ════════════════════════════════════════════════════════════════════
 
