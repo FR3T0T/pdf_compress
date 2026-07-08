@@ -58,6 +58,11 @@ Importing anything under `ui/` pulls in the Qt GUI stack (`ui/__init__` → `web
 → QtWebEngine), which a headless CI runner can't load — so tests import the pure
 helpers directly instead of through `ui.bridge`.
 
+**Known issues:** [`AUDIT.md`](AUDIT.md) is a standing code-audit snapshot of the
+current known open findings (severity, evidence, and suggested fixes) across every
+subsystem. Skim the relevant entries before working on a module, and update a
+finding's Status there when you fix it.
+
 ---
 
 ## Usage
@@ -262,6 +267,7 @@ Text and vector graphics are never modified.
 | `assets/fonts/` | Bundled fonts (DejaVu Sans) for image-preserving PDF translation output |
 | `tests/` | Pytest suite (pure-Python, no Qt import required) |
 | `.github/workflows/ci.yml` | CI — ruff lint + pytest matrix (Linux/Windows, py3.10/3.12) |
+| `AUDIT.md` | Standing code-audit snapshot — known open findings by severity, with evidence and suggested fixes |
 | `requirements.txt` | Python runtime dependencies |
 | `requirements-dev.txt` | Dev/test dependencies (pytest, pytest-cov, ruff) |
 

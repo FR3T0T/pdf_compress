@@ -1,4 +1,17 @@
 # Changelog
+## Unreleased
+
+### Docs
+- **Added `AUDIT.md`** — a point-in-time code-audit snapshot of v4.22 (~40 open
+  findings across the engine, PDF ops, crypto, analyze, translate, bridge, CLI,
+  frontend, tests, docs, and packaging), each adversarially verified against the
+  source, with severity, evidence, and a suggested fix. Nothing is fixed yet — it's
+  the shared "where we stand" reference. Linked from `README.md` (Development
+  section + Files table) and folded into `CLAUDE.md`'s doc-currency rules.
+- **`CLAUDE.md` / `README.md`** — contributors now consult the relevant `AUDIT.md`
+  findings before touching a subsystem and flip a finding's **Status** when they
+  fix it (recording the fix in this changelog too).
+
 ## v4.22
 
 A new **multi-tool workspace**, a frontend parity pass (the React app reached
