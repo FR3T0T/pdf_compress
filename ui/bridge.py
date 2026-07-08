@@ -316,15 +316,29 @@ class Bridge(QObject):
         # must NOT set the current cancel event here.
 
         worker = _Worker(tool_key, func, args, kwargs, parent=self)
+        # The cancel event for THIS run, installed by _make_cancel_event just
+        # before this call. Captured so cleanup can verify it's still the one
+        # registered under tool_key before removing it (see _on_finished).
+        my_evt = self._cancel_events.get(tool_key)
 
         def _on_progress(payload: str):
             self.progressUpdate.emit(payload)
 
         def _on_finished(payload: str):
             self.operationDone.emit(payload)
-            # Cleanup
-            self._workers.pop(tool_key, None)
-            self._cancel_events.pop(tool_key, None)
+            # Cleanup — guarded by IDENTITY, not just the string key (BRG-01).
+            # _make_cancel_event deliberately overlaps same-key runs: a
+            # cancel-then-rerun signals the old event and installs a new
+            # worker + event under the same tool_key. The OLD worker's
+            # finished handler then fires AFTER the new run registered, so an
+            # unguarded pop(tool_key) would evict the NEW run's worker/event —
+            # leaving the in-flight rerun permanently uncancellable
+            # (cancelOperation would find no event and no-op). Only remove
+            # each entry when it is still THIS run's object.
+            if self._workers.get(tool_key) is worker:
+                self._workers.pop(tool_key, None)
+            if my_evt is not None and self._cancel_events.get(tool_key) is my_evt:
+                self._cancel_events.pop(tool_key, None)
             worker.deleteLater()
 
         worker.progress.connect(_on_progress)
