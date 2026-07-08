@@ -1,6 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import type { PickedFile } from '../../types/bridge';
 import { bridgeApi, isRealBridge } from '../../bridge/bridgeApi';
+import { usePageActive } from '../../router/Router';
 
 /** Imperative handle so a page can trigger the picker (e.g. from a Ctrl+O hotkey). */
 export interface DropZoneHandle {
@@ -45,6 +46,7 @@ export const DropZone = forwardRef<DropZoneHandle, DropZoneProps>(function DropZ
 ) {
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const pageActive = usePageActive();
 
   const addPaths = (paths: string[]) => {
     const existing = new Set(files.map((f) => f.path));
@@ -57,10 +59,14 @@ export const DropZone = forwardRef<DropZoneHandle, DropZoneProps>(function DropZ
 
   // Resubscribes whenever `files` changes so addPaths' dedup/merge closes
   // over the current list rather than a stale one from the first render.
-  useEffect(
-    () => bridgeApi.onFilesDropped((paths) => addPaths(multiple ? paths : paths.slice(0, 1))),
-    [multiple, files]
-  );
+  // Gated on usePageActive() so, under AppShell keep-alive (every visited
+  // page stays mounted), an OS file-drop only lands on the ACTIVE page --
+  // a hidden mounted DropZone must not also append it (FE-01). Mirrors the
+  // active-page gate in useHotkeys.
+  useEffect(() => {
+    if (!pageActive) return;
+    return bridgeApi.onFilesDropped((paths) => addPaths(multiple ? paths : paths.slice(0, 1)));
+  }, [multiple, files, pageActive]);
 
   const browse = async () => {
     if (disabled) return;
