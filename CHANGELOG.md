@@ -41,6 +41,21 @@
   `allow_overwriting_input=True` (reads it into memory, releasing the handle);
   the atomic write and its failure cleanup are unchanged. Flips ANL-01 to Fixed.
 
+### Tests
+- **Redaction now has test coverage (TST-01).** Added
+  `tests/test_pdf_ops.py::TestRedactPdf` (fitz-gated; production `redact_pdf`
+  unchanged) asserting redacted terms are gone from both `get_text()` and the
+  decoded content-stream bytes (catches a regression to painting-over),
+  `redaction_count`/`pages_affected` are correct, the `case_sensitive`
+  re-extraction filter keeps the other case, an AcroForm text widget's `/V` value
+  is removed and non-extractable, and `ValueError` is raised with neither
+  `search_terms` nor `rects`. Flips TST-01 to Fixed.
+- **Path-containment guard now tested (TST-02).** Added
+  `tests/test_pdf_ops.py::TestContainedOutputPath` covering the security-critical
+  negative path of `contained_output_path()` — `../` traversal and absolute
+  `out_name` both raise `ValueError`, while a plain name and a non-escaping
+  subfolder stay contained. Flips TST-02 to Fixed.
+
 ### Docs
 - **Added `AUDIT.md`** — a point-in-time code-audit snapshot of v4.22 (~40 open
   findings across the engine, PDF ops, crypto, analyze, translate, bridge, CLI,

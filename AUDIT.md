@@ -143,8 +143,8 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | BRG-01 | 🟠 Med | bridge | Worker cleanup keyed by `tool_key` breaks cancel after rapid restart | `ui/bridge.py:322` | Open |
 | CLI-01 | 🟠 Med | CLI | CLI always exits 0 even when files fail | `compress_pdf.py:214` | Open |
 | FE-01 | 🟠 Med | frontend | Drag-drop not scoped to active page → pollutes every mounted page | `DropZone.tsx:60` | Open |
-| TST-01 | 🟠 Med | tests | Redaction (data-destruction) has zero test coverage | `pdf_ops.py:1517` | Open |
-| TST-02 | 🟠 Med | tests | Path-containment guard `contained_output_path()` untested | `pdf_ops.py:22` | Open |
+| TST-01 | 🟠 Med | tests | Redaction (data-destruction) has zero test coverage | `pdf_ops.py:1517` | ✅ Fixed |
+| TST-02 | 🟠 Med | tests | Path-containment guard `contained_output_path()` untested | `pdf_ops.py:22` | ✅ Fixed |
 | ENG-05 | 🟡 Low | engine | Size-benefit check compares uncompressed candidate vs compressed original | `engine.py:979` | Open |
 | ENG-06 | 🟡 Low | engine | Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px` | `engine.py:721` | Open |
 | OPS-01 | 🟡 Low | pdf_ops | `protect_pdf` sets owner password = user password → restrictions bypassable | `pdf_ops.py:430` | Open |
@@ -442,39 +442,43 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `useHotkeys`. *(Requires a `dist/` rebuild.)*
 - **Verification:** CONFIRMED.
 
-#### TST-01 — Redaction (data-destruction) has zero test coverage
-- **Location:** `pdf_ops.py:1517` (`redact_pdf`); no tests reference it.
+#### TST-01 — Redaction (data-destruction) has zero test coverage ✅ Fixed
+- **Location:** `pdf_ops.py:1517` (`redact_pdf`).
 - **What:** `redact_pdf` guarantees stripped text "isn't recoverable" and contains
   subtle security-critical logic (case-sensitive re-extraction filter
   `:1591-1593`; AcroForm widget neutralisation `:1615-1622`, added to fix a
   documented real leak; `PDF_REDACT_IMAGE_REMOVE` `:1624`). A repo-wide grep for
-  `redact` in `tests/` returns nothing.
+  `redact` in `tests/` returned nothing.
 - **Impact:** A regression to painting-over (or skipping the widget/image path)
   would leave "redacted" text fully extractable while reporting
-  `redaction_count` success — and CI would stay green. No present-day defect; it's
-  the highest-value **untested** path in the module.
-- **Fix:** Integration tests: redact a term, reopen with fitz/pikepdf, assert the
-  term is absent from `get_text()` **and** raw content bytes; a form-field case
-  asserting the widget `/V` is gone; `ValueError` when no term matches / no
-  terms+rects given.
-- **Verification:** CONFIRMED. (Rated High by the finder; Medium here — a missing
-  test, not a live defect.)
+  `redaction_count` success — and CI would stay green. No present-day defect; it
+  was the highest-value **untested** path in the module.
+- **Fix (applied):** Added `tests/test_pdf_ops.py::TestRedactPdf` (fitz-gated,
+  test-only — `redact_pdf` unchanged). Covers: redacted term absent from
+  `get_text()` **and** from the decoded content-stream bytes (the painting-over
+  guard); `redaction_count`/`pages_affected` correctness; the `case_sensitive`
+  re-extraction filter (exact-case removed, other case survives; case-insensitive
+  removes both); the AcroForm case — a redaction rect over a text widget removes
+  its `/V` and makes the value non-extractable; and `ValueError` with neither
+  `search_terms` nor `rects`. All pass — the guarantees hold today.
+- **Verification:** CONFIRMED; now covered by automated tests.
 
-#### TST-02 — Path-containment guard `contained_output_path()` untested
+#### TST-02 — Path-containment guard `contained_output_path()` untested ✅ Fixed
 - **Location:** `pdf_ops.py:22-40`; callers `bridge.py:1064/1144/1325`,
   `compress_paths.py:45`, `pdf_ops.py:295`.
 - **What:** This is the sole guard stopping a user-editable naming template /
   output name from escaping the chosen folder (absolute path that `os.path.join`
-  honours, or `../` traversal). No test asserts it raises on escapes/absolute
-  names. Happy-path is covered indirectly; the security-critical negative path is
-  not.
+  honours, or `../` traversal). No test asserted it raises on escapes/absolute
+  names. Happy-path was covered indirectly; the security-critical negative path
+  was not.
 - **Impact:** A regression dropping the `commonpath` check would reintroduce an
   arbitrary-file-write / traversal vulnerability undetected.
-- **Fix:** Pure, Qt-free unit tests (belong next to the `compress_paths` tests):
-  absolute `out_name` raises `ValueError`; `../../etc/passwd` raises; a plain name
-  returns a path inside the folder.
-- **Verification:** CONFIRMED. (Rated High by the finder; Medium here — a missing
-  test on a security boundary, not a live vuln.)
+- **Fix (applied):** Added `tests/test_pdf_ops.py::TestContainedOutputPath` (pure,
+  Qt-free): a plain name returns a path inside the folder; a `sub/` name stays
+  contained (guard isn't over-eager); `../../../etc/passwd` raises `ValueError`;
+  and an absolute `out_name` (`os.path.abspath(os.sep + …)`, absolute on the
+  running OS) raises `ValueError`. All pass.
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 ### 🟡 Low
 
