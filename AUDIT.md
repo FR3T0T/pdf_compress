@@ -136,9 +136,9 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | ENG-03 | 🟠 Med | engine | `q Q` regex can corrupt text / inline images in uncompressed streams | `engine.py:1684` | Open |
 | ENG-04 | 🟠 Med | engine | Ghostscript pipes never drained → deadlock until 5-min timeout | `engine.py:1318` | Open |
 | OPS-02 | 🟠 Med | pdf_ops | `flatten(forms=True, annotations=False)` leaves form-field values | `pdf_ops.py:1291` | Open |
-| ANL-01 | 🟠 Med | analyze | In-place sanitise fails on Windows (`os.replace` over open handle) | `pdf_analyze.py:824` | Open |
-| ANL-03 | 🟠 Med | analyze | Invisible-text ("failed redaction") detector largely non-functional | `pdf_analyze.py:564` | Open |
-| ANL-04 | 🟠 Med | analyze | Embedded-file sanitiser leaves `/FileAttachment` & `/AF` files | `pdf_analyze.py:757` | Open |
+| ANL-01 | 🟠 Med | analyze | In-place sanitise fails on Windows (`os.replace` over open handle) | `pdf_analyze.py:884` | ✅ Fixed |
+| ANL-03 | 🟠 Med | analyze | Invisible-text ("failed redaction") detector largely non-functional | `pdf_analyze.py:620` | ✅ Fixed |
+| ANL-04 | 🟠 Med | analyze | Embedded-file sanitiser leaves `/FileAttachment` & `/AF` files | `pdf_analyze.py:918` | ✅ Fixed |
 | TRN-01 | 🟠 Med | translate | PDF→PDF translate aborts entirely on one undetectable short block | `pdf_translate.py:592` | Open |
 | BRG-01 | 🟠 Med | bridge | Worker cleanup keyed by `tool_key` breaks cancel after rapid restart | `ui/bridge.py:322` | Open |
 | CLI-01 | 🟠 Med | CLI | CLI always exits 0 even when files fail | `compress_pdf.py:214` | Open |
@@ -316,57 +316,74 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `annotations` flag.
 - **Verification:** CONFIRMED.
 
-#### ANL-01 — In-place sanitise fails on Windows
-- **Location:** `pdf_analyze.py:723` (`with pikepdf.open(...)`) / `:824`
+#### ANL-01 — In-place sanitise fails on Windows ✅ Fixed
+- **Location:** `pdf_analyze.py:884` (`with pikepdf.open(...)`) / `:1033`
   (`os.replace`).
-- **What:** The atomic write (`mkstemp` → `pdf.save(tmp)` → `os.replace`) runs
+- **What:** The atomic write (`mkstemp` → `pdf.save(tmp)` → `os.replace`) ran
   **inside** the `with pikepdf.open(input_path) as pdf:` block. When
-  `output_path == input_path` (in-place sanitise), `os.replace` overwrites a file
-  pikepdf still holds open → `PermissionError [WinError 5]` on Windows (the
+  `output_path == input_path` (in-place sanitise), `os.replace` overwrote a file
+  pikepdf still held open → `PermissionError [WinError 5]` on Windows (the
   primary platform). In-place is reachable via the Save-As picker.
-- **Impact:** User gets a generic "Sanitize failed" toast; the original is
-  preserved (no data loss, no false success), but the operation can't complete
-  in-place. (POSIX is unaffected.)
-- **Fix:** Open with `pikepdf.open(input_path, allow_overwriting_input=True)`, or
-  move the save/`os.replace` outside the `with` block.
-- **Verification:** CONFIRMED. (Original finder rated High; downgraded to Medium
-  because the failure is safe — original intact, clear error.)
+- **Impact:** User got a generic "Sanitize failed" toast; the original was
+  preserved (no data loss, no false success), but the operation couldn't complete
+  in-place. (POSIX was unaffected.)
+- **Fix (applied):** Open with `pikepdf.open(input_path,
+  allow_overwriting_input=True)` — it reads the input fully into memory and
+  releases the OS handle, so the existing atomic write can `os.replace` over
+  `input_path`. The atomic write (and its `os.unlink(tmp)`-on-failure cleanup) is
+  unchanged. Regression test: `tests/test_pdf_analyze.py::TestSanitizeInPlace`.
+- **Verification:** CONFIRMED; now covered by tests (in-place replace, distinct
+  output, and simulated save-failure tmp cleanup / original untouched).
 
-#### ANL-03 — Invisible-text ("failed redaction") detector largely non-functional
-- **Location:** `pdf_analyze.py:564-579` (`_scan_invisible_text`).
-- **What:** Two defects. (1) The dict/span branch (`:564-572`) is dead: the guard
-  `span.get('flags', 0) & 0 == 0` is constant-true and the body is `pass`, so
-  `found` is never set there. (2) The only working check reads **only the first
-  content stream** (`page.get_contents()[0]`, `:576`) and matches only `b' 3 Tr'`
+#### ANL-03 — Invisible-text ("failed redaction") detector largely non-functional ✅ Fixed
+- **Location:** `pdf_analyze.py:620` (`_scan_invisible_text`), helper
+  `_page_content_blobs` at `:590`.
+- **What:** Two defects. (1) The dict/span branch was dead: the guard
+  `span.get('flags', 0) & 0 == 0` was constant-true and the body was `pass`, so
+  `found` was never set there. (2) The only working check read **only the first
+  content stream** (`page.get_contents()[0]`) and matched only `b' 3 Tr'`
   or a stream ending in `3 Tr` — missing render-mode-3 text in later streams
   (common after incremental edits), `\n3 Tr`/other whitespace, and text inside
   form XObjects.
 - **Impact:** False negatives on the security-relevant fake-redaction check; the
-  `get_text("rawdict")` call feeding the dead loop is wasted work. Still fires in
+  `get_text("rawdict")` call feeding the dead loop was wasted work. Still fired in
   the narrow single-stream, space-prefixed case.
-- **Fix:** Remove the dead span loop; concatenate **all** streams from
-  `page.get_contents()` (and inspect form XObjects); tokenise for a `3 Tr`
-  operator with proper whitespace handling.
-- **Verification:** CONFIRMED.
+- **Fix (applied):** Removed the dead span loop (and its `rawdict` call); added
+  `_page_content_blobs`, which concatenates **all** `page.get_contents()` streams
+  plus the streams of any form XObjects the page references (image XObjects
+  skipped); match the `3 Tr` operator with `_TR3_RE =
+  re.compile(rb"(?:^|[\s])3\s+Tr\b")` so leading whitespace is any of
+  space/newline/tab/CR and `"13 Tr"`/`"23 Tr"` don't false-positive. Regression
+  test: `tests/test_pdf_analyze.py::TestInvisibleText`.
+- **Verification:** CONFIRMED; now covered by tests (2nd-stream, `\n3 Tr`, form
+  XObject → detected; `13 Tr` and clean → not flagged).
 
-#### ANL-04 — Embedded-file sanitiser leaves `/FileAttachment` & `/AF` files
-- **Location:** `pdf_analyze.py:757` (sanitiser); detection at `:458-473`.
-- **What:** With `embedded_files=True`, the sanitiser only does
-  `del names["/EmbeddedFiles"]`. The annotation loop drops annotations solely by
-  `/A` → `/S` action type and never inspects `/Subtype`, so `/FileAttachment`
-  annotations (which carry an embedded stream via `/FS` → `/EF`) are kept; `/AF`
-  associated-file arrays are handled nowhere. A surviving annotation holds an
-  indirect reference to the stream, so deleting the name-tree entry doesn't GC it.
-  Detection also gates the object-scan fallback on `/Type == /Filespec`, which is
+#### ANL-04 — Embedded-file sanitiser leaves `/FileAttachment` & `/AF` files ✅ Fixed
+- **Location:** `pdf_analyze.py:918`/`:995` (sanitiser); detection
+  `_scan_embedded_files` at `:486`, name-tree walk `_walk_ef_name_tree` at `:451`.
+- **What:** With `embedded_files=True`, the sanitiser only did
+  `del names["/EmbeddedFiles"]`. The annotation loop dropped annotations solely by
+  `/A` → `/S` action type and never inspected `/Subtype`, so `/FileAttachment`
+  annotations (which carry an embedded stream via `/FS` → `/EF`) were kept; `/AF`
+  associated-file arrays were handled nowhere. A surviving annotation held an
+  indirect reference to the stream, so deleting the name-tree entry didn't GC it.
+  Detection also gated the object-scan fallback on `/Type == /Filespec`, which is
   optional and omitted by some producers.
-- **Impact:** Annotation-borne embedded files survive `embedded_files=True`, and
-  the "removed" report under-reports. (Detection's `/Kids` gap is mitigated — the
-  object-scan fallback still catches those.)
-- **Fix:** Recurse the name tree through `/Kids`; treat any dict with `/EF` as a
-  filespec regardless of missing `/Type`; and in the sanitiser also drop
-  `/FileAttachment` annotations and strip `/AF` arrays when `embedded_files` is on.
-- **Verification:** CONFIRMED (sanitiser leak fully confirmed; detection gaps real
-  but partly mitigated).
+- **Impact:** Annotation-borne embedded files survived `embedded_files=True`, and
+  the "removed" report under-reported. (Detection's `/Kids` gap was mitigated — the
+  object-scan fallback still caught those.)
+- **Fix (applied):** *Detection* — `_scan_embedded_files` now treats any dict
+  carrying `/EF` as a filespec regardless of missing `/Type`, and walks the
+  `/EmbeddedFiles` name tree through `/Kids` via `_walk_ef_name_tree`. *Sanitiser*
+  — when `embedded_files` is on it also drops `/Subtype == /FileAttachment`
+  annotations (`file_attachment_annot` counter) and strips `/AF` arrays at the
+  document root, on pages, and on annotations (`associated_file` counter); once
+  those references are gone the embedded streams are unreferenced and dropped on
+  `save`, so no `/EF` stream survives (verified, not just the name-tree entry).
+  Regression test: `tests/test_pdf_analyze.py::TestEmbeddedFiles`.
+- **Verification:** CONFIRMED; now covered by tests (annotation-borne file
+  detected + payload gone after sanitise; no-`/Type` filespec; `/AF` strip;
+  `/Kids` tree walked; clean PDF removes nothing).
 
 #### TRN-01 — PDF→PDF translate aborts entirely on one undetectable block
 - **Location:** `pdf_translate.py:592` (`_translate_pdf_to_pdf`).

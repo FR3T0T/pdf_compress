@@ -448,31 +448,68 @@ def _scan_links(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
     ))
 
 
+def _walk_ef_name_tree(node, out: list, depth: int = 0) -> None:
+    """Collect embedded-file display names from an /EmbeddedFiles name tree,
+    recursing intermediate nodes that hold /Kids instead of /Names.
+
+    A PDF name tree can be a single leaf ({/Names: [key, val, ...]}) or a
+    balanced tree of intermediate {/Kids: [...]} nodes with leaves at the
+    bottom — the old code only read a root-level /Names and missed any
+    /Kids-structured tree (ANL-04). Depth-capped and exception-tolerant.
+    """
+    if depth > 50:
+        return
+    try:
+        if not isinstance(node, pikepdf.Dictionary):
+            return
+    except Exception:
+        return
+    try:
+        arr = node.get("/Names")
+        if arr is not None:
+            # Leaf: [key1, filespec1, key2, filespec2, ...] — keys are the
+            # display names.
+            for i in range(0, len(arr) - 1, 2):
+                try: out.append(_as_str(arr[i]))
+                except Exception: continue
+    except Exception:
+        pass
+    try:
+        kids = node.get("/Kids")
+        if kids is not None:
+            for kid in kids:
+                _walk_ef_name_tree(kid, out, depth + 1)
+    except Exception:
+        pass
+
+
 def _scan_embedded_files(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
     """Attachments / embedded files."""
     names: list[str] = []
     try:
         root = pdf.Root
-        ef = root.get("/Names", {})
-        if isinstance(ef, pikepdf.Dictionary) and "/EmbeddedFiles" in ef:
-            tree = ef["/EmbeddedFiles"]
-            arr = tree.get("/Names")
-            if arr is not None:
-                for i in range(0, len(arr), 2):
-                    try:
-                        names.append(_as_str(arr[i]))
-                    except Exception:
-                        continue
+        nm = root.get("/Names")
+        if isinstance(nm, pikepdf.Dictionary) and "/EmbeddedFiles" in nm:
+            _walk_ef_name_tree(nm["/EmbeddedFiles"], names)
     except Exception:
         pass
 
-    # Also catch /Filespec objects anywhere
+    # Also catch filespecs anywhere — including those that ride on
+    # /FileAttachment annotations rather than the name tree. /Type is
+    # OPTIONAL on a filespec and omitted by some producers, so treat any dict
+    # carrying /EF (an embedded-file stream) as one regardless of /Type
+    # (ANL-04); external filespecs keep the older /Type-gated, name-required
+    # behaviour.
     for obj in _iter_all_objects(pdf):
         try:
-            if isinstance(obj, pikepdf.Dictionary) and \
-               _as_str(obj.get("/Type")) == "/Filespec":
+            if not isinstance(obj, pikepdf.Dictionary):
+                continue
+            if "/EF" in obj:
                 f = _as_str(obj.get("/F") or obj.get("/UF") or "")
-                if f:
+                names.append(f if f.strip() else "(unnamed embedded file)")
+            elif _as_str(obj.get("/Type")) == "/Filespec":
+                f = _as_str(obj.get("/F") or obj.get("/UF") or "")
+                if f.strip():
                     names.append(f)
         except Exception:
             continue
@@ -542,6 +579,44 @@ def _scan_optional_content(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
         ))
 
 
+# Text render mode 3 = "invisible" (drawn but not shown) — the classic
+# fake-redaction / OCR-underlay tell. Match the `3 Tr` operator on token
+# boundaries: a leading start-of-stream or whitespace so "13 Tr"/"23 Tr"
+# don't false-positive, any whitespace between operand and operator, and a
+# word boundary after Tr.
+_TR3_RE = re.compile(rb"(?:^|[\s])3\s+Tr\b")
+
+
+def _page_content_blobs(doc, page) -> list:
+    """Decoded bytes of every content stream on *page*, plus the streams of
+    any form XObjects it references.
+
+    Render-mode-3 text commonly lands in a *later* content stream after
+    incremental edits, or inside a form XObject — the old code read only
+    ``page.get_contents()[0]`` and saw neither (ANL-03). Image XObjects are
+    skipped (their streams are pixel data, not operators).
+    """
+    blobs = []
+    try:
+        for xref in page.get_contents():
+            try: blobs.append(doc.xref_stream(xref))
+            except Exception: continue
+    except Exception:
+        pass
+    try:
+        for item in page.get_xobjects():
+            try:
+                xref = item[0]
+                subtype = doc.xref_get_key(xref, "Subtype")
+                if subtype and _as_str(subtype[1]).lstrip("/") == "Form":
+                    blobs.append(doc.xref_stream(xref))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return blobs
+
+
 def _scan_invisible_text(path: str, res: AnalysisResult) -> None:
     """Invisible text (render mode 3) — a classic fake-redaction tell.
 
@@ -556,29 +631,10 @@ def _scan_invisible_text(path: str, res: AnalysisResult) -> None:
     try:
         doc = fitz.open(path)
         for page in doc:
-            try:
-                d = page.get_text("rawdict")
-            except Exception:
-                continue
-            found = False
-            for block in d.get("blocks", []):
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        # render mode 3 == invisible (flags bit for hidden text)
-                        if span.get("flags", 0) & 0 == 0 and span.get("color", 0) is not None:
-                            pass
-                        # PyMuPDF exposes render mode via "char" only in some
-                        # versions; fall back to detecting fully transparent
-                        # text drawn as type 3 in the content stream below.
-            # Reliable signal: text present but not visible via "dict" opacity
-            # is hard; instead detect explicit "3 Tr" in content stream.
-            try:
-                cont = doc.xref_stream(page.get_contents()[0]) if page.get_contents() else b""
-            except Exception:
-                cont = b""
-            if b" 3 Tr" in cont or cont.strip().endswith(b"3 Tr"):
-                found = True
-            if found:
+            # Join streams with whitespace so a `3 Tr` at the start of a later
+            # stream still sits on a token boundary for _TR3_RE.
+            content = b"\n".join(_page_content_blobs(doc, page))
+            if _TR3_RE.search(content):
                 pages_with_invisible += 1
         doc.close()
     except Exception as exc:
@@ -820,7 +876,12 @@ def sanitize_pdf(input_path: str, output_path: str,
     def _bump(key: str, n: int = 1) -> None:
         removed[key] = removed.get(key, 0) + n
 
-    with pikepdf.open(input_path) as pdf:
+    # allow_overwriting_input reads the input fully into memory at open time and
+    # releases the OS file handle, so the atomic write below can os.replace over
+    # input_path for an in-place sanitise (output_path == input_path). Without
+    # it, os.replace hits a handle pikepdf still holds → PermissionError
+    # [WinError 5] on Windows (ANL-01). Harmless when output_path differs.
+    with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
         root = pdf.Root
 
         if opts["javascript"] or opts["auto_actions"]:
@@ -858,6 +919,15 @@ def sanitize_pdf(input_path: str, output_path: str,
                     _bump("embedded_files")
             except Exception:
                 pass
+            # /AF (associated files) reference embedded streams independently
+            # of the name tree; strip it wherever it appears — root, pages,
+            # annotations — or the streams stay referenced and survive (ANL-04).
+            try:
+                if "/AF" in root:
+                    del root["/AF"]
+                    _bump("associated_file")
+            except Exception:
+                pass
 
         # Walk pages & annotations for active content
         for page in pdf.pages:
@@ -865,6 +935,12 @@ def sanitize_pdf(input_path: str, output_path: str,
                 if "/AA" in page and opts["auto_actions"]:
                     del page["/AA"]
                     _bump("page_aa")
+            except Exception:
+                pass
+            try:
+                if opts["embedded_files"] and "/AF" in page:
+                    del page["/AF"]
+                    _bump("associated_file")
             except Exception:
                 pass
 
@@ -908,6 +984,19 @@ def sanitize_pdf(input_path: str, output_path: str,
                         try:
                             if len(aa.keys()) == 0:
                                 del annot["/AA"]
+                        except Exception:
+                            pass
+                    # Embedded files carried by the annotation itself:
+                    # /FileAttachment annots hold a stream via /FS→/EF, and /AF
+                    # arrays reference embedded streams — both independent of
+                    # the name tree, and both invisible to the /A→/S check
+                    # above (ANL-04).
+                    if opts["embedded_files"]:
+                        if _as_str(annot.get("/Subtype")) == "/FileAttachment":
+                            drop = True; _bump("file_attachment_annot")
+                        try:
+                            if "/AF" in annot:
+                                del annot["/AF"]; _bump("associated_file")
                         except Exception:
                             pass
                     if not drop:

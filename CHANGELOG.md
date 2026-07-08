@@ -13,6 +13,33 @@
   under its matching opt while preserving the benign head and any surviving
   tail; removals bump the existing counters so the count stays honest. Added
   `tests/test_pdf_analyze.py`. Flips ANL-02 to Fixed in `AUDIT.md`.
+- **Sanitiser now removes annotation-borne embedded files (ANL-04).** With
+  `embedded_files=True`, `sanitize_pdf` only deleted the `/EmbeddedFiles` name-tree
+  entry, leaving `/FileAttachment` annotations (which carry a stream via
+  `/FS`→`/EF`) and `/AF` associated-file arrays intact — a surviving annotation
+  kept the stream referenced, so the payload was never GC'd. The annotation loop
+  now drops `/Subtype == /FileAttachment` annotations and strips `/AF` arrays at
+  the root, on pages, and on annotations (new `file_attachment_annot` /
+  `associated_file` counters), so no `/EF` stream survives. Detection
+  (`_scan_embedded_files`) also now treats any dict with `/EF` as a filespec even
+  when `/Type` is omitted, and walks the name tree through `/Kids`. Flips ANL-04
+  to Fixed.
+
+### Fixes
+- **Invisible-text (fake-redaction) detector rebuilt (ANL-03).** The render-mode-3
+  scan had a dead `rawdict` span loop and only inspected the *first* content
+  stream with a naïve `b" 3 Tr"` substring test — missing `3 Tr` in later streams
+  (common after incremental edits), `\n3 Tr`/other whitespace, and text in form
+  XObjects. It now concatenates every `page.get_contents()` stream plus referenced
+  form-XObject streams and matches the operator on token boundaries
+  (`(?:^|[\s])3\s+Tr\b`), so `"13 Tr"` no longer false-positives. Flips ANL-03 to
+  Fixed.
+- **In-place sanitise no longer fails on Windows (ANL-01).** `sanitize_pdf`'s
+  atomic write ran inside the `with pikepdf.open(input_path)` block, so
+  `os.replace` over `input_path` (in-place, via Save-As) hit a still-open handle →
+  `PermissionError [WinError 5]`. The input is now opened with
+  `allow_overwriting_input=True` (reads it into memory, releasing the handle);
+  the atomic write and its failure cleanup are unchanged. Flips ANL-01 to Fixed.
 
 ### Docs
 - **Added `AUDIT.md`** — a point-in-time code-audit snapshot of v4.22 (~40 open
