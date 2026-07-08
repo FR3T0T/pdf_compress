@@ -43,6 +43,13 @@ same change**, not "later":
   frontend architecture, parity status, or the bridge surface changes.
 - **`CLAUDE.md`** (this file) — update when a rule, convention, or workflow here
   changes.
+- **`AUDIT.md`** — the standing code-audit snapshot: known open findings with
+  severity, evidence, and suggested fixes. Two obligations: **(1) consult it**
+  before working on a subsystem — skim that area's findings so you don't
+  reintroduce or trip over a known one; **(2) keep it current** — when you fix a
+  finding, flip its **Status** in the §4 master table (and record the fix in
+  `CHANGELOG.md`). It's anchored to a git SHA, so treat *file + description* as the
+  stable anchor when line numbers drift.
 - **Version string** lives in four places — keep them in sync (they have drifted
   before): `app.py` `VERSION`, `pyproject.toml` `version`, the `README.md` badge,
   and the top `CHANGELOG.md` heading.
