@@ -590,11 +590,27 @@ def _translate_pdf_to_pdf(input_path: str, output_path: str, target: str,
                 x0, y0, x1, y1, text, _block_no, block_type = block[:7]
                 if block_type != 0 or not text.strip():
                     continue
-                res = translate_text(text, target, source, protect_terms)
-                detected_source = detected_source or res["source"]
+                # Once the document language is known from an earlier block,
+                # reuse it so short blocks (page numbers, years, <3 chars) that
+                # would fail auto-detection still translate instead of raising.
+                effective_source = (
+                    detected_source if source == "auto" and detected_source else source
+                )
+                try:
+                    res = translate_text(text, target, effective_source, protect_terms)
+                    detected_source = detected_source or res["source"]
+                    translated = res["translated"]
+                except Exception as exc:
+                    # An undetectable/untranslatable block (e.g. a bare number
+                    # that fails detect_language) must NOT abort the document --
+                    # keep it verbatim so the loop continues and out.save() is
+                    # still reached (TRN-01). Covers TranslationError and any
+                    # backstop failure.
+                    log.debug("keeping block untranslated on page %d: %s", i, exc)
+                    translated = text
                 rect = fitz.Rect(x0, y0, x1, y1)
                 try:
-                    _insert_autofit_text(new_page, rect, res["translated"], font_kwargs)
+                    _insert_autofit_text(new_page, rect, translated, font_kwargs)
                 except Exception as exc:
                     log.debug("skipping text block on page %d: %s", i, exc)
 

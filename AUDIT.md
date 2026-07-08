@@ -139,7 +139,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | ANL-01 | 🟠 Med | analyze | In-place sanitise fails on Windows (`os.replace` over open handle) | `pdf_analyze.py:884` | ✅ Fixed |
 | ANL-03 | 🟠 Med | analyze | Invisible-text ("failed redaction") detector largely non-functional | `pdf_analyze.py:620` | ✅ Fixed |
 | ANL-04 | 🟠 Med | analyze | Embedded-file sanitiser leaves `/FileAttachment` & `/AF` files | `pdf_analyze.py:918` | ✅ Fixed |
-| TRN-01 | 🟠 Med | translate | PDF→PDF translate aborts entirely on one undetectable short block | `pdf_translate.py:592` | Open |
+| TRN-01 | 🟠 Med | translate | PDF→PDF translate aborts entirely on one undetectable short block | `pdf_translate.py:600` | ✅ Fixed |
 | BRG-01 | 🟠 Med | bridge | Worker cleanup keyed by `tool_key` breaks cancel after rapid restart | `ui/bridge.py:322` | Open |
 | CLI-01 | 🟠 Med | CLI | CLI always exits 0 even when files fail | `compress_pdf.py:214` | Open |
 | FE-01 | 🟠 Med | frontend | Drag-drop not scoped to active page → pollutes every mounted page | `DropZone.tsx:60` | Open |
@@ -389,20 +389,29 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   detected + payload gone after sanitise; no-`/Type` filespec; `/AF` strip;
   `/Kids` tree walked; clean PDF removes nothing).
 
-#### TRN-01 — PDF→PDF translate aborts entirely on one undetectable block
-- **Location:** `pdf_translate.py:592` (`_translate_pdf_to_pdf`).
-- **What:** Each block's `translate_text(...)` call at `:592` is **not** wrapped in
-  try/except (only the subsequent `_insert_autofit_text` is). In `source='auto'`
+#### TRN-01 — PDF→PDF translate aborts entirely on one undetectable block ✅ Fixed
+- **Location:** `pdf_translate.py:600` (`_translate_pdf_to_pdf` block loop).
+- **What:** Each block's `translate_text(...)` call was **not** wrapped in
+  try/except (only the subsequent `_insert_autofit_text` was). In `source='auto'`
   (the default), a block that's a page number, a year (`2024`), or <3 chars fails
-  `detect_language` → `_resolve_source` raises `TranslationError`, which propagates
-  out and aborts the whole document — `out.save()` is never reached.
+  `detect_language` → `_resolve_source` raises `TranslationError`, which propagated
+  out and aborted the whole document — `out.save()` was never reached.
 - **Impact:** Real PDFs routinely contain such short blocks, so default-mode
-  PDF→PDF translation is fragile and produces **no output at all**. (The .txt/.docx
-  path detects per whole page, so it's less exposed.)
-- **Fix:** Reuse a source detected from an earlier block for subsequent blocks,
-  and/or wrap the per-block call in try/except so an undetectable block is copied
-  verbatim rather than aborting the document.
-- **Verification:** CONFIRMED.
+  PDF→PDF translation was fragile and produced **no output at all**. (The
+  .txt/.docx path detects per whole page, so it's less exposed.)
+- **Fix (applied):** Both AUDIT-suggested approaches combined. (1) Once a source
+  is detected from an earlier block, subsequent blocks under `source='auto'` pass
+  that `detected_source` to `translate_text` (`effective_source`), so short blocks
+  that would fail auto-detection still translate using the known document
+  language. (2) The per-block `translate_text` call is wrapped in
+  `try/except Exception` (covers `TranslationError` + backstop): on failure the
+  block's original text is copied through verbatim with a `log.debug`, so the loop
+  continues and `out.save()` is still reached. `_insert_autofit_text`'s existing
+  try/except and the .txt/.docx path are unchanged. Tests:
+  `tests/test_pdf_translate.py::TestTranslatePdfBlockResilience`.
+- **Verification:** CONFIRMED; now covered by a monkeypatched integration test
+  (one block raises → document still saves, other block translated, number
+  preserved).
 
 #### BRG-01 — Worker cleanup keyed by `tool_key` breaks cancel after restart
 - **Location:** `ui/bridge.py:322-331`.
