@@ -142,7 +142,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | TRN-01 | 🟠 Med | translate | PDF→PDF translate aborts entirely on one undetectable short block | `pdf_translate.py:600` | ✅ Fixed |
 | BRG-01 | 🟠 Med | bridge | Worker cleanup keyed by `tool_key` breaks cancel after rapid restart | `ui/bridge.py:322` | Open |
 | CLI-01 | 🟠 Med | CLI | CLI always exits 0 even when files fail | `compress_pdf.py:214` | Open |
-| FE-01 | 🟠 Med | frontend | Drag-drop not scoped to active page → pollutes every mounted page | `DropZone.tsx:60` | Open |
+| FE-01 | 🟠 Med | frontend | Drag-drop not scoped to active page → pollutes every mounted page | `DropZone.tsx:66` | ✅ Fixed |
 | TST-01 | 🟠 Med | tests | Redaction (data-destruction) has zero test coverage | `pdf_ops.py:1517` | ✅ Fixed |
 | TST-02 | 🟠 Med | tests | Path-containment guard `contained_output_path()` untested | `pdf_ops.py:22` | ✅ Fixed |
 | ENG-05 | 🟡 Low | engine | Size-benefit check compares uncompressed candidate vs compressed original | `engine.py:979` | Open |
@@ -440,20 +440,25 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Fix:** After the summary, `sys.exit(1 if n_err else 0)`.
 - **Verification:** CONFIRMED.
 
-#### FE-01 — Drag-drop not scoped to the active page
-- **Location:** `web-react/src/components/shared/DropZone.tsx:60`.
+#### FE-01 — Drag-drop not scoped to the active page ✅ Fixed
+- **Location:** `web-react/src/components/shared/DropZone.tsx:66`.
 - **What:** Under AppShell keep-alive every visited tool page stays mounted. Each
-  mounted `DropZone` subscribes to the **global** `files-dropped` EventBus signal
-  with no active-page gate. One OS drop emits one global event → **every** mounted
-  DropZone appends the file to its own page's list. This is the exact keep-alive
-  scoping hazard `useHotkeys` was fixed for via `usePageActive()` — DropZone never
-  got the guard.
+  mounted `DropZone` subscribed to the **global** `files-dropped` EventBus signal
+  with no active-page gate. One OS drop emitted one global event → **every**
+  mounted DropZone appended the file to its own page's list. This was the exact
+  keep-alive scoping hazard `useHotkeys` was fixed for via `usePageActive()` —
+  DropZone never got the guard.
 - **Impact:** Dropping a file while viewing Compress (after visiting Merge/Split)
-  silently stages it on those pages too; the user may later run an operation on
-  files they never intended. Manifests in the default (no-workspace) mode.
-- **Fix:** Gate the `onFilesDropped` subscription on `usePageActive()`, mirroring
-  `useHotkeys`. *(Requires a `dist/` rebuild.)*
-- **Verification:** CONFIRMED.
+  silently staged it on those pages too; the user might later run an operation on
+  files they never intended. Manifested in the default (no-workspace) mode.
+- **Fix (applied):** `DropZone` now calls `usePageActive()` and the
+  `onFilesDropped` subscription early-returns when the page isn't active, so only
+  the visible page subscribes — mirroring `useHotkeys` exactly (same gate, same
+  `pageActive` dep-array entry). The browse/manual-add and drag-over visual
+  handlers are unchanged. `dist/` rebuilt.
+- **Verification:** CONFIRMED. (No unit test on this keep-alive path — validated
+  by build + a real-app check: a drop on one page must not appear on other
+  visited pages.)
 
 #### TST-01 — Redaction (data-destruction) has zero test coverage ✅ Fixed
 - **Location:** `pdf_ops.py:1517` (`redact_pdf`).

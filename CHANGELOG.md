@@ -42,6 +42,13 @@
   to Fixed.
 
 ### Fixes
+- **File drag-drop is now scoped to the active tool page (FE-01).** Under the
+  AppShell keep-alive (every visited page stays mounted), each mounted `DropZone`
+  subscribed to the global `files-dropped` EventBus, so a single OS file-drop was
+  appended to *every* visited page's file list — staging files on pages the user
+  never intended. `DropZone` now gates that subscription on `usePageActive()`
+  (mirroring `useHotkeys`), so only the visible page receives the drop. Frontend
+  change; `dist/` rebuilt.
 - **PDF→PDF translation no longer aborts the whole document over one undetectable
   block (TRN-01).** In `_translate_pdf_to_pdf`, a block that failed
   `detect_language` under `source='auto'` (a page number, a year like `2024`, or a
