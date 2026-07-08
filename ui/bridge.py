@@ -63,6 +63,7 @@ from pdf_ops import (
     flatten_pdf,
     get_toc,
     images_to_pdf,
+    is_within_directory,
     merge_pdfs,
     nup_layout,
     pdf_to_images,
@@ -850,7 +851,16 @@ class Bridge(QObject):
     def deleteFile(self, path: str) -> str:
         """Best-effort delete of a workspace-superseded temp file. Returns
         JSON {success, error}. A missing file is not an error.
+
+        Scoped to the workspace temp dir (BRG-02): this only ever deletes
+        superseded working files, so it refuses any path outside
+        ``self._workspace_dir`` rather than acting on an arbitrary path.
         """
+        if not self._workspace_dir or not is_within_directory(path, self._workspace_dir):
+            log.warning("deleteFile refused: %s is outside the workspace dir", path)
+            return json.dumps(
+                {"success": False, "error": "refused: path outside workspace"},
+                ensure_ascii=False)
         try:
             if path and os.path.isfile(path):
                 os.remove(path)
@@ -863,7 +873,17 @@ class Bridge(QObject):
     def copyFile(self, src_path: str, dest_path: str) -> str:
         """Copy the workspace's current working file out to a user-chosen
         export path. Returns JSON {success, error}.
+
+        Only ``src_path`` is scoped to the workspace temp dir (BRG-02) -- it
+        must be a workspace working file. ``dest_path`` is deliberately
+        unconstrained: it's the user's chosen export target, expected to be
+        outside the workspace.
         """
+        if not self._workspace_dir or not is_within_directory(src_path, self._workspace_dir):
+            log.warning("copyFile refused: source %s is outside the workspace dir", src_path)
+            return json.dumps(
+                {"success": False, "error": "refused: source outside workspace"},
+                ensure_ascii=False)
         try:
             shutil.copy2(src_path, dest_path)
             return json.dumps({"success": True}, ensure_ascii=False)

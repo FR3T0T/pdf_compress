@@ -40,6 +40,27 @@ def contained_output_path(out_folder: str, out_name: str) -> str:
     return candidate
 
 
+def is_within_directory(path: str, base: str) -> bool:
+    """Return True iff *path* resolves to *base* itself or something inside it.
+
+    Boolean sibling of contained_output_path, for callers that need to VET an
+    already-built path rather than construct one -- e.g. ui/bridge.py's
+    deleteFile/copyFile scoping operations to the workspace temp dir. Lives
+    here (a Qt-free module) so its tests don't drag in PySide6 via bridge.py.
+
+    Uses os.path.commonpath on realpath'd paths, NOT ``str.startswith`` --
+    startswith would treat ``/foo/ws_evil`` as inside ``/foo/ws``. Returns
+    False (never raises) on any escape, and on commonpath's ValueError for
+    paths that share no common root (e.g. different drives on Windows).
+    """
+    try:
+        base_r = os.path.realpath(base)
+        path_r = os.path.realpath(path)
+        return os.path.commonpath([base_r, path_r]) == base_r
+    except (ValueError, OSError):
+        return False
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Data classes
 # ═══════════════════════════════════════════════════════════════════

@@ -17,6 +17,7 @@ from pdf_ops import (
     extract_text,
     flatten_pdf,
     get_toc,
+    is_within_directory,
     merge_pdfs,
     read_metadata,
     redact_pdf,
@@ -351,6 +352,48 @@ class TestContainedOutputPath:
         outside = os.path.abspath(os.sep + "redact_outside_target")
         with pytest.raises(ValueError):
             contained_output_path(str(tmp_path), outside)
+
+
+class TestIsWithinDirectory:
+    """is_within_directory() vets an already-built path against a base dir
+    (BRG-02: scoping bridge deleteFile/copyFile to the workspace temp dir).
+    Boolean and commonpath-based — never raises, and not fooled by a sibling
+    that merely shares a name prefix."""
+
+    def test_path_inside_is_true(self, tmp_path):
+        base = tmp_path / "ws"
+        base.mkdir()
+        assert is_within_directory(str(base / "working.pdf"), str(base)) is True
+
+    def test_nested_subdir_inside_is_true(self, tmp_path):
+        base = tmp_path / "ws"
+        base.mkdir()
+        nested = base / "sub" / "deep" / "working.pdf"
+        assert is_within_directory(str(nested), str(base)) is True
+
+    def test_base_itself_is_true(self, tmp_path):
+        base = tmp_path / "ws"
+        base.mkdir()
+        assert is_within_directory(str(base), str(base)) is True
+
+    def test_traversal_escape_is_false(self, tmp_path):
+        base = tmp_path / "ws"
+        base.mkdir()
+        escape = base / ".." / ".." / "etc" / "passwd"
+        assert is_within_directory(str(escape), str(base)) is False
+
+    def test_absolute_outside_is_false(self, tmp_path):
+        base = tmp_path / "ws"
+        base.mkdir()
+        outside = os.path.abspath(os.sep + "workspace_outside_target")
+        assert is_within_directory(outside, str(base)) is False
+
+    def test_sibling_prefix_is_false(self, tmp_path):
+        # The startswith trap: /foo/ws_evil is NOT inside /foo/ws.
+        base = tmp_path / "ws"
+        base.mkdir()
+        sibling = tmp_path / "ws_evil" / "x"
+        assert is_within_directory(str(sibling), str(base)) is False
 
 
 # ═══════════════════════════════════════════════════════════════════

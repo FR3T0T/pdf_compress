@@ -154,13 +154,13 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | CRY-01 | 🟡 Low | crypto | Decrypt raises non-`EPDFError` types on malformed headers | `epdf_crypto.py:442` | Open |
 | CRY-02 | 🟡 Low | crypto | Non-dict `kdf_params` bypasses validation → uncaught `TypeError` | `epdf_crypto.py:134` | Open |
 | TRN-02 | 🟡 Low | translate | Temp PNG leaks if `pix.save` fails before the cleanup try/finally | `pdf_translate.py:442` | Open |
-| BRG-02 | 🟡 Low | bridge | `deleteFile`/`copyFile` lack workspace-dir path containment | `ui/bridge.py:849` | Open |
+| BRG-02 | 🟡 Low | bridge | `deleteFile`/`copyFile` lack workspace-dir path containment | `ui/bridge.py:851` | ✅ Fixed |
 | BRG-03 | 🟡 Low | bridge | Slot-level param parse runs outside worker try/except → UI hangs | `ui/bridge.py:718` | Open |
 | CLI-02 | 🟡 Low | CLI | Batch: two inputs sharing a basename overwrite each other's output | `compress_pdf.py:128` | Open |
 | CLI-03 | 🟡 Low | CLI | `input()` at exit raises `EOFError` traceback on non-interactive stdin | `compress_pdf.py:211` | Open |
 | CLI-04 | 🟡 Low | CLI | Not-found inputs omitted from summary counts / failure tally | `compress_pdf.py:115` | Open |
 | FE-02 | 🟡 Low | frontend | Workspace risk badge/findings never refreshed after a transform | `WorkspaceContext.tsx:123` | Open |
-| FE-03 | 🟡 Low | frontend | `RedactPage` advances workspace with an unguarded `output_path` | `RedactPage.tsx:180` | Open |
+| FE-03 | 🟡 Low | frontend | `RedactPage` advances workspace with an unguarded `output_path` | `RedactPage.tsx:191` | ✅ Fixed |
 | TST-03 | 🟡 Low | tests | Password protect/unlock round-trip untested | `pdf_ops.py:408` | Open |
 | TST-04 | 🟡 Low | tests | Backup-on-overwrite test asserts nothing when compression skips | `tests/test_engine.py:239` | Open |
 | DOC-01 | 🟡 Low | docs | README advertises a Windows context-menu + About dialog that no longer exist | `README.md:180` | Open |
@@ -605,22 +605,28 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Fix:** Move `pix.save(tmp)` inside the try so the finally always runs.
 - **Verification:** CONFIRMED.
 
-#### BRG-02 — `deleteFile`/`copyFile` lack workspace-dir path containment
-- **Location:** `ui/bridge.py:849` (`deleteFile`), `:862` (`copyFile`).
-- **What:** `deleteFile`'s docstring scopes it to "a workspace-superseded temp
-  file", but the body does `if path and os.path.isfile(path): os.remove(path)`
-  with no check that `path` is inside `self._workspace_dir`. `copyFile` likewise
-  has no containment on `dest`. `contained_output_path` exists for exactly this but
-  isn't applied.
+#### BRG-02 — `deleteFile`/`copyFile` lack workspace-dir path containment ✅ Fixed
+- **Location:** `ui/bridge.py:851` (`deleteFile`), `:873` (`copyFile`); helper
+  `is_within_directory` at `pdf_ops.py:43`.
+- **What:** `deleteFile`'s docstring scoped it to "a workspace-superseded temp
+  file", but the body did `if path and os.path.isfile(path): os.remove(path)`
+  with no check that `path` was inside `self._workspace_dir`. `copyFile` likewise
+  had no containment on its source. `contained_output_path` existed for exactly
+  this but wasn't applied.
 - **Impact:** Defense-in-depth gap, **not** a demonstrated vuln: the only caller is
   the committed frontend which passes only workspace-dir paths; `os.remove` is
   guarded by `isfile` (no dir/glob); `copyFile`'s dest is a user-chosen export
   path. Unrelated to the network/offline invariant despite the finder's category.
-- **Fix:** Resolve `realpath` and require it inside `self._workspace_dir` (reuse
-  the `commonpath` check) before removing; consider the same for `copyFile`'s dest
-  or document it as an intentional export sink.
-- **Verification:** CONFIRMED. (Finder rated Medium/offline-invariant; downgraded
-  to Low/hardening.)
+- **Fix (applied):** Added a Qt-free boolean guard `is_within_directory(path,
+  base)` in `pdf_ops.py` (realpath + `commonpath`, never `startswith`, returns
+  `False` — never raises — on escape or a cross-root `commonpath` ValueError).
+  `deleteFile` now refuses (`{"success": False, "error": "refused: path outside
+  workspace"}`) unless `self._workspace_dir` is set and `path` is within it — the
+  "missing file is not an error" behaviour is kept for in-workspace paths.
+  `copyFile` requires `src_path` within the workspace; `dest_path` is left
+  deliberately unconstrained (the user's export sink). Tests:
+  `tests/test_pdf_ops.py::TestIsWithinDirectory` (incl. the sibling-prefix trap).
+- **Verification:** CONFIRMED; helper now covered by automated tests.
 
 #### BRG-03 — Slot param parse runs outside the worker try/except → UI hangs
 - **Location:** `ui/bridge.py:714-726` (`startTranslateText`), `:742-750`
@@ -684,19 +690,24 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   like `load`), or reset `scan` to a neutral state. *(Requires a `dist/` rebuild.)*
 - **Verification:** CONFIRMED.
 
-#### FE-03 — `RedactPage` advances workspace with an unguarded `output_path`
-- **Location:** `web-react/src/pages/tools/RedactPage.tsx:176-182`.
-- **What:** The done handler calls `workspace.applyResult(output_path, …)` without
-  first checking `output_path` is truthy — unlike every sibling page
-  (Crop/PageOps/Flatten/Nup/Metadata/Compress all guard it). If the backend ever
-  reported success with an empty `output_path`, the working document would be
-  silently dropped while a 'Redact' op is still appended.
+#### FE-03 — `RedactPage` advances workspace with an unguarded `output_path` ✅ Fixed
+- **Location:** `web-react/src/pages/tools/RedactPage.tsx:181-200` (done handler).
+- **What:** The done handler called `workspace.applyResult(output_path, …)` with
+  `output_path` read out of the **backend result** (`op.result.results`) — a value
+  that round-tripped through the bridge — rather than the known-good path the
+  frontend itself computed via `workspaceOutputPath(wsDir, wsPath, opIndex)`. It
+  also didn't guard truthiness, unlike every sibling page.
 - **Impact:** Defensive-consistency gap; **effectively unreachable** today (the
   backend echoes the caller-supplied path and any write failure raises → status
-  'error', not 'done'). One-line fix to match siblings.
-- **Fix:** Guard on `output_path` before `applyResult`; emit a failure toast
-  otherwise. *(Requires a `dist/` rebuild.)*
-- **Verification:** CONFIRMED.
+  'error', not 'done').
+- **Fix (applied):** `confirmRedact` now stashes the frontend-computed `outPath`
+  in `workspaceOutPathRef` when the workspace run launches; the done handler
+  advances the workspace with **that** trusted path (never the backend echo),
+  guarded on truthiness (failure toast otherwise). Counts for the toast still
+  come from the backend result. The non-workspace file-output branch is
+  unchanged. `dist/` rebuilt.
+- **Verification:** CONFIRMED. (No unit test on this path — validated by build +
+  a real-app redact→advance check.)
 
 #### TST-03 — Password protect/unlock round-trip untested
 - **Location:** `pdf_ops.py:408` (`protect_pdf`), `:452` (`unlock_pdf`).

@@ -2,6 +2,22 @@
 ## Unreleased
 
 ### Security
+- **Redact no longer advances the workspace with a round-tripped path (FE-03).**
+  `RedactPage`'s op-done handler fed `workspace.applyResult` the `output_path`
+  read back out of the backend result. It now advances the workspace with the
+  known-good path the frontend itself computed via `workspaceOutputPath()`
+  (stashed in a ref when the run launches), guarded on truthiness; the toast's
+  match/page counts still come from the backend result, and the non-workspace
+  file-output branch is unchanged. Frontend-only; `dist/` rebuilt.
+- **Workspace file ops are now scoped to the workspace temp dir (BRG-02).** The
+  bridge's `deleteFile`/`copyFile` slots deleted/read whatever path they were
+  handed with no containment check. They now use a new Qt-free
+  `is_within_directory()` guard (`pdf_ops.py`, realpath + `commonpath` — not
+  `startswith`, so a sibling like `…/ws_evil` isn't treated as inside `…/ws`):
+  `deleteFile` refuses any path outside `self._workspace_dir`, and `copyFile`
+  requires its **source** to be inside it (the export **destination** stays
+  unconstrained by design). Defense-in-depth — no known exploit path. Added
+  `tests/test_pdf_ops.py::TestIsWithinDirectory`.
 - **Sanitiser now neutralises JavaScript/Launch/Submit hidden in `/Next` action
   chains (ANL-02).** `sanitize_pdf` judged each annotation only by its top-level
   `/A` `/S`, so an annotation with a benign `/URI` head (kept when
