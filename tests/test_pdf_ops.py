@@ -8,19 +8,28 @@ import pytest
 from pdf_ops import (
     MergeResult,
     PageOpResult,
+    RedactResult,
     SplitResult,
     _parse_ranges,
     _sanitize_title,
     apply_page_operations,
+    contained_output_path,
     extract_text,
     flatten_pdf,
     get_toc,
     merge_pdfs,
     read_metadata,
+    redact_pdf,
     repair_pdf,
     split_pdf,
     write_metadata,
 )
+
+try:
+    import fitz  # noqa: F401  (PyMuPDF — required by redact_pdf below)
+    _HAS_FITZ = True
+except Exception:
+    _HAS_FITZ = False
 
 # ═══════════════════════════════════════════════════════════════════
 #  Pure unit tests
@@ -306,3 +315,168 @@ class TestSanitizeTitle:
 
     def test_empty(self):
         assert _sanitize_title("") == "untitled"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Path-containment guard (TST-02)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestContainedOutputPath:
+    """contained_output_path() is the sole guard against a user-editable
+    naming template writing outside the chosen folder (arbitrary-file-write
+    via an absolute name or ../ traversal). The negative path was untested."""
+
+    def test_normal_name_stays_inside(self, tmp_path):
+        result = contained_output_path(str(tmp_path), "report.pdf")
+        base = os.path.realpath(str(tmp_path))
+        assert os.path.commonpath([base, result]) == base
+
+    def test_subfolder_name_ok(self, tmp_path):
+        # A non-escaping subfolder must be allowed — only ESCAPES should raise,
+        # so this confirms the guard isn't over-eager.
+        result = contained_output_path(str(tmp_path), "sub/report.pdf")
+        base = os.path.realpath(str(tmp_path))
+        assert os.path.commonpath([base, result]) == base
+        assert result != base
+
+    def test_traversal_raises(self, tmp_path):
+        # "../../../etc/passwd" walks out of the folder on both POSIX and Windows.
+        with pytest.raises(ValueError):
+            contained_output_path(str(tmp_path), "../../../etc/passwd")
+
+    def test_absolute_path_raises(self, tmp_path):
+        # os.path.join() silently discards the folder when out_name is absolute.
+        # abspath(os.sep + ...) is absolute on the running OS on both platforms.
+        outside = os.path.abspath(os.sep + "redact_outside_target")
+        with pytest.raises(ValueError):
+            contained_output_path(str(tmp_path), outside)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Redaction (real data destruction) (TST-01)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _text_pdf(path, text: str) -> str:
+    """A one-page PDF with *text* drawn into the content stream."""
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), text)
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
+def _form_pdf(path, field_value: str, *, rect=(72, 72, 400, 120)) -> str:
+    """A one-page PDF with a single AcroForm text widget carrying
+    *field_value* (in /V and its appearance stream)."""
+    doc = fitz.open()
+    page = doc.new_page()
+    w = fitz.Widget()
+    w.field_name = "sensitive"
+    w.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+    w.rect = fitz.Rect(*rect)
+    w.field_value = field_value
+    page.add_widget(w)
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
+def _get_text(path) -> str:
+    doc = fitz.open(path)
+    text = "".join(page.get_text() for page in doc)
+    doc.close()
+    return text
+
+
+def _raw_contents(path) -> bytes:
+    """Concatenated, decompressed page content-stream bytes — where the text
+    operators physically live. If a term is gone from get_text() but present
+    here, it was painted over, not redacted."""
+    doc = fitz.open(path)
+    raw = b"".join(page.read_contents() for page in doc)
+    doc.close()
+    return raw
+
+
+def _acroform_values(path) -> list:
+    """Every /V value string reachable in the saved PDF."""
+    vals = []
+    with pikepdf.open(path) as pdf:
+        for obj in pdf.objects:
+            try:
+                if isinstance(obj, pikepdf.Dictionary) and "/V" in obj:
+                    vals.append(str(obj["/V"]))
+            except Exception:
+                continue
+    return vals
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+class TestRedactPdf:
+    def test_no_terms_or_rects_raises(self, tmp_path):
+        # Guard fires before opening the file, so the input need not exist.
+        with pytest.raises(ValueError):
+            redact_pdf(str(tmp_path / "in.pdf"), str(tmp_path / "out.pdf"))
+
+    @pytest.mark.integration
+    def test_redacted_text_gone_from_get_text(self, tmp_path):
+        src = _text_pdf(tmp_path / "t.pdf",
+                        "SECRET_TERM appears and also secret_term lowercase")
+        out = str(tmp_path / "t_out.pdf")
+        redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        assert "SECRET_TERM" not in _get_text(out)
+
+    @pytest.mark.integration
+    def test_redacted_text_gone_from_raw_bytes(self, tmp_path):
+        # Physically stripped from the content stream, not painted over — this
+        # is the assertion a painting-over regression would fail.
+        src = _text_pdf(tmp_path / "t.pdf",
+                        "SECRET_TERM appears and also secret_term lowercase")
+        out = str(tmp_path / "t_out.pdf")
+        redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        assert b"SECRET_TERM" not in _raw_contents(out)
+
+    @pytest.mark.integration
+    def test_redaction_count_reported(self, tmp_path):
+        src = _text_pdf(tmp_path / "c.pdf", "MARK here MARK there MARK everywhere")
+        out = str(tmp_path / "c_out.pdf")
+        result = redact_pdf(src, out, search_terms=["MARK"])
+        assert isinstance(result, RedactResult)
+        assert result.redaction_count == 3      # three matches on the page
+        assert result.pages_affected == 1
+
+    @pytest.mark.integration
+    def test_case_sensitive_filter(self, tmp_path):
+        text = "SECRET_TERM upper and secret_term lower"
+
+        # case_sensitive=True: only the exact-case match is removed.
+        src = _text_pdf(tmp_path / "cs.pdf", text)
+        cs_out = str(tmp_path / "cs_out.pdf")
+        redact_pdf(src, cs_out, search_terms=["SECRET_TERM"], case_sensitive=True)
+        cs = _get_text(cs_out)
+        assert "SECRET_TERM" not in cs
+        assert "secret_term" in cs               # lowercase survives
+
+        # case_sensitive=False: both are removed.
+        src2 = _text_pdf(tmp_path / "ci.pdf", text)
+        ci_out = str(tmp_path / "ci_out.pdf")
+        redact_pdf(src2, ci_out, search_terms=["SECRET_TERM"], case_sensitive=False)
+        ci = _get_text(ci_out)
+        assert "SECRET_TERM" not in ci
+        assert "secret_term" not in ci
+
+    @pytest.mark.integration
+    def test_form_field_value_removed(self, tmp_path):
+        # AcroForm widget values live in /V + a separate appearance stream;
+        # apply_redactions() alone leaves them fully extractable (the leak this
+        # guards). A redaction rect over the widget must strip the value.
+        src = _form_pdf(tmp_path / "f.pdf", "SECRET_FIELD_VALUE")
+        assert "SECRET_FIELD_VALUE" in _get_text(src)           # present before
+        out = str(tmp_path / "f_out.pdf")
+        redact_pdf(src, out,
+                   rects=[{"page": 0, "x0": 60, "y0": 60, "x1": 420, "y1": 130}])
+        assert "SECRET_FIELD_VALUE" not in _get_text(out)       # not extractable
+        assert "SECRET_FIELD_VALUE" not in "".join(_acroform_values(out))  # /V gone
