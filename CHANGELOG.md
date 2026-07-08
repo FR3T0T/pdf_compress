@@ -1,6 +1,19 @@
 # Changelog
 ## Unreleased
 
+### Security
+- **Sanitiser now neutralises JavaScript/Launch/Submit hidden in `/Next` action
+  chains (ANL-02).** `sanitize_pdf` judged each annotation only by its top-level
+  `/A` `/S`, so an annotation with a benign `/URI` head (kept when
+  `external_links=False`) but a `/Next` running JavaScript survived intact even
+  with `javascript=True` — the analyzer flagged it while sanitise reported
+  success. The annotation loop now walks each `/A` (and each `/AA` trigger
+  entry) `/Next` chain the way the analyzer's `_collect_actions` does, excising
+  any `/JavaScript`/`/Launch`/`/SubmitForm`/`/ImportData` (or inline `/JS`) node
+  under its matching opt while preserving the benign head and any surviving
+  tail; removals bump the existing counters so the count stays honest. Added
+  `tests/test_pdf_analyze.py`. Flips ANL-02 to Fixed in `AUDIT.md`.
+
 ### Docs
 - **Added `AUDIT.md`** — a point-in-time code-audit snapshot of v4.22 (~40 open
   findings across the engine, PDF ops, crypto, analyze, translate, bridge, CLI,

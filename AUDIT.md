@@ -54,7 +54,8 @@ reports on two evasion vectors.**
    reporting success.
 4. **`ANL-02` — Analyze's sanitiser leaves JavaScript hidden in `/Next` action
    chains.** Reports success while the exact flagged high-severity script
-   survives.
+   survives. **✅ Fixed** — the sanitiser now walks `/Next` (and `/AA` entry)
+   chains like the analyzer; see §5.
 
 ---
 
@@ -131,7 +132,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | ENG-01 | 🔴 High | engine | Only JPEG images are recompressed; non-JPEG silently skipped | `engine.py:909` | Open |
 | ENG-02 | 🔴 High | engine | `/SMask` deleted even when compositing failed → transparency lost | `engine.py:1052` | Open |
 | TRN-03 | 🔴 High | translate | Source text in non-Latin/Cyrillic scripts returned untranslated | `pdf_translate.py:308` | Open |
-| ANL-02 | 🔴 High | analyze | Sanitiser leaves JS/Launch/Submit in `/Next` action chains | `pdf_analyze.py:778` | Open |
+| ANL-02 | 🔴 High | analyze | Sanitiser leaves JS/Launch/Submit in `/Next` action chains | `pdf_analyze.py:778` | ✅ Fixed |
 | ENG-03 | 🟠 Med | engine | `q Q` regex can corrupt text / inline images in uncompressed streams | `engine.py:1684` | Open |
 | ENG-04 | 🟠 Med | engine | Ghostscript pipes never drained → deadlock until 5-min timeout | `engine.py:1318` | Open |
 | OPS-02 | 🟠 Med | pdf_ops | `flatten(forms=True, annotations=False)` leaves form-field values | `pdf_ops.py:1291` | Open |
@@ -239,23 +240,31 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Verification:** CONFIRMED (manually — this finding's automated verifier died
   on a session limit; re-checked by hand against the source).
 
-### ANL-02 — Sanitiser leaves JavaScript in `/Next` action chains 🔴
+### ANL-02 — Sanitiser leaves JavaScript in `/Next` action chains 🔴 ✅ Fixed
 - **Location:** `pdf_analyze.py:778` (sanitiser annotation loop, `:775-796`);
   analyzer walk at `:282-290`.
 - **What:** The analyzer follows `/Next` action chains and flags buried
-  JavaScript/Launch/SubmitForm as `high`. The **sanitiser does not** — for each
-  annotation it inspects only the top-level `/A`'s `/S` and never walks
+  JavaScript/Launch/SubmitForm as `high`. The **sanitiser did not** — for each
+  annotation it inspected only the top-level `/A`'s `/S` and never walked
   `a.get('/Next')`. An annotation whose `/A` is a benign `/URI` (kept by default,
-  `external_links=False`) but whose `/Next` runs JavaScript is left fully intact
+  `external_links=False`) but whose `/Next` runs JavaScript was left fully intact
   even with `javascript=True`.
-- **Impact:** `sanitize_pdf` reports success while the exact high-severity script
-  the analyzer flagged survives — false security on a well-known malware evasion
+- **Impact:** `sanitize_pdf` reported success while the exact high-severity script
+  the analyzer flagged survived — false security on a well-known malware evasion
   vector. Reproduced live during the audit (analyzer flags it; sanitiser returns
   `removed={}`; re-analysis still finds the JS).
-- **Fix:** In the sanitise loop, walk the `/A` (and `/AA` entries) `/Next` chains
-  the same way `_collect_actions._walk` does, neutralising any node whose `/S` is
-  `/JavaScript`/`/Launch`/`/SubmitForm`/`/ImportData` (or that carries `/JS`).
-- **Verification:** CONFIRMED (code + live repro).
+- **Fix (applied):** Added `_action_head_drop()` and a recursive
+  `_clean_action_next()`; the annotation loop now runs each `/A` **and each
+  `/AA` trigger entry** through them, excising any node whose `/S` is
+  `/JavaScript`/`/Launch`/`/SubmitForm`/`/ImportData` (or that carries `/JS`),
+  gated on the matching opt, while preserving the benign head (e.g. a kept
+  `/URI`) and any surviving tail. Dropped nodes bump the existing
+  `annot_javascript`/`launch_action`/`submit_action` counters so the count is
+  honest. Depth-capped at 30. Regression test:
+  `tests/test_pdf_analyze.py::TestSanitizeNextChain`.
+- **Verification:** CONFIRMED (code + live repro); now covered by an automated
+  test that builds the `/URI`→`/Next`=`/JavaScript` evasion, sanitises it, and
+  asserts the JS is gone while the link survives.
 
 ---
 

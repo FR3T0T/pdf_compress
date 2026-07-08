@@ -708,6 +708,106 @@ DEFAULT_SANITIZE = {
 }
 
 
+# Maps a dangerous action /S subtype to (sanitize opt, removed[] counter key).
+# /SubmitForm and /ImportData share the submit gate/counter, mirroring the
+# analyzer's grouping in _scan_scripts_and_actions.
+_DANGEROUS_ACTIONS = {
+    "/JavaScript": ("javascript", "annot_javascript"),
+    "/Launch": ("launch_actions", "launch_action"),
+    "/SubmitForm": ("submit_actions", "submit_action"),
+    "/ImportData": ("submit_actions", "submit_action"),
+}
+
+
+def _action_head_drop(action, opts: dict) -> Optional[str]:
+    """Return the removed[] counter key if *action*'s own node must be
+    dropped under *opts*, else None.
+
+    A node is dangerous when its /S is JavaScript/Launch/SubmitForm/
+    ImportData (gated on the matching opt) or it carries an inline /JS
+    entry (gated on ``javascript``) — the same signal the analyzer's
+    _scan_scripts_and_actions flags (``/S`` or inline ``/JS``).
+    """
+    try:
+        stype = _as_str(action.get("/S"))
+    except Exception:
+        return None
+    opt_counter = _DANGEROUS_ACTIONS.get(stype)
+    if opt_counter is not None and opts.get(opt_counter[0]):
+        return opt_counter[1]
+    try:
+        if "/JS" in action and opts.get("javascript"):
+            return "annot_javascript"
+    except Exception:
+        pass
+    return None
+
+
+def _clean_action_next(action, opts: dict, bump, depth: int = 0) -> None:
+    """Recursively excise dangerous nodes buried in *action*'s ``/Next``
+    chain, in place, preserving benign nodes and their surviving tail.
+
+    ANL-02: the analyzer's ``_collect_actions._walk`` follows ``/Next``
+    when flagging buried JavaScript/Launch/SubmitForm, but the sanitiser
+    used to inspect only the top-level ``/A`` — so an annotation with a
+    benign ``/URI`` head (kept when ``external_links`` is off) but a
+    ``/Next`` that runs JavaScript survived even with ``javascript`` on.
+    Each dropped node bumps the same counter its head would, so the count
+    stays honest. Depth-capped (a >30-deep action chain isn't legitimate)
+    and exception-tolerant like the rest of this module.
+    """
+    if depth > 30:
+        try: del action["/Next"]
+        except Exception: pass
+        return
+    try:
+        nxt = action.get("/Next")
+    except Exception:
+        return
+    if nxt is None:
+        return
+    try:
+        nodes = list(nxt) if isinstance(nxt, pikepdf.Array) else [nxt]
+    except Exception:
+        return
+
+    survivors = []
+    for node in nodes:
+        try:
+            if not isinstance(node, pikepdf.Dictionary):
+                continue
+        except Exception:
+            continue
+        # Clean this node's own tail first so a promoted survivor is already
+        # scrubbed and never needs re-processing.
+        _clean_action_next(node, opts, bump, depth + 1)
+        key = _action_head_drop(node, opts)
+        if key is None:
+            survivors.append(node)
+            continue
+        bump(key)
+        # Dangerous node excised — promote its (already-cleaned) /Next tail
+        # so a benign action chained after it isn't lost with it.
+        try:
+            tail = node.get("/Next")
+        except Exception:
+            tail = None
+        if isinstance(tail, pikepdf.Array):
+            survivors.extend(list(tail))
+        elif tail is not None:
+            survivors.append(tail)
+
+    try:
+        if not survivors:
+            del action["/Next"]
+        elif len(survivors) == 1:
+            action["/Next"] = survivors[0]
+        else:
+            action["/Next"] = pikepdf.Array(survivors)
+    except Exception:
+        pass
+
+
 def sanitize_pdf(input_path: str, output_path: str,
                  options: Optional[dict] = None) -> dict:
     """Strip dangerous/active content from a PDF.
@@ -777,19 +877,39 @@ def sanitize_pdf(input_path: str, output_path: str,
                     drop = False
                     a = annot.get("/A")
                     if a is not None:
-                        stype = _as_str(a.get("/S"))
-                        if stype == "/JavaScript" and opts["javascript"]:
-                            drop = True; _bump("annot_javascript")
-                        elif stype == "/Launch" and opts["launch_actions"]:
-                            drop = True; _bump("launch_action")
-                        elif stype in ("/SubmitForm", "/ImportData") and opts["submit_actions"]:
-                            drop = True; _bump("submit_action")
-                        elif stype == "/URI" and opts["external_links"]:
-                            drop = True; _bump("external_link")
-                    # field/annotation additional actions
-                    if "/AA" in annot and opts["javascript"]:
-                        del annot["/AA"]
-                        _bump("annot_aa")
+                        head_key = _action_head_drop(a, opts)
+                        if head_key is not None:
+                            drop = True; _bump(head_key)      # dangerous head → drop annotation
+                        else:
+                            stype = _as_str(a.get("/S"))
+                            if stype == "/URI" and opts["external_links"]:
+                                drop = True; _bump("external_link")
+                            else:
+                                # Benign head kept — but walk its /Next chain so
+                                # a buried JS/Launch/Submit can't ride along (ANL-02).
+                                _clean_action_next(a, opts, _bump)
+                    # field/annotation additional actions (/AA): process each
+                    # trigger entry the same way, excising dangerous heads and
+                    # buried /Next nodes rather than blindly dropping benign ones.
+                    aa = annot.get("/AA")
+                    if isinstance(aa, pikepdf.Dictionary):
+                        for trig in list(aa.keys()):
+                            try:
+                                entry = aa[trig]
+                                if not isinstance(entry, pikepdf.Dictionary):
+                                    continue
+                                ek = _action_head_drop(entry, opts)
+                                if ek is not None:
+                                    del aa[trig]; _bump(ek)
+                                else:
+                                    _clean_action_next(entry, opts, _bump)
+                            except Exception:
+                                continue
+                        try:
+                            if len(aa.keys()) == 0:
+                                del annot["/AA"]
+                        except Exception:
+                            pass
                     if not drop:
                         keep.append(annot)
                 except Exception:
