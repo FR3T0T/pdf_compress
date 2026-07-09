@@ -145,7 +145,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | ANL-04 | 🟠 Med | analyze | Embedded-file sanitiser leaves `/FileAttachment` & `/AF` files | `pdf_analyze.py:918` | ✅ Fixed |
 | TRN-01 | 🟠 Med | translate | PDF→PDF translate aborts entirely on one undetectable short block | `pdf_translate.py:600` | ✅ Fixed |
 | BRG-01 | 🟠 Med | bridge | Worker cleanup keyed by `tool_key` breaks cancel after rapid restart | `ui/bridge.py:327` | ✅ Fixed |
-| CLI-01 | 🟠 Med | CLI | CLI always exits 0 even when files fail | `compress_pdf.py:214` | Open |
+| CLI-01 | 🟠 Med | CLI | CLI always exits 0 even when files fail | `compress_pdf.py:216` | ✅ Fixed |
 | FE-01 | 🟠 Med | frontend | Drag-drop not scoped to active page → pollutes every mounted page | `DropZone.tsx:66` | ✅ Fixed |
 | TST-01 | 🟠 Med | tests | Redaction (data-destruction) has zero test coverage | `pdf_ops.py:1517` | ✅ Fixed |
 | TST-02 | 🟠 Med | tests | Path-containment guard `contained_output_path()` untested | `pdf_ops.py:22` | ✅ Fixed |
@@ -524,16 +524,26 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   Qt-free). Real-app check: cancel a long op, immediately rerun the same tool,
   confirm the rerun is still cancellable.
 
-#### CLI-01 — CLI always exits 0 even when files fail
-- **Location:** `compress_pdf.py:214` (`main` fall-through).
-- **What:** `main()` tallies failures in `n_err` (invalid magic, encrypted,
-  invalid, too-large, catch-all) but never calls `sys.exit()` on that count. It
-  returns `None` → process exits 0 regardless of failures.
+#### CLI-01 — CLI always exits 0 even when files fail ✅ Fixed
+- **Location:** `compress_pdf.py:216` (`main`, previously the fall-through).
+- **What:** `main()` tallied failures in `n_err` (invalid magic, encrypted,
+  invalid, too-large, catch-all) but never called `sys.exit()` on that count.
+  It returned `None` → process exited 0 regardless of failures.
 - **Impact:** Any chained/scripted use (`python compress_pdf.py *.pdf -o out/ &&
   next_step`, the documented batch pattern; `--no-pause` exists for exactly this)
-  treats an all-failed run as success.
-- **Fix:** After the summary, `sys.exit(1 if n_err else 0)`.
-- **Verification:** CONFIRMED.
+  treated an all-failed run as success.
+- **Fix (applied):** Exactly the suggested fix — after the summary (and the
+  optional pause), `sys.exit(1 if n_err else 0)`. An existing CLI test
+  (`test_invalid_file`) had asserted `returncode == 0` on a failed run,
+  codifying the bug; updated to assert `returncode == 1`. Added
+  `tests/test_cli.py::test_success_exits_zero` and
+  `test_mixed_batch_with_one_failure_exits_nonzero` (any failure in a batch
+  must make the whole run exit nonzero, even when other inputs succeed).
+  Confirmed both new/updated assertions fail against the pre-fix code and pass
+  with the fix. Note: `CLI-04`'s bug (not-found inputs never increment
+  `n_err`) is unaffected by this fix and remains open — a batch of only
+  missing files will still exit 0.
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 #### FE-01 — Drag-drop not scoped to the active page ✅ Fixed
 - **Location:** `web-react/src/components/shared/DropZone.tsx:66`.

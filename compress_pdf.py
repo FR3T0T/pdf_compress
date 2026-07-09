@@ -210,6 +210,8 @@ def main():
     if not args.no_pause:
         input("  Done. Press Enter to exit...")
 
+    sys.exit(1 if n_err else 0)
+
 
 if __name__ == "__main__":
     main()
