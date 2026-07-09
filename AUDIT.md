@@ -137,7 +137,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | ENG-02 | 🔴 High | engine | `/SMask` deleted even when compositing failed → transparency lost | `engine.py:1064` | ✅ Fixed |
 | TRN-03 | 🔴 High | translate | Source text in non-Latin/Cyrillic scripts returned untranslated | `pdf_translate.py:305` | ✅ Fixed |
 | ANL-02 | 🔴 High | analyze | Sanitiser leaves JS/Launch/Submit in `/Next` action chains | `pdf_analyze.py:778` | ✅ Fixed |
-| ENG-03 | 🟠 Med | engine | `q Q` regex can corrupt text / inline images in uncompressed streams | `engine.py:1684` | Open |
+| ENG-03 | 🟠 Med | engine | `q Q` regex can corrupt text / inline images in uncompressed streams | `engine.py:1698` | ✅ Fixed |
 | ENG-04 | 🟠 Med | engine | Ghostscript pipes never drained → deadlock until 5-min timeout | `engine.py:1318` | Open |
 | OPS-02 | 🟠 Med | pdf_ops | `flatten(forms=True, annotations=False)` leaves form-field values | `pdf_ops.py:1291` | Open |
 | ANL-01 | 🟠 Med | analyze | In-place sanitise fails on Windows (`os.replace` over open handle) | `pdf_analyze.py:884` | ✅ Fixed |
@@ -307,20 +307,43 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 
 ### 🟠 Medium
 
-#### ENG-03 — `q Q` regex can corrupt uncompressed content streams
-- **Location:** `engine.py:1684` (`_optimize_content_streams`).
-- **What:** `re.sub(rb'\bq\s+Q\b', b'', raw)` runs over the **untokenized** content
-  stream; it doesn't skip `(...)`/`<...>` string literals or `BI…ID…EI`
-  inline-image binary. A literal `q Q` inside a `Tj`/`TJ` string or inline-image
-  data is deleted.
+#### ENG-03 — `q Q` regex can corrupt uncompressed content streams ✅ Fixed
+- **Location:** `engine.py:1698` (`_optimize_content_streams`), helper
+  `_remove_empty_qq_pairs` at `:1669`.
+- **What:** `re.sub(rb'\bq\s+Q\b', b'', raw)` ran over the **untokenized**
+  content stream; it didn't skip `(...)`/`<...>` string literals or
+  `BI…ID…EI` inline-image binary. A literal `q Q` inside a `Tj`/`TJ` string or
+  inline-image data was deleted.
 - **Impact:** Silent, persisted corruption of visible text or an inline image,
-  written back when net savings exceed 16 bytes. **Only affects uncompressed
-  content streams** (for FlateDecode streams `raw` is compressed binary, so the
-  string-literal case can't match) — which narrows but doesn't eliminate it.
-- **Fix:** Tokenise before removing empty `q/Q` pairs, or drop the
-  micro-optimisation (pikepdf's stream recompression already yields the bulk of
-  savings safely).
-- **Verification:** CONFIRMED (reproduced empirically against pikepdf 10.5.0).
+  written back when net savings exceeded 16 bytes. **Only affected uncompressed
+  content streams** (for FlateDecode streams `raw` was compressed binary, so
+  the string-literal case couldn't match) — which narrowed but didn't
+  eliminate it.
+- **Fix (applied):** Took the tokenize option rather than dropping the
+  optimization. `page["/Contents"]` is now parsed with pikepdf's own
+  battle-tested content-stream tokenizer (`pikepdf.parse_content_stream`),
+  which returns discrete instructions and represents an inline image as a
+  single opaque `ContentStreamInlineImage` unit — so string/hex-string/
+  inline-image bytes are never exposed to a byte-level pass at all, empty
+  `q`/`Q` removal now operates purely at the instruction level
+  (`_remove_empty_qq_pairs`: drop a `q` instruction immediately followed by
+  `Q` with nothing between them), and the result is re-serialized with
+  `pikepdf.unparse_content_stream`. As a side effect this also makes the
+  optimization tokenizer-correct for `/Contents` arrays (previously
+  naively concatenated with `read_raw_bytes()` + `b"\n"`, ignoring that each
+  part could have its own filter) — `parse_content_stream` coalesces a page's
+  content array itself. The `> 16 bytes` savings gate is unchanged (still
+  measured against the original's still-encoded size, so it stays a no-op for
+  compressed streams, same as before). Verified empirically: reproduced the
+  exact corruption against the old code (a string literal `(q Q inside a
+  string)` was mangled to `( inside a string)`, and an inline image whose
+  payload was literally `b"q Q"` was deleted down to `ID  EI`); confirmed the
+  fix leaves both byte-for-byte intact while still removing genuinely empty
+  `q`/`Q` pairs. Regression tests:
+  `tests/test_engine.py::TestOptimizeContentStreams` (string literal + inline
+  image survive; empty pairs removed; a single pair below the savings
+  threshold triggers no rewrite at all).
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 #### ENG-04 — Ghostscript pipes never drained → deadlock until timeout
 - **Location:** `engine.py:1318-1349` (`compress_with_ghostscript`).

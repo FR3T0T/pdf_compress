@@ -19,6 +19,7 @@ from engine import (
     EncryptedPDFError,
     InvalidPDFError,
     Result,
+    _optimize_content_streams,
     _sanitize_path_for_subprocess,
     analyze_pdf,
     compress_images_smart,
@@ -469,3 +470,68 @@ class TestCompressImagesSmartSoftMask:
         pdf2 = pikepdf.open(out)
         xobj2 = pdf2.pages[0]["/Resources"]["/XObject"]["/Img0"]
         assert "/SMask" in xobj2
+
+
+class TestOptimizeContentStreams:
+    """ENG-03: removing empty q/Q pairs must never touch bytes inside a
+    string literal, hex string, or inline-image binary payload that
+    happen to look like the same operators."""
+
+    def _build_page(self, pdf):
+        page = pikepdf.Page(pikepdf.Dictionary(
+            Type=pikepdf.Name("/Page"), MediaBox=[0, 0, 200, 200],
+        ))
+        pdf.pages.append(page)
+        return pdf.pages[0]
+
+    def test_string_literal_and_inline_image_survive_intact(self, tmp_path):
+        pdf = pikepdf.Pdf.new()
+        page = self._build_page(pdf)
+
+        # 10 empty q/Q pairs on each side (enough bytes to clear the
+        # 16-byte savings threshold), a string literal containing the
+        # literal bytes "q Q", a genuine non-empty q...cm...Q pair, and
+        # an inline image whose binary payload is literally b"q Q".
+        content = (
+            b"q Q " * 10
+            + b"BT /F1 12 Tf (q Q inside a string) Tj ET "
+            + b"q 1 0 0 1 10 10 cm Q "
+            + b"BI /W 2 /H 1 /BPC 8 /CS /G ID "
+            + bytes([0x71, 0x20, 0x51])  # b"q Q" as raw inline-image bytes
+            + b" EI "
+            + b"q Q " * 10
+        )
+        page["/Contents"] = pdf.make_stream(content)
+        before = bytes(page["/Contents"].read_bytes())
+
+        _optimize_content_streams(pdf)
+
+        after = bytes(page["/Contents"].read_bytes())
+        assert after != before  # savings were large enough to trigger a rewrite
+        assert b"(q Q inside a string)" in after
+
+        instrs = pikepdf.parse_content_stream(page)
+        inline = [i for i in instrs if str(i.operator) == "INLINE IMAGE"]
+        assert len(inline) == 1
+        assert inline[0].operands[0].width == 2
+        assert inline[0].operands[0].height == 1
+
+        # Only the genuine non-empty pair (around `cm`) should remain —
+        # all 20 empty q/Q pairs removed.
+        qs = [str(i.operator) for i in instrs if str(i.operator) in ("q", "Q")]
+        assert qs == ["q", "Q"]
+
+    def test_no_rewrite_when_savings_below_threshold(self, tmp_path):
+        pdf = pikepdf.Pdf.new()
+        page = self._build_page(pdf)
+
+        # A single empty pair saves only a few bytes -- below the
+        # 16-byte threshold, so no rewrite should happen at all.
+        content = b"q Q BT /F1 12 Tf (hello) Tj ET"
+        page["/Contents"] = pdf.make_stream(content)
+        before = bytes(page["/Contents"].read_bytes())
+
+        _optimize_content_streams(pdf)
+
+        after = bytes(page["/Contents"].read_bytes())
+        assert after == before
