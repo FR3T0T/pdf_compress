@@ -189,6 +189,14 @@
   negative path of `contained_output_path()` — `../` traversal and absolute
   `out_name` both raise `ValueError`, while a plain name and a non-escaping
   subfolder stay contained. Flips TST-02 to Fixed.
+- **Backup-on-overwrite test no longer verifies nothing on skip (TST-04).**
+  `tests/test_engine.py::test_compress_backup_on_overwrite` wrapped its only
+  assertions in `if not result.skipped:`, so a compression that skipped (no size
+  gain) ran no assertions and passed vacuously. Removed the guard — the test now
+  asserts `backup_path is not None` and the file exists unconditionally, and also
+  checks the backup is a real copy of the pre-compress original (same size). Safe
+  because the engine creates the backup unconditionally before the skip decision;
+  the un-guarded assertions pass. Production code unchanged. Flips TST-04 to Fixed.
 
 ### Docs
 - **Added `AUDIT.md`** — a point-in-time code-audit snapshot of v4.22 (~40 open

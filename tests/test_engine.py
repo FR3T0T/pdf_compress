@@ -232,13 +232,18 @@ class TestCompressPdf:
 
     @pytest.mark.integration
     def test_compress_backup_on_overwrite(self, sample_pdf, tmp_path):
-        # Copy sample to a working file and compress in-place
+        # Copy sample to a working file and compress in-place. The backup is
+        # created UNCONDITIONALLY (before the skip decision), so these must
+        # hold whether or not compression ends up skipping — the old
+        # `if not result.skipped:` guard let the test verify nothing when a
+        # skip occurred (TST-04).
         work = str(tmp_path / "work.pdf")
         shutil.copy2(sample_pdf, work)
         result = compress_pdf(work, work, backup_on_overwrite=True)
-        if not result.skipped:
-            assert result.backup_path is not None
-            assert os.path.isfile(result.backup_path)
+        assert result.backup_path is not None
+        assert os.path.isfile(result.backup_path)
+        # The backup is a real copy of the pre-compress original.
+        assert os.path.getsize(result.backup_path) == os.path.getsize(sample_pdf)
 
 
 class TestCreateBackup:
