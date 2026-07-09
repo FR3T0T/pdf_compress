@@ -110,6 +110,19 @@
   to Fixed.
 
 ### Fixes
+- **Disabled UPX compression in the PyInstaller spec (PKG-03).** `upx=True`
+  with an empty `upx_exclude` compressed every bundled binary, including the
+  PySide6 Qt6 DLLs and the QtWebEngine runtime -- UPX-compressing Qt/WebEngine
+  DLLs is a well-documented PyInstaller failure mode ("could not load the Qt
+  platform plugin"), and this is a QWebEngine app, the highest-risk case.
+  Conditional in practice (`build.bat` never installs UPX and CI has no
+  frozen-build job, so `upx=True` was usually a silent no-op) but a real trap
+  on any dev machine that independently has UPX on PATH. Took `upx=False` over
+  an ever-growing `upx_exclude` list -- a QWebEngine app's set of Qt-related
+  binaries can grow across Qt version bumps, so excluding by name is an
+  ongoing maintenance burden with a silent-failure mode if it falls behind;
+  disabling UPX removes the risk entirely at the cost of a larger distributed
+  binary.
 - **PyInstaller spec no longer lists a deleted module as a hidden import
   (PKG-02).** `hiddenimports` still included `"ui.dialogs"`, but `ui/dialogs.py`
   was deleted in v4.21 -- PyInstaller emitted a harmless "hidden import not

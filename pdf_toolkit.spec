@@ -120,7 +120,11 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX-compressing Qt/WebEngine DLLs is a well-documented PyInstaller
+    # failure mode ("could not load the Qt platform plugin") -- this is a
+    # QWebEngine app, the highest-risk case, so UPX is disabled outright
+    # rather than maintained as an ever-growing upx_exclude list (PKG-03).
+    upx=False,
     console=False,           # GUI app, no console window
     disable_windowed_traceback=False,
 )
@@ -132,7 +136,6 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
-    upx_exclude=[],
+    upx=False,
     name="PDFToolkit",
 )
