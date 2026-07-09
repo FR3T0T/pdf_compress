@@ -110,6 +110,26 @@
   to Fixed.
 
 ### Fixes
+- **Compression now recompresses non-JPEG images instead of silently skipping
+  them (ENG-01, ENG-05).** `compress_images_smart` decoded every image via
+  `Image.open()` on the still-filter-encoded `read_raw_bytes()` output, which
+  only self-describing formats like JPEG survive — Flate/CCITT/LZW/indexed
+  images (diagrams, screenshots, scans) raised `UnidentifiedImageError`,
+  silently swallowed, so they were never recompressed and the advertised
+  1-bit/Flate-diagram encoding paths were dead code. Images now decode via
+  `pikepdf.PdfImage(xobj).as_pil_image()` (falling back to the old `Image.open`
+  path for anything it can't handle), so those branches are reachable for the
+  first time. That exposed a second, coupled defect (ENG-05): the size-benefit
+  check for both branches compared **uncompressed** candidate bytes (packed
+  1-bit / raw RGB) against `info.raw_size`, the **already-compressed** original
+  stream length — and then wrote those uncompressed bytes to the XObject
+  tagged with a `/FlateDecode` filter it never actually applied, which
+  `pdf.save()` does not fix up and produces an unreadable image. Both branches
+  now `zlib.compress()` the candidate first and compare/write that. Added
+  `tests/test_engine.py::TestCompressImagesSmartNonJpeg` (Flate-diagram and
+  1-bit fixtures; both fail against the old decode path and pass now, with a
+  round-trip decode assertion on the saved output). Flips ENG-01 and ENG-05 to
+  Fixed in `AUDIT.md`.
 - **Preview now updates after a merge (FE-04, issue #58).** Merging produced a
   correct combined PDF, but the in-app preview (the WorkspaceBar preview — the
   app's only preview surface, keyed on the workspace document) kept showing the

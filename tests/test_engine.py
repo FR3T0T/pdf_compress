@@ -3,8 +3,11 @@
 import os
 import shutil
 import threading
+import zlib
 
+import pikepdf
 import pytest
+from PIL import Image
 
 from engine import (
     PRESET_ORDER,
@@ -16,11 +19,77 @@ from engine import (
     Result,
     _sanitize_path_for_subprocess,
     analyze_pdf,
+    compress_images_smart,
     compress_pdf,
     create_backup,
     fmt_size,
     validate_pdf_magic,
 )
+
+# ── Helpers for non-JPEG image fixtures (ENG-01 / ENG-05) ────────────
+
+
+def _make_flate_diagram_pdf(path: str, width: int = 200, height: int = 200,
+                             color: tuple[int, int, int] = (30, 120, 30)) -> str:
+    """A PDF with a Flate-encoded (non-JPEG), few-color 'diagram' image —
+    the class of image ENG-01 silently skipped (decode via Image.open()
+    on still-filter-encoded bytes fails for anything but JPEG)."""
+    pdf = pikepdf.Pdf.new()
+    page = pikepdf.Page(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Page"), MediaBox=[0, 0, 612, 792],
+    ))
+    pdf.pages.append(page)
+
+    pixel_data = bytes(color) * (width * height)
+    # Stored with level=0 (store, no compression) so the "original" is
+    # deliberately poorly compressed — real recompression should shrink it.
+    xobj = pdf.make_stream(zlib.compress(pixel_data, level=0))
+    xobj["/Type"] = pikepdf.Name("/XObject")
+    xobj["/Subtype"] = pikepdf.Name("/Image")
+    xobj["/Width"] = width
+    xobj["/Height"] = height
+    xobj["/ColorSpace"] = pikepdf.Name("/DeviceRGB")
+    xobj["/BitsPerComponent"] = 8
+    xobj["/Filter"] = pikepdf.Name("/FlateDecode")
+
+    pdf.pages[0]["/Resources"] = pikepdf.Dictionary(
+        XObject=pikepdf.Dictionary(Img0=xobj))
+
+    pdf.save(path)
+    pdf.close()
+    return path
+
+
+def _make_bw_pdf(path: str, width: int = 200, height: int = 200) -> str:
+    """A PDF with a 1-bit (bilevel) Flate-encoded image — the other class
+    of image ENG-01 silently skipped."""
+    pdf = pikepdf.Pdf.new()
+    page = pikepdf.Page(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Page"), MediaBox=[0, 0, 612, 792],
+    ))
+    pdf.pages.append(page)
+
+    img = Image.new("1", (width, height), color=1)  # all white
+    for x in range(0, width // 5):
+        for y in range(0, height // 5):
+            img.putpixel((x, y), 0)                 # black corner square
+    raw_bits = img.tobytes()
+
+    xobj = pdf.make_stream(zlib.compress(raw_bits, level=0))
+    xobj["/Type"] = pikepdf.Name("/XObject")
+    xobj["/Subtype"] = pikepdf.Name("/Image")
+    xobj["/Width"] = width
+    xobj["/Height"] = height
+    xobj["/ColorSpace"] = pikepdf.Name("/DeviceGray")
+    xobj["/BitsPerComponent"] = 1
+    xobj["/Filter"] = pikepdf.Name("/FlateDecode")
+
+    pdf.pages[0]["/Resources"] = pikepdf.Dictionary(
+        XObject=pikepdf.Dictionary(Img0=xobj))
+
+    pdf.save(path)
+    pdf.close()
+    return path
 
 # ═══════════════════════════════════════════════════════════════════
 #  Pure unit tests (no file I/O)
@@ -256,3 +325,52 @@ class TestCreateBackup:
     def test_nonexistent_file(self):
         result = create_backup("/nonexistent/file.pdf")
         assert result is None
+
+
+class TestCompressImagesSmartNonJpeg:
+    """ENG-01/ENG-05: non-JPEG images must actually decode and recompress
+    (not be silently skipped via a swallowed UnidentifiedImageError), and
+    the accepted candidate must be compared/written as genuinely
+    Flate-compressed bytes — not raw bytes mislabeled with a FlateDecode
+    filter, which pdf.save() does not fix up and produces an unreadable
+    image."""
+
+    def test_flate_diagram_image_is_recompressed(self, tmp_path):
+        path = str(tmp_path / "diagram.pdf")
+        _make_flate_diagram_pdf(path)
+
+        pdf = pikepdf.open(path)
+        stats = compress_images_smart(pdf, PRESETS["standard"])
+        assert stats.images_recompressed == 1
+        assert stats.images_kept_lossless == 1
+
+        out = str(tmp_path / "out.pdf")
+        pdf.save(out)
+        pdf.close()
+
+        pdf2 = pikepdf.open(out)
+        xobj2 = pdf2.pages[0]["/Resources"]["/XObject"]["/Img0"]
+        decoded = pikepdf.PdfImage(xobj2).as_pil_image().convert("RGB")
+        assert decoded.size == (200, 200)
+        assert decoded.getpixel((100, 100)) == (30, 120, 30)
+        pdf2.close()
+
+    def test_bw_image_is_recompressed(self, tmp_path):
+        path = str(tmp_path / "bw.pdf")
+        _make_bw_pdf(path)
+
+        pdf = pikepdf.open(path)
+        stats = compress_images_smart(pdf, PRESETS["standard"])
+        assert stats.images_recompressed == 1
+        assert stats.images_converted_bw == 1
+
+        out = str(tmp_path / "out.pdf")
+        pdf.save(out)
+        pdf.close()
+
+        pdf2 = pikepdf.open(out)
+        xobj2 = pdf2.pages[0]["/Resources"]["/XObject"]["/Img0"]
+        decoded = pikepdf.PdfImage(xobj2).as_pil_image().convert("L")
+        assert decoded.size == (200, 200)
+        assert decoded.getpixel((5, 5)) == 0        # black corner preserved
+        assert decoded.getpixel((150, 150)) == 255  # white elsewhere

@@ -46,7 +46,9 @@ reports on two evasion vectors.**
 1. **`ENG-01` — Compression only ever re-compresses existing JPEGs.** Every
    Flate/CCITT/LZW/indexed image (diagrams, screenshots, scans) is silently
    skipped; the advertised 1-bit / Flate-for-diagrams / smart-format branches are
-   dead code.
+   dead code. **✅ Fixed** — images now decode via `pikepdf.PdfImage(...)
+   .as_pil_image()`, activating those branches; see §5. (Fixing this exposed and
+   required fixing `ENG-05` in the same pass — see §6.)
 2. **`ENG-02` — Transparency is destroyed.** Soft masks are deleted even when
    compositing failed, baking transparent images into opaque rectangles.
 3. **`TRN-03` — Translation doesn't translate from CJK/Arabic/Hindi/Bengali.**
@@ -129,7 +131,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 
 | ID | Sev | Area | Title | Location | Status |
 |----|-----|------|-------|----------|--------|
-| ENG-01 | 🔴 High | engine | Only JPEG images are recompressed; non-JPEG silently skipped | `engine.py:909` | Open |
+| ENG-01 | 🔴 High | engine | Only JPEG images are recompressed; non-JPEG silently skipped | `engine.py:909` | ✅ Fixed |
 | ENG-02 | 🔴 High | engine | `/SMask` deleted even when compositing failed → transparency lost | `engine.py:1052` | Open |
 | TRN-03 | 🔴 High | translate | Source text in non-Latin/Cyrillic scripts returned untranslated | `pdf_translate.py:305` | ✅ Fixed |
 | ANL-02 | 🔴 High | analyze | Sanitiser leaves JS/Launch/Submit in `/Next` action chains | `pdf_analyze.py:778` | ✅ Fixed |
@@ -146,7 +148,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | TST-01 | 🟠 Med | tests | Redaction (data-destruction) has zero test coverage | `pdf_ops.py:1517` | ✅ Fixed |
 | TST-02 | 🟠 Med | tests | Path-containment guard `contained_output_path()` untested | `pdf_ops.py:22` | ✅ Fixed |
 | RED-01 | 🟠 Med | pdf_ops | Redaction destroys entire page on image-only (scanned) PDFs | `pdf_ops.py:1649` | ✅ Fixed |
-| ENG-05 | 🟡 Low | engine | Size-benefit check compares uncompressed candidate vs compressed original | `engine.py:979` | Open |
+| ENG-05 | 🟡 Low | engine | Size-benefit check compares uncompressed candidate vs compressed original | `engine.py:987` | ✅ Fixed |
 | ENG-06 | 🟡 Low | engine | Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px` | `engine.py:721` | Open |
 | OPS-01 | 🟡 Low | pdf_ops | `protect_pdf` sets owner password = user password → restrictions bypassable | `pdf_ops.py:430` | Open |
 | OPS-03 | 🟡 Low | pdf_ops | `add_watermark` leaks open file handle on malformed range/color | `pdf_ops.py:823` | Open |
@@ -176,33 +178,43 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 
 ## 5. High-severity findings
 
-### ENG-01 — Compression only ever re-compresses existing JPEGs 🔴
-- **Location:** `engine.py:909` (decode); dead branches at `:946`, `:966`;
-  swallowing `except` at `:1063`.
-- **What:** `compress_images_smart` decodes every image with
+### ENG-01 — Compression only ever re-compresses existing JPEGs 🔴 ✅ Fixed
+- **Location:** `engine.py:909` (decode); previously-dead branches at `:953`,
+  `:976`; swallowing `except` at `:1073`.
+- **What:** `compress_images_smart` decoded every image with
   `Image.open(io.BytesIO(xobj.read_raw_bytes()))`. `read_raw_bytes()` returns the
   **still-PDF-filter-encoded** stream. Only self-describing formats decode that
   way — DCTDecode (literal JPEG), maybe JPXDecode. FlateDecode / CCITTFax / LZW /
-  RunLength / indexed images raise `UnidentifiedImageError`, which is swallowed at
-  `:1063`, so the image is skipped untouched.
+  RunLength / indexed images raised `UnidentifiedImageError`, swallowed at
+  `:1073`, so the image was skipped untouched.
 - **Evidence:** `raw = bytes(xobj.read_raw_bytes()); img = Image.open(io.BytesIO(raw))`
-  at `:908-909`. `_is_photographic` returns `True` for every JPEG at `:634`, so
-  the only images that *do* open are always classified `is_photo=True` → the
-  `elif not is_photo` (Flate-for-diagrams, `:966`) and the
-  `if is_monochrome or bpc==1` (1-bit, `:946`) branches are unreachable.
+  (old `:908-909`). `_is_photographic` returns `True` for every JPEG at `:634`, so
+  the only images that *did* open were always classified `is_photo=True` → the
+  `elif not is_photo` (Flate-for-diagrams) and the `if is_monochrome or bpc==1`
+  (1-bit) branches were unreachable.
 - **Impact:** Every non-JPEG image — Flate "PNG-like" diagrams, screenshots,
-  indexed images, and CCITT/Flate 1-bit scans — is **never recompressed or
-  downscaled**. The engine only ever re-JPEGs existing JPEGs. Scanned and
-  diagram-heavy PDFs get little/no image compression, with **no error surfaced**.
+  indexed images, and CCITT/Flate 1-bit scans — was **never recompressed or
+  downscaled**. The engine only ever re-JPEG'd existing JPEGs. Scanned and
+  diagram-heavy PDFs got little/no image compression, with **no error surfaced**.
   The advertised "1-bit encoding / Flate for diagrams / smart format selection"
-  features are inert on real inputs.
-- **Fix:** Decode via `pikepdf.PdfImage(xobj).as_pil_image()` (or
-  `read_bytes()` + `Image.frombytes` with the colorspace) so Flate/CCITT/LZW/
-  indexed images actually decode and the downscale/Flate/B&W branches become
-  reachable. **Note:** fixing this *activates* `ENG-05`, which must be fixed in
-  the same pass. The same `read_raw_bytes` misuse recurs at `:537`/`:568` and in
-  `_load_smask_image` (`:767`) — see `ENG-02`.
-- **Verification:** CONFIRMED.
+  features were inert on real inputs.
+- **Fix (applied):** Decode now tries `pikepdf.PdfImage(xobj).as_pil_image()`
+  first (falls back to the old `Image.open(io.BytesIO(raw))` for anything it
+  can't handle), so Flate/CCITT/LZW/indexed images actually decode and the
+  downscale/Flate/B&W branches are reachable for the first time. Fixing this
+  exposed a second, coupled defect in those same branches — the size-benefit
+  check and the write itself were both wrong — fixed together as `ENG-05` (see
+  §6): the candidate is now actually `zlib.compress()`-ed before comparing
+  against `info.raw_size` and before being written with the `/FlateDecode`
+  filter tag (previously it wrote **uncompressed** bytes under that filter name,
+  which `pdf.save()` does not fix up and produces an unreadable image — latent
+  until this fix made the branches reachable). The same `read_raw_bytes` misuse
+  recurs at `:537`/`:568` and in `_load_smask_image` (`:764`) — that's `ENG-02`,
+  left as a separate fix. Regression tests:
+  `tests/test_engine.py::TestCompressImagesSmartNonJpeg` (Flate-diagram and
+  1-bit fixtures; both fail against the pre-fix decode path, pass now, and
+  assert the saved output round-trips through a real decode).
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 ### ENG-02 — Soft mask deleted even when compositing failed 🔴
 - **Location:** `engine.py:1052` (and sibling deletes at `:960`, `:988`,
@@ -520,21 +532,36 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 
 ### 🟡 Low
 
-#### ENG-05 — Size check compares uncompressed candidate vs compressed original
-- **Location:** `engine.py:951` (B&W), `:979` (Flate diagram).
+#### ENG-05 — Size check compares uncompressed candidate vs compressed original ✅ Fixed
+- **Location:** `engine.py:956` (B&W), `:987` (Flate diagram).
 - **What:** `len(bw_data) < info.raw_size` / `len(raw_pixels) < info.raw_size`
-  compare **pre-compression** candidate bytes (packed bits / raw RGB, which
-  pikepdf will still Flate on write) against `info.raw_size`, the **already-
-  compressed** original stream length. Apples-to-oranges.
-- **Impact:** The B&W accept/reject decision doesn't measure real post-Flate
-  savings, and the diagram primary branch rarely fires (uncompressed RGB usually
+  compared **pre-compression** candidate bytes (packed bits / raw RGB) against
+  `info.raw_size`, the **already-compressed** original stream length —
+  apples-to-oranges. Worse than the original audit assumed: the corresponding
+  `xobj.write(bw_data / raw_pixels, filter=pikepdf.Name("/FlateDecode"))` then
+  wrote those **uncompressed** bytes to the stream while declaring them
+  FlateDecode-encoded. Verified empirically that `pikepdf.Object.write()` does
+  **not** compress on write — it stores `data` verbatim under the given filter
+  name — and `pdf.save()`'s `compress_streams` does not fix up a stream that
+  already declares a filter, so the resulting image was undecodable
+  (`DataDecodingError: ... incorrect header check` on re-open). The original
+  audit's assumption that "pikepdf will still Flate on write" was incorrect.
+- **Impact:** The B&W accept/reject decision didn't measure real post-Flate
+  savings, and the diagram primary branch rarely fired (uncompressed RGB usually
   exceeds the compressed original), routing diagrams to the lossy JPEG fallback.
-  Conservative (never bloats). **Currently latent** because these branches are
-  unreachable per `ENG-01` — but becomes live the moment `ENG-01` is fixed, so fix
-  both together.
-- **Fix:** Compress the candidate (`zlib.compress`) and compare that length, or
-  compare actual written stream sizes.
-- **Verification:** CONFIRMED.
+  **Currently latent** because these branches were unreachable per `ENG-01` — but
+  the write-corruption half would have become a real, active bug (broken images
+  in the output PDF) the moment `ENG-01` was fixed, so both were fixed together.
+- **Fix (applied):** Both candidates (`bw_data`, `raw_pixels`) are now run through
+  `zlib.compress(data, level=9)` before the accept/reject comparison against
+  `info.raw_size`, and the **compressed** bytes — not the raw ones — are what
+  gets written under the `/FlateDecode` filter, so the stream's declared filter
+  now matches its actual contents. Verified empirically (`xobj.write()` +
+  `pdf.save()` + reopen + `read_bytes()` round-trip) before and after the fix.
+  Regression tests: `tests/test_engine.py::TestCompressImagesSmartNonJpeg`
+  (asserts the saved PDF's image decodes correctly via
+  `pikepdf.PdfImage(...).as_pil_image()` after a full save/reopen cycle).
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 #### ENG-06 — Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px`
 - **Location:** `engine.py:452-453`, `:721`.
