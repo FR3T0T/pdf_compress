@@ -50,7 +50,7 @@ from epdf_crypto import (
     epdf_read_metadata,
     is_epdf,
 )
-from pdf_analyze import DEFAULT_SANITIZE, analyze_file, sanitize_pdf
+from pdf_analyze import DEFAULT_SANITIZE, analyze_file, strip_file
 from pdf_ops import (
     add_page_numbers,
     add_watermark,
@@ -598,18 +598,23 @@ class Bridge(QObject):
     @Slot(str, str, str, result=str)
     def sanitizeDocument(self, path: str, output_path: str,
                          options_json: str) -> str:
-        """Strip active/dangerous content from a PDF. Returns JSON.
+        """Strip active/dangerous content from a PDF, or privacy metadata
+        from an image. Returns JSON.
 
-        ``options_json`` is a JSON object overriding DEFAULT_SANITIZE keys
-        (javascript, launch_actions, auto_actions, embedded_files,
-        submit_actions, external_links, metadata).
+        Dispatches by file type via ``strip_file``: PDFs go to ``sanitize_pdf``
+        honouring ``options_json`` (a JSON object overriding DEFAULT_SANITIZE
+        keys: javascript, launch_actions, auto_actions, embedded_files,
+        submit_actions, external_links, metadata); JPEG/PNG images go to
+        ``strip_image_metadata`` (which removes all EXIF/GPS/thumbnail/
+        authorship metadata — the options don't apply). PDF behaviour is
+        unchanged.
         """
         try:
             try:
                 opts = json.loads(options_json) if options_json else {}
             except Exception:
                 opts = {}
-            result = sanitize_pdf(path, output_path, opts)
+            result = strip_file(path, output_path, opts)
             result["success"] = True
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:

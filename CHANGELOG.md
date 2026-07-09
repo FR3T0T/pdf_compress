@@ -39,6 +39,26 @@
   Non-JPEG images (Flate/CCITT) don't carry EXIF and are skipped. The
   EXIF-survives-embedding round-trip was verified empirically end-to-end. No new
   dependencies. Added `tests/test_pdf_analyze.py::TestEmbeddedImageExif`.
+- **Analyze tool can now strip metadata from images (detect → remove).** The
+  earlier phases let the Analyze tool *detect* image privacy metadata; this
+  completes it with a *remove* action mirroring `sanitize_pdf`. New backend
+  `strip_image_metadata(input, output)` first detects what sensitive metadata is
+  present (reusing the Phase-1 scanners, so the reported `removed` categories —
+  `gps`/`camera`/`thumbnail`/`authorship` — match what the analyzer flags), then
+  writes a metadata-free copy of the **same format** atomically (temp file +
+  `os.replace`): JPEGs are re-encoded **losslessly** (`quality="keep"` preserves
+  the original DCT coefficients, so no recompression artifacts) with every EXIF
+  block dropped; PNGs are rebuilt from a copy with a cleared info dict. Re-scanning
+  the output yields no findings (verified empirically). A new
+  `strip_file(input, output, options)` dispatcher routes PDFs to `sanitize_pdf`
+  (honouring the options) and images to `strip_image_metadata`, mirroring
+  `analyze_file`. The `sanitizeDocument` bridge slot now goes through `strip_file`
+  (PDF behaviour unchanged); the Analyze page re-enables the clean/strip action
+  for images (hidden in Phase 2), names the clean copy with the image's own
+  extension (`photo_clean.jpg`, not `_clean.pdf`) with a matching save-dialog
+  filter, and shows image-appropriate copy in place of the PDF sanitize
+  checkboxes. Frontend rebuilt (`web-react/dist/`). Added
+  `tests/test_pdf_analyze.py::TestStripImageMetadata` and `TestStripFileDispatch`.
 
 ### Security
 - **Redaction of scanned (image-only) PDFs now works instead of blanking the page

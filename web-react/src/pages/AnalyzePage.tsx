@@ -82,6 +82,14 @@ export function AnalyzePage() {
 
   const pickOutput = async (): Promise<string | null> => {
     if (!filePath) return null;
+    if (isImage) {
+      // Keep the image's own extension — a stripped JPEG stays a JPEG.
+      const m = bridgeApi.basename(filePath).match(/^(.*?)(\.(jpe?g|png))$/i);
+      const base = m ? m[1] : bridgeApi.basename(filePath);
+      const ext = (m ? m[2] : '.jpg').toLowerCase();
+      const filter = /\.png$/i.test(ext) ? 'PNG Image (*.png)' : 'JPEG Image (*.jpg *.jpeg)';
+      return bridgeApi.saveFile(filter, `${base}_clean${ext}`);
+    }
     const base = bridgeApi.basename(filePath).replace(/\.pdf$/i, '');
     return bridgeApi.saveFile('PDF Files (*.pdf)', `${base}_clean.pdf`);
   };
@@ -94,7 +102,11 @@ export function AnalyzePage() {
       if (!res.success) {
         toast.error(res.error || 'Sanitize failed.');
       } else if (!res.total_removed) {
-        toast.info('Nothing matched the selected options — clean copy written.');
+        toast.info(
+          isImage
+            ? 'No metadata needed removing — clean copy written.'
+            : 'Nothing matched the selected options — clean copy written.'
+        );
       } else {
         toast.success(`Removed ${res.total_removed} item${res.total_removed === 1 ? '' : 's'}. Clean copy saved.`);
       }
@@ -151,13 +163,14 @@ export function AnalyzePage() {
             ))}
           </div>
 
-          {hasRisk && sanitizeDefaults && !isImage && (
+          {hasRisk && sanitizeDefaults && (
             <div style={{ marginTop: 'var(--space-4)' }}>
               <SanitizePanel
                 defaults={sanitizeDefaults}
                 onPickOutput={pickOutput}
                 onSanitize={runSanitize}
                 busy={sanitizing}
+                imageMode={isImage}
               />
             </div>
           )}
