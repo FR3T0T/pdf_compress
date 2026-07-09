@@ -110,6 +110,17 @@
   to Fixed.
 
 ### Fixes
+- **`.epdf` decrypt now raises `EPDFError` for malformed headers instead of a
+  raw exception (CRY-01).** Attacker-controllable header fields were read
+  unguarded: a non-numeric `version` raised `ValueError`; a missing
+  `salt`/`nonce` raised `KeyError`; non-base64 content raised
+  `binascii.Error`. None were wrapped, unlike `epdf_read_metadata`, which
+  breaks callers relying on `except EPDFError` to distinguish "bad file" from
+  a programming bug (not exploitable -- any tampered field still fails
+  AEAD/HMAC regardless). Both reads now catch their respective exception
+  types and re-raise as `EPDFFormatError`. Verified against three tampered-
+  header cases empirically before/after. Added
+  `tests/test_epdf_crypto.py::TestDecryptMalformedHeader`.
 - **`images_to_pdf` now actually preserves quality for lossless sources
   (OPS-05).** Despite the docstring's claim, every input -- including
   lossless PNG/TIFF -- was unconditionally re-encoded to lossy JPEG q92, with

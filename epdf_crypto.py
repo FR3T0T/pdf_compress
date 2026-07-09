@@ -418,7 +418,10 @@ def epdf_decrypt(input_path: str, output_path: str, password: str) -> dict:
 
     cipher = metadata.get("cipher")
     kdf = metadata.get("kdf", "argon2id")
-    version = int(metadata.get("version", 1))
+    try:
+        version = int(metadata.get("version", 1))
+    except (TypeError, ValueError) as exc:
+        raise EPDFFormatError(f"Invalid version in .epdf metadata: {exc}") from exc
 
     if cipher not in _DECRYPTORS:
         raise EPDFFormatError(f"Unsupported cipher in file: {cipher}")
@@ -439,8 +442,13 @@ def epdf_decrypt(input_path: str, output_path: str, password: str) -> dict:
     aad = header if version >= 2 else None
 
     # Derive key
-    salt = b64decode(metadata["salt"])
-    nonce = b64decode(metadata["nonce"])
+    try:
+        salt = b64decode(metadata["salt"])
+        nonce = b64decode(metadata["nonce"])
+    except (KeyError, ValueError) as exc:
+        # ValueError also catches binascii.Error (its subclass) from a
+        # non-base64 value; KeyError from a missing salt/nonce field.
+        raise EPDFFormatError(f"Invalid salt/nonce in .epdf metadata: {exc}") from exc
     kdf_params = metadata.get("kdf_params", DEFAULT_KDF_PARAMS)
     key = _derive_key(password, salt, kdf, kdf_params)
 

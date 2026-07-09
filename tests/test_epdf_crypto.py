@@ -213,3 +213,60 @@ class TestDecryptRejectsHostileKdf:
 
         with pytest.raises(EPDFError):  # EPDFFormatError is an EPDFError subclass
             epdf_decrypt(enc, str(tmp_path / "out.pdf"), "pw")
+
+
+def _tamper_epdf_metadata(enc_path, mutate_fn):
+    """Rewrite an .epdf file's JSON metadata header via mutate_fn(meta_dict),
+    keeping the encrypted payload untouched."""
+    with open(enc_path, "rb") as f:
+        data = f.read()
+    meta_len = struct.unpack("<I", data[8:12])[0]
+    meta = json.loads(data[12:12 + meta_len])
+    payload = data[12 + meta_len:]
+    mutate_fn(meta)
+    new_meta = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+    with open(enc_path, "wb") as f:
+        f.write(EPDF_MAGIC + struct.pack("<I", len(new_meta)) + new_meta + payload)
+
+
+class TestDecryptMalformedHeader:
+    """CRY-01: attacker-controllable header fields (version, salt, nonce) must
+    fail as EPDFFormatError, not a raw ValueError/KeyError/binascii.Error --
+    callers rely on `except EPDFError` to distinguish "bad file" from a
+    programming bug."""
+
+    @pytest.mark.integration
+    def test_non_numeric_version(self, sample_pdf, tmp_path):
+        enc = str(tmp_path / "bad.epdf")
+        epdf_encrypt(sample_pdf, enc, "pw")
+        _tamper_epdf_metadata(enc, lambda m: m.__setitem__("version", "not-a-number"))
+
+        with pytest.raises(EPDFFormatError):
+            epdf_decrypt(enc, str(tmp_path / "out.pdf"), "pw")
+
+    @pytest.mark.integration
+    def test_missing_salt(self, sample_pdf, tmp_path):
+        enc = str(tmp_path / "bad.epdf")
+        epdf_encrypt(sample_pdf, enc, "pw")
+        _tamper_epdf_metadata(enc, lambda m: m.pop("salt", None))
+
+        with pytest.raises(EPDFFormatError):
+            epdf_decrypt(enc, str(tmp_path / "out.pdf"), "pw")
+
+    @pytest.mark.integration
+    def test_missing_nonce(self, sample_pdf, tmp_path):
+        enc = str(tmp_path / "bad.epdf")
+        epdf_encrypt(sample_pdf, enc, "pw")
+        _tamper_epdf_metadata(enc, lambda m: m.pop("nonce", None))
+
+        with pytest.raises(EPDFFormatError):
+            epdf_decrypt(enc, str(tmp_path / "out.pdf"), "pw")
+
+    @pytest.mark.integration
+    def test_non_base64_salt(self, sample_pdf, tmp_path):
+        enc = str(tmp_path / "bad.epdf")
+        epdf_encrypt(sample_pdf, enc, "pw")
+        _tamper_epdf_metadata(enc, lambda m: m.__setitem__("salt", "!!!not-valid-base64!!!"))
+
+        with pytest.raises(EPDFFormatError):
+            epdf_decrypt(enc, str(tmp_path / "out.pdf"), "pw")
