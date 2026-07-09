@@ -110,6 +110,20 @@
   to Fixed.
 
 ### Fixes
+- **Ghostscript pass no longer deadlocks on large stderr output (ENG-04).**
+  `compress_with_ghostscript`'s poll loop only called `proc.wait(timeout=2.0)`
+  and never drained the piped stdout/stderr; if `gs` wrote more than the OS
+  pipe buffer (~64 KB — font-substitution/recoverable-error diagnostics that
+  `-dQUIET` doesn't suppress), it blocked on the full pipe while we blocked in
+  `wait()`, stalling for the full 5-minute timeout before the GS pass was
+  silently discarded. The loop now uses `proc.communicate(timeout=2.0)`
+  instead, continuously draining both pipes while polling (safe to retry per
+  the `subprocess` docs — no output lost); cancellation/timeout handling is
+  unchanged. Reproduced the deadlock empirically (a child writing 500 KB to a
+  piped stdout never returns from a `wait()`-only loop) and confirmed the fix
+  resolves it in milliseconds. Added an optional `gs_timeout` parameter
+  (default unchanged) so tests can verify this without waiting 5 minutes on a
+  regression. Added `tests/test_engine.py::TestCompressWithGhostscript`.
 - **Content-stream cleanup no longer corrupts text or inline images (ENG-03).**
   `_optimize_content_streams`' empty-`q`/`Q`-pair removal ran a raw-byte regex
   over the untokenized content stream, so a literal "q Q" inside a `Tj`/`TJ`

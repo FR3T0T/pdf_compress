@@ -4,13 +4,17 @@ import io
 import os
 import random
 import shutil
+import subprocess
+import sys
 import threading
+import time
 import zlib
 
 import pikepdf
 import pytest
 from PIL import Image
 
+import engine
 from engine import (
     PRESET_ORDER,
     PRESETS,
@@ -24,6 +28,7 @@ from engine import (
     analyze_pdf,
     compress_images_smart,
     compress_pdf,
+    compress_with_ghostscript,
     create_backup,
     fmt_size,
     validate_pdf_magic,
@@ -535,3 +540,47 @@ class TestOptimizeContentStreams:
 
         after = bytes(page["/Contents"].read_bytes())
         assert after == before
+
+
+class TestCompressWithGhostscript:
+    """ENG-04: the poll loop must drain stdout/stderr while waiting, or a
+    child that fills the OS pipe buffer deadlocks against our own
+    un-drained wait()."""
+
+    def test_large_stderr_output_does_not_deadlock(self, monkeypatch, tmp_path, sample_pdf):
+        # A fake "gs" that writes far more than a pipe buffer (~64KB) to
+        # stderr before exiting -- simulating Ghostscript's font-substitution
+        # diagnostics that -dQUIET doesn't suppress.
+        script = tmp_path / "fake_gs.py"
+        out_path = tmp_path / "gs_out.pdf"
+        script.write_text(
+            "import sys\n"
+            "sys.stderr.buffer.write(b'x' * 500_000)\n"
+            "sys.stderr.flush()\n"
+            f"open({str(out_path)!r}, 'wb').write(b'%PDF-1.4 fake output')\n"
+        )
+
+        monkeypatch.setattr(engine, "find_ghostscript", lambda **kw: sys.executable)
+
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, **kwargs):
+            # Ignore the real (Ghostscript-flavored) argv -- run the fake
+            # script instead, keeping the same stdout/stderr piping so the
+            # actual polling loop in compress_with_ghostscript is exercised
+            # against a real OS pipe, unmodified.
+            return real_popen([sys.executable, str(script)], **kwargs)
+
+        monkeypatch.setattr(engine.subprocess, "Popen", fake_popen)
+
+        start = time.time()
+        result = compress_with_ghostscript(
+            sample_pdf, str(out_path), "standard", gs_timeout=3.0,
+        )
+        elapsed = time.time() - start
+
+        # Draining correctly, this finishes in a fraction of a second.
+        # A regression back to wait()-only polling would hang until the
+        # (here shortened) gs_timeout and return None.
+        assert elapsed < 2.0
+        assert result is not None
