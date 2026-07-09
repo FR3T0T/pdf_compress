@@ -110,6 +110,16 @@
   to Fixed.
 
 ### Fixes
+- **Non-dict `kdf_params` in an `.epdf` header now raises `EPDFError` instead
+  of a raw `TypeError` (CRY-02).** `_derive_key` merged `kdf_params` via
+  `{**DEFAULT_KDF_PARAMS, **(kdf_params or {})}`; a crafted header setting
+  `kdf_params` to a non-mapping (a JSON list or string) made the `**` spread
+  raise `TypeError` before `_validate_kdf_params` ever ran, escaping its
+  `EPDFFormatError` contract (same gap as CRY-01, fed from the same decrypt
+  path). `_derive_key` now asserts `isinstance(kdf_params, dict)` before the
+  merge and raises `EPDFFormatError` otherwise. Verified empirically
+  before/after against two tampered-header cases. Added
+  `tests/test_epdf_crypto.py::TestDecryptNonDictKdfParams`.
 - **`.epdf` decrypt now raises `EPDFError` for malformed headers instead of a
   raw exception (CRY-01).** Attacker-controllable header fields were read
   unguarded: a non-numeric `version` raised `ValueError`; a missing

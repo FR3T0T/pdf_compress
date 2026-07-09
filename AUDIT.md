@@ -157,7 +157,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | OPS-04 | 🟡 Low | pdf_ops | `split_pdf` filename collisions silently overwrite | `pdf_ops.py:306` | ✅ Fixed |
 | OPS-05 | 🟡 Low | pdf_ops | `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality" | `pdf_ops.py:644` | ✅ Fixed |
 | CRY-01 | 🟡 Low | crypto | Decrypt raises non-`EPDFError` types on malformed headers | `epdf_crypto.py:446` | ✅ Fixed |
-| CRY-02 | 🟡 Low | crypto | Non-dict `kdf_params` bypasses validation → uncaught `TypeError` | `epdf_crypto.py:134` | Open |
+| CRY-02 | 🟡 Low | crypto | Non-dict `kdf_params` bypasses validation → uncaught `TypeError` | `epdf_crypto.py:138` | ✅ Fixed |
 | TRN-02 | 🟡 Low | translate | Temp PNG leaks if `pix.save` fails before the cleanup try/finally | `pdf_translate.py:450` | ✅ Fixed |
 | BRG-02 | 🟡 Low | bridge | `deleteFile`/`copyFile` lack workspace-dir path containment | `ui/bridge.py:851` | ✅ Fixed |
 | BRG-03 | 🟡 Low | bridge | Slot-level param parse runs outside worker try/except → UI hangs | `ui/bridge.py:722` | ✅ Fixed |
@@ -791,17 +791,22 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `tests/test_epdf_crypto.py::TestDecryptMalformedHeader`.
 - **Verification:** CONFIRMED; now covered by automated tests.
 
-#### CRY-02 — Non-dict `kdf_params` bypasses validation → uncaught `TypeError`
-- **Location:** `epdf_crypto.py:134` (`_derive_key`), fed from `:444`.
+#### CRY-02 — Non-dict `kdf_params` bypasses validation → uncaught `TypeError` ✅ Fixed
+- **Location:** `epdf_crypto.py:138` (`_derive_key`), fed from `:453`.
 - **What:** `params = _validate_kdf_params({**DEFAULT_KDF_PARAMS, **(kdf_params or
-  {})})` — if a crafted header sets `kdf_params` to a non-mapping (JSON list /
-  string), the `**` spread raises `TypeError` **before** `_validate_kdf_params`
-  runs, escaping its clean `EPDFFormatError` path.
+  {})})` — if a crafted header set `kdf_params` to a non-mapping (JSON list /
+  string), the `**` spread raised `TypeError` **before** `_validate_kdf_params`
+  ran, escaping its clean `EPDFFormatError` path.
 - **Impact:** Same `EPDFError`-contract gap as `CRY-01`; fails fast before Argon2
   (no DoS/OOM), bridge prevents a crash — only a raw error message.
-- **Fix:** Assert `isinstance(kdf_params, dict)` (raise `EPDFFormatError`
-  otherwise) before the merge.
-- **Verification:** CONFIRMED.
+- **Fix (applied):** `_derive_key` now asserts `isinstance(kdf_params, dict)`
+  (when not `None`) and raises `EPDFFormatError` otherwise, before the merge.
+  Verified empirically against two tampered-header cases (`kdf_params` set to
+  a JSON list, and to a string): pre-fix, both raised a raw `TypeError`
+  ("'list'/'str' object is not a mapping"); post-fix, both raise
+  `EPDFFormatError`. Regression tests:
+  `tests/test_epdf_crypto.py::TestDecryptNonDictKdfParams`.
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 #### TRN-02 — Temp PNG leak if `pix.save` fails ✅ Fixed
 - **Location:** `pdf_translate.py:450` (`_extract_pages`, OCR fallback).
