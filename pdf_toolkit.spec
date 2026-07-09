@@ -18,12 +18,18 @@ block_cipher = None
 # ── Paths ────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.abspath(SPECPATH)
 WEB_REACT_DIST = os.path.join(PROJECT_ROOT, "web-react", "dist")
+ASSETS_FONTS = os.path.join(PROJECT_ROOT, "assets", "fonts")
 
 # ── Data files (frontend assets) ─────────────────────────────────────
 # The built React frontend. web_shell.py resolves web-react/dist/index.html
 # relative to the project root, so it's bundled at the same relative path.
+# assets/fonts/ (DejaVuSans.ttf) is bundled the same way -- pdf_translate.py
+# resolves it relative to its own __file__, which in a frozen build means
+# relative to the bundle root (PKG-01); without this, translated-PDF output
+# silently falls back to OS fonts (or Latin-only helv if none are found).
 datas = [
     (WEB_REACT_DIST, os.path.join("web-react", "dist")),
+    (ASSETS_FONTS, os.path.join("assets", "fonts")),
 ]
 
 # ── Hidden imports ───────────────────────────────────────────────────

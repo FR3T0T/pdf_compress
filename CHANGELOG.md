@@ -110,6 +110,14 @@
   to Fixed.
 
 ### Fixes
+- **Frozen (PyInstaller) build now bundles the portable translation font
+  (PKG-01).** `pdf_translate` prefers the committed `assets/fonts/DejaVuSans.ttf`
+  for image-preserving translated-PDF output, but the spec's `datas` only
+  bundled `web-react/dist` -- in a frozen build the font was absent and the
+  loader silently fell back to OS fonts, then to Latin-only `helv`, defeating
+  the "portable across machines" guarantee (in practice usually masked on
+  Windows by the `arial.ttf` fallback, unless that's also missing). Added the
+  fonts dir to `datas`, mirroring the existing `web-react/dist` entry.
 - **Missing CLI inputs now count toward the failure tally and exit code
   (CLI-04).** A non-existent input printed a `SKIP` line and moved on without
   incrementing any counter, inconsistent with the invalid-magic case right
