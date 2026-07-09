@@ -85,3 +85,23 @@ class TestCLI:
             with pikepdf.open(str(out_dir / f)) as pdf:
                 markers.add(str(pdf.Root["/Marker"]))
         assert markers == {"FROM_A", "FROM_B"}
+
+    @pytest.mark.integration
+    def test_no_pause_flag_omitted_on_closed_stdin_does_not_crash(self, sample_pdf, tmp_path):
+        # CLI-03: without --no-pause, an unguarded input() at exit raised
+        # EOFError on non-interactive stdin (piped/redirected/CI), crashing
+        # with exit code 1 regardless of whether compression actually
+        # succeeded -- masking the real exit status CLI-01 established.
+        # A closed pipe (not DEVNULL/NUL, which Windows reports as a tty)
+        # reliably reproduces non-interactive stdin.
+        out = str(tmp_path / "cli_out.pdf")
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = subprocess.Popen(
+            [sys.executable, "compress_pdf.py", sample_pdf, "-o", out],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env,
+        )
+        _, stderr = proc.communicate(input="", timeout=60)
+        assert proc.returncode == 0, stderr
+        assert "EOFError" not in stderr

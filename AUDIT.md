@@ -162,7 +162,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | BRG-02 | 🟡 Low | bridge | `deleteFile`/`copyFile` lack workspace-dir path containment | `ui/bridge.py:851` | ✅ Fixed |
 | BRG-03 | 🟡 Low | bridge | Slot-level param parse runs outside worker try/except → UI hangs | `ui/bridge.py:722` | ✅ Fixed |
 | CLI-02 | 🟡 Low | CLI | Batch: two inputs sharing a basename overwrite each other's output | `compress_pdf.py:126` | ✅ Fixed |
-| CLI-03 | 🟡 Low | CLI | `input()` at exit raises `EOFError` traceback on non-interactive stdin | `compress_pdf.py:211` | Open |
+| CLI-03 | 🟡 Low | CLI | `input()` at exit raises `EOFError` traceback on non-interactive stdin | `compress_pdf.py:222` | ✅ Fixed |
 | CLI-04 | 🟡 Low | CLI | Not-found inputs omitted from summary counts / failure tally | `compress_pdf.py:115` | Open |
 | FE-02 | 🟡 Low | frontend | Workspace risk badge/findings never refreshed after a transform | `WorkspaceContext.tsx:123` | ✅ Fixed |
 | FE-03 | 🟡 Low | frontend | `RedactPage` advances workspace with an unguarded `output_path` | `RedactPage.tsx:191` | ✅ Fixed |
@@ -891,16 +891,23 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Verification:** CONFIRMED; now covered by an automated test. (Finder rated
   Medium; downgraded to Low.)
 
-#### CLI-03 — `input()` at exit raises `EOFError` on non-interactive stdin
-- **Location:** `compress_pdf.py:210-211`.
-- **What:** Without `--no-pause`, `main()` ends with a blocking `input("Press
+#### CLI-03 — `input()` at exit raises `EOFError` on non-interactive stdin ✅ Fixed
+- **Location:** `compress_pdf.py:222` (was `:210-211` before `CLI-01` added the
+  explicit `sys.exit()` call after this pause).
+- **What:** Without `--no-pause`, `main()` ended with a blocking `input("Press
   Enter…")` with no `try/except` or `isatty()` guard. Piped/redirected/CI stdin
-  raises `EOFError` → traceback + non-zero exit. Ironically the only path that
-  exits non-zero, so a real compression failure exits 0 while an environmental
-  non-TTY exits 1.
-- **Fix:** Wrap `input()` in `try/except EOFError`, or skip the pause when
-  `not sys.stdin.isatty()`.
-- **Verification:** CONFIRMED.
+  raised `EOFError` → traceback + a crash-derived exit code. Post-`CLI-01`,
+  this crash pre-empted the real `sys.exit(1 if n_err else 0)` a few lines
+  later — masking the correct exit status with an incidental one (a genuinely
+  successful run would still exit 1 due to the crash, not the real result).
+- **Fix (applied):** Took the `isatty()` option: `input()` is now skipped
+  entirely when `not sys.stdin.isatty()`, in addition to the existing
+  `--no-pause` flag. Verified empirically: piping a closed stdin (not
+  `DEVNULL`/`NUL`, which Windows' CRT reports as a tty) to a run without
+  `--no-pause` — pre-fix, crashed with `EOFError` and exit code 1 even on a
+  fully successful compression; post-fix, exits 0 cleanly. Regression test:
+  `tests/test_cli.py::TestCLI::test_no_pause_flag_omitted_on_closed_stdin_does_not_crash`.
+- **Verification:** CONFIRMED; now covered by an automated test.
 
 #### CLI-04 — Not-found inputs omitted from summary / failure tally
 - **Location:** `compress_pdf.py:115-117`.

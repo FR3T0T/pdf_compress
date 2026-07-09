@@ -110,6 +110,16 @@
   to Fixed.
 
 ### Fixes
+- **CLI no longer crashes at exit on non-interactive stdin (CLI-03).** Without
+  `--no-pause`, `main()` ended with a blocking `input("Press Enter…")` with no
+  `isatty()` guard; piped/redirected/CI stdin raised `EOFError`. Post-CLI-01,
+  this crash pre-empted the real `sys.exit(1 if n_err else 0)` a few lines
+  later, so even a fully successful run exited 1 due to the crash rather than
+  the actual result. `input()` is now skipped entirely when
+  `not sys.stdin.isatty()`. Verified empirically with a real closed pipe (note:
+  Windows' CRT reports `NUL`/`DEVNULL` as a tty, so that alone doesn't
+  reproduce this -- a genuine pipe does). Added
+  `tests/test_cli.py::TestCLI::test_no_pause_flag_omitted_on_closed_stdin_does_not_crash`.
 - **CLI batch mode no longer overwrites outputs for same-basename inputs
   (CLI-02).** In `-o <dir>` mode the output name was `<basename>_compressed.pdf`
   keyed only on basename, so `a/report.pdf` and `b/report.pdf` both resolved to
