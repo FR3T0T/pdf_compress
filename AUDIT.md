@@ -169,7 +169,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | FE-04 | 🟡 Low | frontend | Preview pane stays stale after a merge — never points at the merged output | `MergePage.tsx:105` | ✅ Fixed |
 | TST-03 | 🟡 Low | tests | Password protect/unlock round-trip untested | `pdf_ops.py:408` | ✅ Fixed |
 | TST-04 | 🟡 Low | tests | Backup-on-overwrite test asserts nothing when compression skips | `tests/test_engine.py:239` | ✅ Fixed |
-| DOC-01 | 🟡 Low | docs | README advertises a Windows context-menu + About dialog that no longer exist | `README.md:180` | Open |
+| DOC-01 | 🟡 Low | docs | README advertises a Windows context-menu + About dialog that no longer exist | `README.md:185` | ✅ Fixed |
 | DOC-02 | 🟡 Low | docs | CHANGELOG documents a "stanza" security upgrade for a never-present dep | `CHANGELOG.md:115` | Open |
 | PKG-01 | 🟡 Low | build | `assets/fonts/DejaVuSans.ttf` not bundled in the PyInstaller spec | `pdf_toolkit.spec:25` | Open |
 | PKG-02 | 🟡 Low | build | Spec lists a deleted module `ui.dialogs` as a hidden import | `pdf_toolkit.spec:75` | Open |
@@ -1021,16 +1021,18 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `backup_path`. Verified: the un-guarded assertions pass, confirming the backup
   is genuinely created whether or not compression skips.
 
-#### DOC-01 — README advertises a removed Windows context-menu + About dialog
-- **Location:** `README.md:180`.
-- **What:** The GUI features list still says: *"Windows context menu — register
+#### DOC-01 — README advertises a removed Windows context-menu + About dialog ✅ Fixed
+- **Location:** `README.md:185` (bullet removed).
+- **What:** The GUI features list said: *"Windows context menu — register
   'Compress with PDF Compress' in the Explorer right-click menu (via About
-  dialog)"*. Neither exists — both belonged to the native-Qt widget UI deleted in
-  v4.21. Repo-wide greps for `winreg`/`HKEY_`/context-menu/About-dialog code
-  return nothing.
-- **Impact:** A reader looks for a feature the shipping React app doesn't provide.
-- **Fix:** Remove the bullet (and the "via About dialog" reference), or
-  re-implement if it's meant to ship.
+  dialog)"*. Neither existed — both belonged to the native-Qt widget UI deleted
+  in v4.21. Repo-wide greps for `winreg`/`HKEY_`/About-dialog code returned
+  nothing.
+- **Impact:** A reader looked for a feature the shipping React app doesn't
+  provide.
+- **Fix (applied):** Removed the bullet entirely (re-verified the grep still
+  returns nothing before removing, rather than re-implementing — no other
+  indication this was meant to ship).
 - **Verification:** CONFIRMED. (Finder rated Medium; downgraded to Low — pure
   doc-drift.)
 

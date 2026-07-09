@@ -417,6 +417,10 @@
   the un-guarded assertions pass. Production code unchanged. Flips TST-04 to Fixed.
 
 ### Docs
+- **README no longer advertises a removed Windows context-menu + About dialog
+  (DOC-01).** Both belonged to the native-Qt widget UI deleted in v4.21; a
+  repo-wide grep for `winreg`/`HKEY_`/About-dialog code returns nothing.
+  Removed the stale bullet from the GUI features list.
 - **Added `AUDIT.md`** — a point-in-time code-audit snapshot of v4.22 (~40 open
   findings across the engine, PDF ops, crypto, analyze, translate, bridge, CLI,
   frontend, tests, docs, and packaging), each adversarially verified against the
