@@ -110,6 +110,16 @@
   to Fixed.
 
 ### Fixes
+- **Workspace risk badge now refreshes after every transform (FE-02).** The
+  background security scan ran only in `WorkspaceContext`'s `load`, so after any
+  transform (compress, flatten, redact, watermark…) `applyResult` repointed the
+  working document to the tool's output but never re-scanned — the WorkspaceBar
+  kept showing the originally-loaded document's findings, and AnalyzePage (which
+  does re-scan) disagreed with the bar. The scan logic is now factored into a
+  `startScan(path)` helper (keeping the `scanPathRef` newest-scan-wins guard) that
+  both `load` and `applyResult` call, so the badge always reflects the current
+  document — e.g. a Flatten that strips JS now lowers/clears the badge instead of
+  showing stale warnings. Frontend-only; `dist/` rebuilt.
 - **OCR fallback no longer leaks a temp PNG when the page rasterize/save fails
   (TRN-02).** In `_extract_pages`, `pix.save(tmp)` ran before the try/finally that
   unlinks the mkstemp'd file, so if the save raised (disk full, PyMuPDF error) the
