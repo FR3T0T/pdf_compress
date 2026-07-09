@@ -110,6 +110,17 @@
   to Fixed.
 
 ### Fixes
+- **Preview now updates after a merge (FE-04, issue #58).** Merging produced a
+  correct combined PDF, but the in-app preview (the WorkspaceBar preview — the
+  app's only preview surface, keyed on the workspace document) kept showing the
+  pre-merge state, because MergePage — a multi-input tool — never repointed the
+  workspace at its output. The op-done handler now calls `workspace.load(output)`
+  with the merged file, so the preview follows the result (and re-scans it via the
+  FE-02 machinery). It uses `load` rather than `applyResult` because merge writes
+  to a user-chosen path that must never be auto-deleted (`applyResult` would mark
+  it workspace-owned and a later Clear would delete the user's file); `load`
+  adopts it as a fresh, unowned working document. Merge's output logic is
+  unchanged. Frontend-only; `dist/` rebuilt.
 - **Workspace risk badge now refreshes after every transform (FE-02).** The
   background security scan ran only in `WorkspaceContext`'s `load`, so after any
   transform (compress, flatten, redact, watermark…) `applyResult` repointed the
