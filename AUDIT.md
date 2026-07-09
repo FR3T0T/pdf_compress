@@ -174,7 +174,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | PKG-01 | 🟡 Low | build | `assets/fonts/DejaVuSans.ttf` not bundled in the PyInstaller spec | `pdf_toolkit.spec:29` | ✅ Fixed |
 | PKG-02 | 🟡 Low | build | Spec lists a deleted module `ui.dialogs` as a hidden import | `pdf_toolkit.spec` (entry removed) | ✅ Fixed |
 | TST-05 | ⚪ Info | tests | Crypto round-trip tests check only the 5-byte `%PDF-` magic | `tests/test_epdf_crypto.py:46` | Open |
-| PKG-03 | 🔵 Plaus | build | UPX enabled for all binaries incl. Qt/WebEngine DLLs (frozen-build trap) | `pdf_toolkit.spec:118` | Open |
+| PKG-03 | 🔵 Plaus | build | UPX enabled for all binaries incl. Qt/WebEngine DLLs (frozen-build trap) | `pdf_toolkit.spec:114` | ✅ Fixed |
 
 ---
 
@@ -1103,23 +1103,33 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 
 ### 🔵 Plausible
 
-#### PKG-03 — UPX enabled for all binaries incl. Qt/WebEngine DLLs
-- **Location:** `pdf_toolkit.spec:118` (EXE), `:130-131` (COLLECT,
-  `upx_exclude=[]`).
-- **What:** `upx=True` with an empty `upx_exclude` compresses every bundled binary,
+#### PKG-03 — UPX enabled for all binaries incl. Qt/WebEngine DLLs ✅ Fixed
+- **Location:** `pdf_toolkit.spec:114` (EXE), `:129` (COLLECT) — was `upx=True`
+  with an empty `upx_exclude` at both.
+- **What:** `upx=True` with an empty `upx_exclude` compressed every bundled binary,
   including the PySide6 Qt6 DLLs and the QtWebEngine runtime. UPX-compressing
   Qt/WebEngine DLLs is a well-documented PyInstaller failure mode (app crashes on
   launch / "could not load the Qt platform plugin"). This is a QWebEngine app —
   the highest-risk case.
 - **Impact:** **Conditional** — `build.bat` never installs UPX and CI has no
-  frozen-build job, so when UPX isn't on PATH `upx=True` is a silent no-op. The
-  broken build only happens on a dev machine that independently has UPX installed;
-  the failure is then version-dependent and hard to reproduce.
-- **Fix:** Set `upx=False` for a Qt/WebEngine app, or keep UPX but exclude the Qt
-  binaries via `upx_exclude` (e.g. `Qt6WebEngineCore.dll`, `Qt6Core.dll`,
-  `QtWebEngineProcess.exe`, `python3*.dll`).
-- **Verification:** PLAUSIBLE (real config trap; can't reproduce the crash without
-  UPX + a build; downgraded from Medium to Low).
+  frozen-build job, so when UPX isn't on PATH `upx=True` was a silent no-op. The
+  broken build only happened on a dev machine that independently had UPX
+  installed; the failure was then version-dependent and hard to reproduce.
+- **Fix (applied):** Took the `upx=False` option rather than an `upx_exclude`
+  list — a QWebEngine app's set of Qt-related binaries (core DLLs, WebEngine
+  process helper, dependent codec/plugin DLLs) is large and can grow across Qt
+  version bumps, so an exclude list is an ongoing maintenance burden with a
+  silent-failure mode if it ever falls behind; disabling UPX outright removes
+  the entire risk category at the cost of a larger distributed binary, which is
+  the safer trade for a GUI app. Set on both `EXE` and `COLLECT` (the
+  `upx_exclude=[]` on `COLLECT` became moot and was removed). Verified spec
+  file syntax; no frozen-build CI job exists to run a full PyInstaller build
+  (see `PKG-01`'s note), so this remains verified by inspection, not an actual
+  build.
+- **Verification:** CONFIRMED by inspection (was PLAUSIBLE — the underlying
+  crash could only be reproduced with UPX installed + a full build, which
+  wasn't run; the fix itself, disabling UPX, is unconditionally verifiable by
+  reading the spec).
 
 ---
 
