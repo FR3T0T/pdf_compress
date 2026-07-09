@@ -110,6 +110,20 @@
   to Fixed.
 
 ### Fixes
+- **Flatten with "remove form fields" but not "remove annotations" now
+  actually removes the form fields (OPS-02).** `flatten_pdf`'s `/Annots`
+  handling was entirely nested inside `if annotations`, so the
+  independently-reachable `annotations=False, forms=True` toggle combo (a
+  real `FlattenPage.tsx` checkbox state) deleted `/AcroForm` but left every
+  `/Widget` annotation's value and appearance stream fully intact and
+  extractable — the operation reported success while doing nothing to the
+  form data. Each annotation is now evaluated against both flags
+  independently: a `/Widget` is dropped whenever `forms=True`, any other
+  annotation is dropped whenever `annotations=True`, regardless of the other
+  flag — so `forms=True` always removes form fields even when annotations are
+  being kept. Verified for all four flag combinations, including reproducing
+  the original bug against the pre-fix code. Added
+  `tests/test_pdf_ops.py::TestFlatten` (one test per combination).
 - **Ghostscript pass no longer deadlocks on large stderr output (ENG-04).**
   `compress_with_ghostscript`'s poll loop only called `proc.wait(timeout=2.0)`
   and never drained the piped stdout/stderr; if `gs` wrote more than the OS

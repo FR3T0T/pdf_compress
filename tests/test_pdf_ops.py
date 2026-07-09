@@ -193,6 +193,34 @@ class TestExtractText:
         assert result.page_count >= 1
 
 
+def _make_form_and_annot_pdf(path: str) -> str:
+    """A PDF with one page holding a /Widget annotation (a form field with
+    a /V value) and a non-Widget /Text annotation, plus an /AcroForm at
+    the document root — enough to distinguish "remove form fields" from
+    "remove other annotations" (OPS-02)."""
+    pdf = pikepdf.Pdf.new()
+    page = pikepdf.Page(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Page"), MediaBox=[0, 0, 200, 200],
+    ))
+    pdf.pages.append(page)
+
+    widget = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Annot"), Subtype=pikepdf.Name("/Widget"),
+        FT=pikepdf.Name("/Tx"), T="field1", V="hello world",
+        Rect=[10, 10, 100, 30],
+    ))
+    text_annot = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Annot"), Subtype=pikepdf.Name("/Text"),
+        Contents="a sticky note", Rect=[10, 50, 100, 70],
+    ))
+    pdf.pages[0]["/Annots"] = pikepdf.Array([widget, text_annot])
+    pdf.Root["/AcroForm"] = pdf.make_indirect(pikepdf.Dictionary(Fields=[widget]))
+
+    pdf.save(path)
+    pdf.close()
+    return path
+
+
 class TestFlatten:
     @pytest.mark.integration
     def test_flatten(self, sample_pdf, tmp_path):
@@ -202,6 +230,47 @@ class TestFlatten:
         # Verify the output opens as a valid PDF
         with pikepdf.open(out) as pdf:
             assert len(pdf.pages) >= 1
+
+    def _subtypes(self, pdf):
+        annots = pdf.pages[0].get("/Annots")
+        if not annots:
+            return []
+        return sorted(str(a.get("/Subtype")) for a in annots)
+
+    def test_annotations_and_forms_removes_everything(self, tmp_path):
+        src = _make_form_and_annot_pdf(str(tmp_path / "src.pdf"))
+        out = str(tmp_path / "out.pdf")
+        flatten_pdf(src, out, annotations=True, forms=True)
+        with pikepdf.open(out) as pdf:
+            assert self._subtypes(pdf) == []
+            assert "/AcroForm" not in pdf.Root
+
+    def test_annotations_only_keeps_widgets(self, tmp_path):
+        src = _make_form_and_annot_pdf(str(tmp_path / "src.pdf"))
+        out = str(tmp_path / "out.pdf")
+        flatten_pdf(src, out, annotations=True, forms=False)
+        with pikepdf.open(out) as pdf:
+            assert self._subtypes(pdf) == ["/Widget"]
+            assert "/AcroForm" in pdf.Root
+
+    def test_forms_only_removes_widgets_keeps_other_annotations(self, tmp_path):
+        # OPS-02: forms=True must strip /Widget annotations even when
+        # annotations=False -- previously the whole /Annots block was
+        # skipped in this combination and the form field survived intact.
+        src = _make_form_and_annot_pdf(str(tmp_path / "src.pdf"))
+        out = str(tmp_path / "out.pdf")
+        flatten_pdf(src, out, annotations=False, forms=True)
+        with pikepdf.open(out) as pdf:
+            assert self._subtypes(pdf) == ["/Text"]
+            assert "/AcroForm" not in pdf.Root
+
+    def test_neither_flag_leaves_annotations_untouched(self, tmp_path):
+        src = _make_form_and_annot_pdf(str(tmp_path / "src.pdf"))
+        out = str(tmp_path / "out.pdf")
+        flatten_pdf(src, out, annotations=False, forms=False)
+        with pikepdf.open(out) as pdf:
+            assert self._subtypes(pdf) == ["/Text", "/Widget"]
+            assert "/AcroForm" in pdf.Root
 
 
 class TestRepair:

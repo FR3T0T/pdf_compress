@@ -1309,22 +1309,27 @@ def flatten_pdf(input_path, output_path, annotations=True, forms=True):
     src = pikepdf.open(input_path)
 
     for page in src.pages:
-        if annotations and "/Annots" in page:
-            if forms:
-                del page["/Annots"]
+        if (annotations or forms) and "/Annots" in page:
+            # Widget annotations are form fields; every other subtype is a
+            # regular annotation. Decide each one independently so
+            # forms=True always strips widgets and annotations=True always
+            # strips the rest, regardless of the other flag (OPS-02) --
+            # e.g. forms=True/annotations=False must still remove form
+            # fields even though non-widget annotations are kept.
+            annots = page["/Annots"]
+            kept = []
+            for annot in annots:
+                a = annot.resolve() if hasattr(annot, 'resolve') else annot
+                is_widget = str(a.get("/Subtype", "")) == "/Widget"
+                if is_widget and forms:
+                    continue
+                if not is_widget and annotations:
+                    continue
+                kept.append(annot)
+            if kept:
+                page["/Annots"] = pikepdf.Array(kept)
             else:
-                # Keep widget annotations (form fields), remove others
-                annots = page["/Annots"]
-                kept = []
-                for annot in annots:
-                    a = annot.resolve() if hasattr(annot, 'resolve') else annot
-                    subtype = str(a.get("/Subtype", ""))
-                    if subtype == "/Widget":
-                        kept.append(annot)
-                if kept:
-                    page["/Annots"] = pikepdf.Array(kept)
-                else:
-                    del page["/Annots"]
+                del page["/Annots"]
 
     if forms and "/AcroForm" in src.Root:
         del src.Root["/AcroForm"]
