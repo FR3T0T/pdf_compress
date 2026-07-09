@@ -105,10 +105,24 @@ export function MergePage() {
   useEffect(() => {
     if (op.status === 'done') {
       toast.success('PDF files merged successfully!');
+      // FE-04: point the workspace (the app's only preview surface) at the
+      // merged output so the WorkspaceBar preview follows it instead of
+      // showing the pre-merge document. load() — not applyResult() — because
+      // merge writes to a USER-chosen path we must never auto-delete; load
+      // leaves the document unowned (applyResult would mark it owned and a
+      // later Clear/transform would delete the user's saved file). It also
+      // reads as a fresh document (ops reset, its own name), which is what a
+      // merge produces — not a transform of the prior working document.
+      const out = op.result?.results?.output_path;
+      if (out) workspace.load(out);
     } else if (op.status === 'error') {
       toast.error(op.error || 'Merge failed.');
     }
-  }, [op.status, op.error, toast]);
+    // workspace.load is a stable useCallback; op.result is populated together
+    // with status==='done', so it needn't be a dep (the effect fires once on
+    // the transition, not on every render).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [op.status, op.error, toast, workspace.load]);
 
   const canRun = files.length >= 2 && op.status !== 'running';
 

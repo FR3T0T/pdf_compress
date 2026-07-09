@@ -162,6 +162,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | CLI-04 | 🟡 Low | CLI | Not-found inputs omitted from summary counts / failure tally | `compress_pdf.py:115` | Open |
 | FE-02 | 🟡 Low | frontend | Workspace risk badge/findings never refreshed after a transform | `WorkspaceContext.tsx:123` | ✅ Fixed |
 | FE-03 | 🟡 Low | frontend | `RedactPage` advances workspace with an unguarded `output_path` | `RedactPage.tsx:191` | ✅ Fixed |
+| FE-04 | 🟡 Low | frontend | Preview pane stays stale after a merge — never points at the merged output | `MergePage.tsx:105` | ✅ Fixed |
 | TST-03 | 🟡 Low | tests | Password protect/unlock round-trip untested | `pdf_ops.py:408` | Open |
 | TST-04 | 🟡 Low | tests | Backup-on-overwrite test asserts nothing when compression skips | `tests/test_engine.py:239` | ✅ Fixed |
 | DOC-01 | 🟡 Low | docs | README advertises a Windows context-menu + About dialog that no longer exist | `README.md:180` | Open |
@@ -765,6 +766,27 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   unchanged. `dist/` rebuilt.
 - **Verification:** CONFIRMED. (No unit test on this path — validated by build +
   a real-app redact→advance check.)
+
+#### FE-04 — Preview pane stays stale after a merge ✅ Fixed
+- **Location:** `web-react/src/pages/tools/MergePage.tsx:105-111` (op-done
+  handler). *(Filed as GitHub issue #58 — a discovery, not in the original audit;
+  recorded here now that it's fixed.)*
+- **What:** Merge produces a correct combined PDF, but nothing repoints the app's
+  only preview surface (the WorkspaceBar preview, keyed on `workspace.path`) at
+  the output. As a multi-input tool, MergePage deliberately never advanced the
+  workspace and has no preview of its own — so after a merge the preview kept
+  showing the pre-merge document.
+- **Impact:** Display-only staleness; the output file is correct. Low severity.
+- **Fix (applied):** The op-done handler now calls `workspace.load(output_path)`
+  with the merged output, which moves the workspace pointer (the WorkspaceBar's
+  `[workspace.path]` effect then drops the stale preview and re-scans via the
+  FE-02 machinery). `load()` — **not** `applyResult()` — because merge writes to a
+  user-chosen path: `applyResult` marks the path workspace-*owned* and a later
+  Clear/transform would delete the user's saved file (data loss), whereas `load`
+  leaves it unowned. It also reads as a fresh document (ops reset, own name),
+  which is what a merge is. Merge's output logic is unchanged. `dist/` rebuilt.
+- **Verification:** CONFIRMED. (No unit test — Qt-bridge/preview UI; validated by
+  build + a real-app merge→preview-updates check.)
 
 #### TST-03 — Password protect/unlock round-trip untested
 - **Location:** `pdf_ops.py:408` (`protect_pdf`), `:452` (`unlock_pdf`).
