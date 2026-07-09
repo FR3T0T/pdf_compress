@@ -155,7 +155,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | OPS-01 | 🟡 Low | pdf_ops | `protect_pdf` sets owner password = user password → restrictions bypassable | `pdf_ops.py:430` | ✅ Fixed |
 | OPS-03 | 🟡 Low | pdf_ops | `add_watermark` leaks open file handle on malformed range/color | `pdf_ops.py:836` | ✅ Fixed |
 | OPS-04 | 🟡 Low | pdf_ops | `split_pdf` filename collisions silently overwrite | `pdf_ops.py:306` | ✅ Fixed |
-| OPS-05 | 🟡 Low | pdf_ops | `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality" | `pdf_ops.py:593` | Open |
+| OPS-05 | 🟡 Low | pdf_ops | `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality" | `pdf_ops.py:644` | ✅ Fixed |
 | CRY-01 | 🟡 Low | crypto | Decrypt raises non-`EPDFError` types on malformed headers | `epdf_crypto.py:442` | Open |
 | CRY-02 | 🟡 Low | crypto | Non-dict `kdf_params` bypasses validation → uncaught `TypeError` | `epdf_crypto.py:134` | Open |
 | TRN-02 | 🟡 Low | translate | Temp PNG leaks if `pix.save` fails before the cleanup try/finally | `pdf_translate.py:450` | ✅ Fixed |
@@ -745,16 +745,28 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `tests/test_pdf_ops.py::TestSplitChapters::test_repeated_titles_disambiguate_instead_of_overwriting`.
 - **Verification:** CONFIRMED; now covered by an automated test.
 
-#### OPS-05 — `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality"
-- **Location:** `pdf_ops.py:543` (docstring), `:592-593` / `:606` (behaviour).
-- **What:** The docstring says it "preserves image quality", but every input —
-  including lossless PNG/TIFF and already-compressed sources — is unconditionally
-  re-encoded to lossy JPEG q92 (DCTDecode). No lossless path exists.
-- **Impact:** Lossless inputs gain artefacts; JPEGs get a second lossy pass. q92 is
-  high, output usable — a quality/expectation mismatch, not a crash.
-- **Fix (product call):** Either embed lossless sources losslessly (FlateDecode),
-  or correct the docstring to state images are re-encoded as JPEG q92.
-- **Verification:** CONFIRMED.
+#### OPS-05 — `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality" ✅ Fixed
+- **Location:** `pdf_ops.py:580` (docstring), `:644` (behaviour).
+- **What:** The docstring said it "preserves image quality", but every input —
+  including lossless PNG/TIFF and already-compressed sources — was
+  unconditionally re-encoded to lossy JPEG q92 (DCTDecode). No lossless path
+  existed.
+- **Impact:** Lossless inputs gained artefacts; JPEGs got a second lossy pass.
+  q92 is high, output usable — a quality/expectation mismatch, not a crash.
+- **Fix (applied):** Took the "embed lossless sources losslessly" product-call
+  option. The source format is captured from `pil.format` immediately after
+  `Image.open` — before `exif_transpose`/transparency-compositing strip it (both
+  return a new `Image` object with `.format = None`). A JPEG source is still
+  re-encoded (already lossy, so a fresh high-quality pass costs nothing further
+  worth avoiding); anything else (PNG, BMP, TIFF, …) is embedded losslessly via
+  `zlib.compress`-ed raw pixel bytes under `/FlateDecode` — matching the correct
+  write pattern established for `ENG-01`/`ENG-05` (actually compress before
+  declaring the filter). Verified empirically: a noisy PNG source now decodes
+  pixel-for-pixel identical to the original (`pikepdf.PdfImage(...)
+  .as_pil_image()` round-trip); pre-fix, the same source was silently
+  re-encoded to JPEG with visible differences. A JPEG source still comes out
+  `/DCTDecode`. Regression tests: `tests/test_pdf_ops.py::TestImagesToPdf`.
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 #### CRY-01 — Decrypt raises non-`EPDFError` types on malformed headers
 - **Location:** `epdf_crypto.py:421` (`version = int(...)`), `:442-443`

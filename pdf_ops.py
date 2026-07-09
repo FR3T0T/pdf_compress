@@ -7,6 +7,7 @@ import re
 import secrets
 import tempfile
 import threading
+import zlib
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -582,7 +583,9 @@ def images_to_pdf(image_paths, output_path, page_size="auto", margin_mm=10,
     """Convert images into a PDF document.
 
     Handles EXIF rotation, transparency (via white background compositing),
-    and preserves image quality.
+    and preserves image quality: a genuinely lossless source (PNG, BMP,
+    TIFF, ...) is embedded losslessly (Flate); only an already-lossy JPEG
+    source is re-encoded as JPEG (quality 92).
     """
     import io
 
@@ -604,6 +607,9 @@ def images_to_pdf(image_paths, output_path, page_size="auto", margin_mm=10,
             on_progress(i, len(image_paths))
 
         pil = Image.open(img_path)
+        # Capture the source format before any transform -- exif_transpose()
+        # (and Image.new() for transparency compositing, below) strip it.
+        source_format = (pil.format or "").upper()
 
         # Apply EXIF orientation (auto-rotates photos from cameras)
         pil = ImageOps.exif_transpose(pil)
@@ -630,22 +636,31 @@ def images_to_pdf(image_paths, output_path, page_size="auto", margin_mm=10,
         else:
             pw, ph = page_dims
 
-        # Save image to bytes as JPEG
-        buf = io.BytesIO()
-        pil.save(buf, "JPEG", quality=92)
-        buf.seek(0)
+        # Preserve quality: a genuinely lossless source is embedded
+        # losslessly (Flate) rather than always re-encoded to JPEG q92
+        # (OPS-05). Only an already-lossy JPEG source gets re-encoded --
+        # it's already lossy, so a fresh high-quality JPEG pass costs
+        # nothing further worth avoiding.
+        if source_format == "JPEG":
+            buf = io.BytesIO()
+            pil.save(buf, "JPEG", quality=92)
+            img_data = buf.getvalue()
+            img_filter = "/DCTDecode"
+        else:
+            img_data = zlib.compress(pil.tobytes(), level=9)
+            img_filter = "/FlateDecode"
 
         # Create page with image
         page_pdf = pikepdf.Pdf.new()
         page_pdf.add_blank_page(page_size=(pw, ph))
-        raw_img = pikepdf.Stream(page_pdf, buf.read())
+        raw_img = pikepdf.Stream(page_pdf, img_data)
         raw_img["/Type"] = pikepdf.Name("/XObject")
         raw_img["/Subtype"] = pikepdf.Name("/Image")
         raw_img["/Width"] = img_w
         raw_img["/Height"] = img_h
         raw_img["/ColorSpace"] = pikepdf.Name("/DeviceRGB")
         raw_img["/BitsPerComponent"] = 8
-        raw_img["/Filter"] = pikepdf.Name("/DCTDecode")
+        raw_img["/Filter"] = pikepdf.Name(img_filter)
 
         # Calculate placement (centered with margins)
         avail_w = pw - 2 * margin_pt

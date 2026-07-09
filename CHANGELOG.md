@@ -110,6 +110,16 @@
   to Fixed.
 
 ### Fixes
+- **`images_to_pdf` now actually preserves quality for lossless sources
+  (OPS-05).** Despite the docstring's claim, every input -- including
+  lossless PNG/TIFF -- was unconditionally re-encoded to lossy JPEG q92, with
+  no lossless path at all. The source format is now captured right after
+  `Image.open` (before EXIF-orientation/transparency-compositing strip it); a
+  JPEG source is still re-encoded (already lossy), but anything else is
+  embedded losslessly via `zlib`-compressed raw pixel bytes under
+  `/FlateDecode`. Verified empirically: a PNG source now round-trips
+  pixel-for-pixel identical; pre-fix, the same source came out visibly
+  altered. Added `tests/test_pdf_ops.py::TestImagesToPdf`.
 - **Split no longer silently overwrites outputs with the same generated name
   (OPS-04).** Each group's output name came from `name_template.format(...)`
   with no collision check, so two groups formatting to the same name

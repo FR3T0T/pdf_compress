@@ -20,6 +20,7 @@ from pdf_ops import (
     extract_text,
     flatten_pdf,
     get_toc,
+    images_to_pdf,
     is_within_directory,
     merge_pdfs,
     protect_pdf,
@@ -755,3 +756,43 @@ class TestAddWatermark:
             caught = e
         assert caught is not None
         os.remove(sample_pdf)  # must not raise -- proves the handle was released
+
+
+class TestImagesToPdf:
+    """OPS-05: a genuinely lossless source (PNG) must be embedded losslessly
+    (Flate), not silently re-encoded to lossy JPEG despite the docstring's
+    "preserves image quality" claim. An already-lossy JPEG source is still
+    fine to re-encode."""
+
+    @staticmethod
+    def _make_noisy_image(w=60, h=40, seed=1):
+        import random
+        rng = random.Random(seed)
+        pixels = bytes(rng.randrange(256) for _ in range(w * h * 3))
+        return Image.frombytes("RGB", (w, h), pixels)
+
+    def test_png_source_embedded_losslessly(self, tmp_path):
+        img = self._make_noisy_image()
+        png_path = str(tmp_path / "src.png")
+        img.save(png_path, format="PNG")
+        out = str(tmp_path / "out.pdf")
+
+        images_to_pdf([png_path], out, page_size="auto", margin_mm=0)
+
+        with pikepdf.open(out) as pdf:
+            xobj = pdf.pages[0]["/Resources"]["/XObject"]["/Img0"]
+            assert str(xobj.get("/Filter")) == "/FlateDecode"
+            decoded = pikepdf.PdfImage(xobj).as_pil_image()
+            assert list(decoded.getdata()) == list(img.getdata())
+
+    def test_jpeg_source_still_jpeg_encoded(self, tmp_path):
+        img = self._make_noisy_image()
+        jpeg_path = str(tmp_path / "src.jpg")
+        img.save(jpeg_path, format="JPEG", quality=95)
+        out = str(tmp_path / "out.pdf")
+
+        images_to_pdf([jpeg_path], out, page_size="auto", margin_mm=0)
+
+        with pikepdf.open(out) as pdf:
+            xobj = pdf.pages[0]["/Resources"]["/XObject"]["/Img0"]
+            assert str(xobj.get("/Filter")) == "/DCTDecode"
