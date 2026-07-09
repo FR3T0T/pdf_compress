@@ -139,7 +139,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | ANL-02 | 🔴 High | analyze | Sanitiser leaves JS/Launch/Submit in `/Next` action chains | `pdf_analyze.py:778` | ✅ Fixed |
 | ENG-03 | 🟠 Med | engine | `q Q` regex can corrupt text / inline images in uncompressed streams | `engine.py:1698` | ✅ Fixed |
 | ENG-04 | 🟠 Med | engine | Ghostscript pipes never drained → deadlock until 5-min timeout | `engine.py:1279` | ✅ Fixed |
-| OPS-02 | 🟠 Med | pdf_ops | `flatten(forms=True, annotations=False)` leaves form-field values | `pdf_ops.py:1291` | Open |
+| OPS-02 | 🟠 Med | pdf_ops | `flatten(forms=True, annotations=False)` leaves form-field values | `pdf_ops.py:1311` | ✅ Fixed |
 | ANL-01 | 🟠 Med | analyze | In-place sanitise fails on Windows (`os.replace` over open handle) | `pdf_analyze.py:884` | ✅ Fixed |
 | ANL-03 | 🟠 Med | analyze | Invisible-text ("failed redaction") detector largely non-functional | `pdf_analyze.py:620` | ✅ Fixed |
 | ANL-04 | 🟠 Med | analyze | Embedded-file sanitiser leaves `/FileAttachment` & `/AF` files | `pdf_analyze.py:918` | ✅ Fixed |
@@ -377,19 +377,33 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   rather than exhausting it and returning `None`).
 - **Verification:** CONFIRMED; now covered by an automated test.
 
-#### OPS-02 — `flatten(forms=True, annotations=False)` leaves form-field values
-- **Location:** `pdf_ops.py:1290-1309`.
-- **What:** All `/Annots` manipulation is nested inside `if annotations and
+#### OPS-02 — `flatten(forms=True, annotations=False)` leaves form-field values ✅ Fixed
+- **Location:** `pdf_ops.py:1311` (`flatten_pdf`).
+- **What:** All `/Annots` manipulation was nested inside `if annotations and
   "/Annots" in page`. With `annotations=False, forms=True` (an independently
-  reachable toggle combo — `FlattenPage.tsx` checkboxes → `bridge.py:1473-1474`),
-  only `/AcroForm` is deleted; every `/Widget` annotation stays with its `/V`
+  reachable toggle combo — `FlattenPage.tsx` checkboxes → `bridge.py`), only
+  `/AcroForm` was deleted; every `/Widget` annotation stayed with its `/V`
   value and appearance stream.
-- **Impact:** The "remove form fields" operation silently fails to remove the form
-  data — values remain rendered and extractable — and the output is structurally
-  inconsistent (orphaned widgets with no AcroForm).
-- **Fix:** Remove `/Widget` annotations whenever `forms=True`, regardless of the
-  `annotations` flag.
-- **Verification:** CONFIRMED.
+- **Impact:** The "remove form fields" operation silently failed to remove the
+  form data — values remained rendered and extractable — and the output was
+  structurally inconsistent (orphaned widgets with no AcroForm).
+- **Fix (applied):** Restructured the per-annotation loop to decide each
+  annotation independently against *both* flags rather than nesting the whole
+  block under `annotations`: a `/Widget` is dropped whenever `forms=True`, and
+  any non-`/Widget` annotation is dropped whenever `annotations=True` —
+  regardless of the other flag. This reduces to the same behavior as before
+  for the three combinations that already worked (`annotations=True,
+  forms=True` drops everything; `annotations=True, forms=False` keeps only
+  widgets; both `False` touches nothing) while fixing the fourth
+  (`annotations=False, forms=True` now drops widgets but keeps other
+  annotations, matching "remove form fields" without also removing unrelated
+  annotations). Verified empirically for all four flag combinations, including
+  reproducing the original bug against the pre-fix code (a `/Widget` survived
+  identically to a same-run `/Text` annotation instead of being removed).
+  Regression tests: `tests/test_pdf_ops.py::TestFlatten` (one test per flag
+  combination, checking both surviving `/Annots` subtypes and `/AcroForm`
+  presence).
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 #### ANL-01 — In-place sanitise fails on Windows ✅ Fixed
 - **Location:** `pdf_analyze.py:884` (`with pikepdf.open(...)`) / `:1033`
