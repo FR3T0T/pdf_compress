@@ -153,7 +153,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | ENG-05 | 🟡 Low | engine | Size-benefit check compares uncompressed candidate vs compressed original | `engine.py:987` | ✅ Fixed |
 | ENG-06 | 🟡 Low | engine | Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px` | `engine.py:716` | ✅ Fixed |
 | OPS-01 | 🟡 Low | pdf_ops | `protect_pdf` sets owner password = user password → restrictions bypassable | `pdf_ops.py:430` | ✅ Fixed |
-| OPS-03 | 🟡 Low | pdf_ops | `add_watermark` leaks open file handle on malformed range/color | `pdf_ops.py:823` | Open |
+| OPS-03 | 🟡 Low | pdf_ops | `add_watermark` leaks open file handle on malformed range/color | `pdf_ops.py:836` | ✅ Fixed |
 | OPS-04 | 🟡 Low | pdf_ops | `split_pdf` filename collisions silently overwrite | `pdf_ops.py:300` | Open |
 | OPS-05 | 🟡 Low | pdf_ops | `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality" | `pdf_ops.py:593` | Open |
 | CRY-01 | 🟡 Low | crypto | Decrypt raises non-`EPDFError` types on malformed headers | `epdf_crypto.py:442` | Open |
@@ -696,18 +696,30 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Verification:** CONFIRMED; now covered by automated tests. (Finder rated
   Medium; downgraded to Low.)
 
-#### OPS-03 — `add_watermark` leaks open file handle on malformed input
-- **Location:** `pdf_ops.py:823`; validations at `:826-827` (`_parse_ranges`) and
-  `:835-836` (hex color) run **after** open, **before** the try/except at `:918`.
+#### OPS-03 — `add_watermark` leaks open file handle on malformed input ✅ Fixed
+- **Location:** `pdf_ops.py:836`.
 - **What:** A malformed `page_range` (out-of-bounds/non-numeric) or `color`
-  (`#88`, `red`) raises with `src` never closed.
+  (`#88`, `red`) raised with `src` never closed — both validations ran
+  **after** `pikepdf.open`, before the save's own try/except.
 - **Impact:** On Windows the un-closed pikepdf handle keeps the input open until
   GC — can block a retry/follow-up on the same file. Narrow: under CPython
-  refcounting the handle is reclaimed once the bridge releases the traceback. Same
-  open-before-validate shape exists in `add_page_numbers`/`apply_page_operations`.
-- **Fix:** Validate `page_range`/`color` before `pikepdf.open`, or wrap the body in
-  try/except that closes `src` on any failure.
-- **Verification:** CONFIRMED.
+  refcounting the handle is reclaimed once the caller releases the traceback
+  (e.g. `pytest.raises` releases it promptly enough that a naive test wouldn't
+  catch this; a caller that holds the exception for a moment — to build an
+  error message, say — delays that reclaim). Same open-before-validate shape
+  still exists in `add_page_numbers`/`apply_page_operations` (not in scope
+  here — no separate tracked finding for those).
+- **Fix (applied):** Color validation moved *before* `pikepdf.open` (no PDF
+  needs to be open to parse a hex string, so a malformed one now can't leak a
+  handle at all). `page_range` validation still needs `num_pages` from the
+  opened PDF, so it's wrapped in a `try/except Exception: src.close(); raise`
+  that runs immediately after opening. Verified empirically on Windows: for
+  both malformed inputs, deliberately holding the caught exception alive
+  (mirroring a real caller building an error message, rather than
+  `pytest.raises`' prompt release) reproduced `PermissionError: [WinError 32]`
+  on `os.remove()` against the pre-fix code; the fix removes it. Regression
+  tests: `tests/test_pdf_ops.py::TestAddWatermark`.
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 #### OPS-04 — `split_pdf` filename collisions silently overwrite
 - **Location:** `pdf_ops.py:290-303`; `_sanitize_title` at `:191-195`.

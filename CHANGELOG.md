@@ -110,6 +110,16 @@
   to Fixed.
 
 ### Fixes
+- **`add_watermark` no longer leaks an open file handle on malformed input
+  (OPS-03).** A malformed `page_range` or `color` raised with `src` (the open
+  `pikepdf.Pdf`) never closed -- both validations ran after `pikepdf.open`,
+  before the save's own error handling. On Windows this can leave the input
+  locked until GC eventually reclaims it. Color validation now runs before
+  opening the PDF at all (no PDF needs to be open to parse a hex string);
+  `page_range` validation (which needs the page count from the opened PDF) is
+  now wrapped in a try/except that closes `src` before re-raising. Verified
+  on Windows, reproducing the actual `PermissionError: [WinError 32]` against
+  the pre-fix code. Added `tests/test_pdf_ops.py::TestAddWatermark`.
 - **`protect_pdf` no longer lets the user password double as the owner
   password (OPS-01).** Permission flags (print/copy/edit/annotate) are only
   enforceable against someone without the owner password; without a distinct
