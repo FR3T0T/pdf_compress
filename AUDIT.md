@@ -51,6 +51,8 @@ reports on two evasion vectors.**
    required fixing `ENG-05` in the same pass — see §6.)
 2. **`ENG-02` — Transparency is destroyed.** Soft masks are deleted even when
    compositing failed, baking transparent images into opaque rectangles.
+   **✅ Fixed** — `/SMask` is now only deleted when compositing actually
+   succeeded; see §5.
 3. **`TRN-03` — Translation doesn't translate from CJK/Arabic/Hindi/Bengali.**
    4 of 12 advertised source languages return the source text unchanged while
    reporting success.
@@ -132,7 +134,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | ID | Sev | Area | Title | Location | Status |
 |----|-----|------|-------|----------|--------|
 | ENG-01 | 🔴 High | engine | Only JPEG images are recompressed; non-JPEG silently skipped | `engine.py:909` | ✅ Fixed |
-| ENG-02 | 🔴 High | engine | `/SMask` deleted even when compositing failed → transparency lost | `engine.py:1052` | Open |
+| ENG-02 | 🔴 High | engine | `/SMask` deleted even when compositing failed → transparency lost | `engine.py:1064` | ✅ Fixed |
 | TRN-03 | 🔴 High | translate | Source text in non-Latin/Cyrillic scripts returned untranslated | `pdf_translate.py:305` | ✅ Fixed |
 | ANL-02 | 🔴 High | analyze | Sanitiser leaves JS/Launch/Submit in `/Next` action chains | `pdf_analyze.py:778` | ✅ Fixed |
 | ENG-03 | 🟠 Med | engine | `q Q` regex can corrupt text / inline images in uncompressed streams | `engine.py:1684` | Open |
@@ -216,25 +218,40 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   assert the saved output round-trips through a real decode).
 - **Verification:** CONFIRMED; now covered by automated tests.
 
-### ENG-02 — Soft mask deleted even when compositing failed 🔴
-- **Location:** `engine.py:1052` (and sibling deletes at `:960`, `:988`,
-  `:1018`); mask loader `_load_smask_image` at `:764`.
-- **What:** Every re-encode branch deletes `/SMask` whenever the original had one,
-  gated only on `smask_obj is not None` — **not** on compositing having
-  succeeded. `_load_smask_image` reads the mask via `read_raw_bytes()` (same bug
-  as `ENG-01`); for a standard FlateDecode soft mask `Image.open` fails and it
-  returns `None`, so compositing is skipped — yet `/SMask` is still deleted.
-- **Evidence:** compositing runs only `if mask_img is not None` (`:915`); the
-  deletion `if smask_obj is not None and "/SMask" in xobj: del xobj["/SMask"]`
-  fires regardless (`:1051-1052`).
-- **Impact:** The base image is re-encoded (typically to alpha-less JPEG) and its
-  alpha is permanently destroyed, baking previously-transparent regions in as an
-  opaque rectangle. Reproduces for the common DCTDecode-base + FlateDecode-mask
-  case.
-- **Fix:** Decode the mask via `pikepdf.PdfImage(smask_obj).as_pil_image()`, and
-  only `del xobj["/SMask"]` when compositing actually succeeded
-  (`mask_img is not None`).
-- **Verification:** CONFIRMED.
+### ENG-02 — Soft mask deleted even when compositing failed 🔴 ✅ Fixed
+- **Location:** `engine.py:1064` (and sibling deletes at `:971`, `:1002`,
+  `:1032`); mask loader `_load_smask_image` at `:765`.
+- **What:** Every re-encode branch deleted `/SMask` whenever the original had
+  one, gated only on `smask_obj is not None` — **not** on compositing having
+  succeeded. `_load_smask_image` read the mask via `read_raw_bytes()` (same bug
+  as `ENG-01`) with a heuristic that treated the still-encoded bytes as decoded
+  pixels when `len(raw) >= w*h` happened to hold; for a standard FlateDecode
+  soft mask that's rarely true (compression shrinks it well below `w*h`), so it
+  fell through to `Image.open`, which fails on raw FlateDecode samples and
+  returned `None` — compositing was skipped, yet `/SMask` was still deleted.
+- **Evidence:** compositing ran only `if mask_img is not None`; the deletion
+  `if smask_obj is not None and "/SMask" in xobj: del xobj["/SMask"]` fired
+  regardless.
+- **Impact:** The base image was re-encoded (typically to alpha-less JPEG) and
+  its alpha permanently destroyed, baking previously-transparent regions in as
+  an opaque rectangle. Reproduced for the common DCTDecode-base +
+  FlateDecode-mask case.
+- **Fix (applied):** `_load_smask_image` now decodes via
+  `pikepdf.PdfImage(smask_obj).as_pil_image()` (the same fix as `ENG-01`,
+  replacing the raw-byte-length heuristic entirely — Flate/CCITT/LZW masks now
+  decode correctly instead of only masks PIL can open directly). `mask_img` is
+  initialized once per image and the four deletion sites now gate on
+  `mask_img is not None` instead of `smask_obj is not None`, so `/SMask` is only
+  removed when compositing actually consumed it; if the mask genuinely can't be
+  decoded, the original (untouched) soft mask reference is left in place so it
+  keeps applying to the re-encoded base image at render time — since a PDF soft
+  mask isn't required to match the base image's pixel dimensions, this remains
+  correct even if the base was also downscaled. Regression tests:
+  `tests/test_engine.py::TestCompressImagesSmartSoftMask` (a decodable
+  FlateDecode mask composites and is removed; an undecodable one — degenerate
+  0×0 dimensions, deterministic regardless of codec support — is left in place;
+  both fail against the pre-fix code and pass now).
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 ### TRN-03 — Non-Latin/Cyrillic source text returned untranslated 🔴 ✅ Fixed
 - **Location:** `pdf_translate.py:309` (the letter gate in `translate_line`).

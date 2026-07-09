@@ -1,6 +1,8 @@
 """Tests for engine.py — compression engine, utilities, and security helpers."""
 
+import io
 import os
+import random
 import shutil
 import threading
 import zlib
@@ -84,6 +86,55 @@ def _make_bw_pdf(path: str, width: int = 200, height: int = 200) -> str:
     xobj["/BitsPerComponent"] = 1
     xobj["/Filter"] = pikepdf.Name("/FlateDecode")
 
+    pdf.pages[0]["/Resources"] = pikepdf.Dictionary(
+        XObject=pikepdf.Dictionary(Img0=xobj))
+
+    pdf.save(path)
+    pdf.close()
+    return path
+
+
+def _make_jpeg_with_smask_pdf(path: str, *, decodable_smask: bool,
+                               width: int = 200, height: int = 200) -> str:
+    """A PDF with a JPEG base image and a FlateDecode 8bpc soft mask — the
+    common DCTDecode-base + FlateDecode-mask case from ENG-02. Base image
+    content is random noise so it isn't caught by the (unrelated) JPEG
+    quality-skip heuristic. When decodable_smask is False, the mask XObject
+    has degenerate (0×0) dimensions so `_load_smask_image` deterministically
+    fails to decode it, regardless of environment/codec support — simulating
+    an unsupported/undecodable mask without relying on a specific codec gap."""
+    pdf = pikepdf.Pdf.new()
+    page = pikepdf.Page(pikepdf.Dictionary(
+        Type=pikepdf.Name("/Page"), MediaBox=[0, 0, 612, 792],
+    ))
+    pdf.pages.append(page)
+
+    random.seed(42)
+    noise = bytes(random.randrange(256) for _ in range(width * height * 3))
+    img = Image.frombytes("RGB", (width, height), noise)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+
+    xobj = pdf.make_stream(buf.getvalue())
+    xobj["/Type"] = pikepdf.Name("/XObject")
+    xobj["/Subtype"] = pikepdf.Name("/Image")
+    xobj["/Width"] = width
+    xobj["/Height"] = height
+    xobj["/ColorSpace"] = pikepdf.Name("/DeviceRGB")
+    xobj["/BitsPerComponent"] = 8
+    xobj["/Filter"] = pikepdf.Name("/DCTDecode")
+
+    mask_pixels = bytes([180]) * (width * height)
+    smask = pdf.make_stream(zlib.compress(mask_pixels, level=9))
+    smask["/Type"] = pikepdf.Name("/XObject")
+    smask["/Subtype"] = pikepdf.Name("/Image")
+    smask["/Width"] = width if decodable_smask else 0
+    smask["/Height"] = height if decodable_smask else 0
+    smask["/ColorSpace"] = pikepdf.Name("/DeviceGray")
+    smask["/BitsPerComponent"] = 8
+    smask["/Filter"] = pikepdf.Name("/FlateDecode")
+
+    xobj["/SMask"] = smask
     pdf.pages[0]["/Resources"] = pikepdf.Dictionary(
         XObject=pikepdf.Dictionary(Img0=xobj))
 
@@ -374,3 +425,47 @@ class TestCompressImagesSmartNonJpeg:
         assert decoded.size == (200, 200)
         assert decoded.getpixel((5, 5)) == 0        # black corner preserved
         assert decoded.getpixel((150, 150)) == 255  # white elsewhere
+
+
+class TestCompressImagesSmartSoftMask:
+    """ENG-02: /SMask must only be deleted when compositing against it
+    actually succeeded — never unconditionally just because the original
+    had one."""
+
+    def test_smask_composited_and_removed_on_success(self, tmp_path):
+        path = str(tmp_path / "smask_ok.pdf")
+        _make_jpeg_with_smask_pdf(path, decodable_smask=True)
+
+        pdf = pikepdf.open(path)
+        stats = compress_images_smart(pdf, PRESETS["standard"])
+        assert stats.images_with_mask_composited == 1
+        assert stats.images_recompressed == 1
+
+        out = str(tmp_path / "out.pdf")
+        pdf.save(out)
+        pdf.close()
+
+        pdf2 = pikepdf.open(out)
+        xobj2 = pdf2.pages[0]["/Resources"]["/XObject"]["/Img0"]
+        assert "/SMask" not in xobj2
+
+    def test_smask_preserved_when_undecodable(self, tmp_path):
+        path = str(tmp_path / "smask_bad.pdf")
+        _make_jpeg_with_smask_pdf(path, decodable_smask=False)
+
+        pdf = pikepdf.open(path)
+        stats = compress_images_smart(pdf, PRESETS["standard"])
+        # Compositing was skipped (mask undecodable) — the base image may
+        # still get re-encoded, but its /SMask reference must survive so
+        # the (untouched) original mask keeps applying at render time,
+        # instead of baking in a false-opaque rectangle.
+        assert stats.images_with_mask_composited == 0
+        assert stats.images_recompressed == 1
+
+        out = str(tmp_path / "out.pdf")
+        pdf.save(out)
+        pdf.close()
+
+        pdf2 = pikepdf.open(out)
+        xobj2 = pdf2.pages[0]["/Resources"]["/XObject"]["/Img0"]
+        assert "/SMask" in xobj2
