@@ -110,6 +110,19 @@
   to Fixed.
 
 ### Fixes
+- **Split no longer silently overwrites outputs with the same generated name
+  (OPS-04).** Each group's output name came from `name_template.format(...)`
+  with no collision check, so two groups formatting to the same name
+  overwrote each other -- realistic in chapters mode, where the default
+  template has no `{n}` and a repeated TOC title (Introduction, Summary,
+  References…) collided, clobbering an earlier chapter's file while still
+  reporting success. A `seen_counts` map now tracks each generated name within
+  the run; the first occurrence is unchanged, later ones get `_2`, `_3`, …
+  inserted before the extension, so every group survives as a distinct file.
+  Verified empirically: 3 chapters titled "Introduction" previously produced
+  1 file on disk (2 chapters silently discarded); now produce 3, each with the
+  correct page count. Added
+  `tests/test_pdf_ops.py::TestSplitChapters::test_repeated_titles_disambiguate_instead_of_overwriting`.
 - **`add_watermark` no longer leaks an open file handle on malformed input
   (OPS-03).** A malformed `page_range` or `color` raised with `src` (the open
   `pikepdf.Pdf`) never closed -- both validations ran after `pikepdf.open`,

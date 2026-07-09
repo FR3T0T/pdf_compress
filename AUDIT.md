@@ -154,7 +154,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | ENG-06 | 🟡 Low | engine | Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px` | `engine.py:716` | ✅ Fixed |
 | OPS-01 | 🟡 Low | pdf_ops | `protect_pdf` sets owner password = user password → restrictions bypassable | `pdf_ops.py:430` | ✅ Fixed |
 | OPS-03 | 🟡 Low | pdf_ops | `add_watermark` leaks open file handle on malformed range/color | `pdf_ops.py:836` | ✅ Fixed |
-| OPS-04 | 🟡 Low | pdf_ops | `split_pdf` filename collisions silently overwrite | `pdf_ops.py:300` | Open |
+| OPS-04 | 🟡 Low | pdf_ops | `split_pdf` filename collisions silently overwrite | `pdf_ops.py:306` | ✅ Fixed |
 | OPS-05 | 🟡 Low | pdf_ops | `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality" | `pdf_ops.py:593` | Open |
 | CRY-01 | 🟡 Low | crypto | Decrypt raises non-`EPDFError` types on malformed headers | `epdf_crypto.py:442` | Open |
 | CRY-02 | 🟡 Low | crypto | Non-dict `kdf_params` bypasses validation → uncaught `TypeError` | `epdf_crypto.py:134` | Open |
@@ -721,20 +721,29 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   tests: `tests/test_pdf_ops.py::TestAddWatermark`.
 - **Verification:** CONFIRMED; now covered by automated tests.
 
-#### OPS-04 — `split_pdf` filename collisions silently overwrite
-- **Location:** `pdf_ops.py:290-303`; `_sanitize_title` at `:191-195`.
-- **What:** Each group's output name comes from `name_template.format(...)` and is
-  saved with no collision check. Two groups formatting to the same name overwrite
-  each other. Realistic in chapters mode: `_sanitize_title` truncates to 80 chars
-  and maps empty/unsafe titles to `untitled`, and the default chapters template
-  (`{filename}_{title}`) has no `{n}`, so any PDF with a repeated TOC title
-  (Introduction, Summary, References…) collides and the later chapter clobbers the
-  earlier one, while the UI reports success. `output_paths` then lists a duplicate.
-- **Impact:** Silent missing-output / miscount. Source PDF untouched; user can add
-  `{n}` and re-run.
-- **Fix:** Detect duplicate `out_path` within the run and disambiguate (append the
-  group index) before saving.
-- **Verification:** CONFIRMED.
+#### OPS-04 — `split_pdf` filename collisions silently overwrite ✅ Fixed
+- **Location:** `pdf_ops.py:306-329`; `_sanitize_title` at `:213-217`.
+- **What:** Each group's output name came from `name_template.format(...)` and
+  was saved with no collision check. Two groups formatting to the same name
+  overwrote each other. Realistic in chapters mode: `_sanitize_title` truncates
+  to 80 chars and maps empty/unsafe titles to `untitled`, and the default
+  chapters template (`{filename}_{title}`) has no `{n}`, so any PDF with a
+  repeated TOC title (Introduction, Summary, References…) collided and the
+  later chapter clobbered the earlier one, while the UI reported success.
+  `output_paths` then listed a duplicate.
+- **Impact:** Silent missing-output / miscount. Source PDF untouched; user could
+  add `{n}` and re-run.
+- **Fix (applied):** A `seen_counts` dict tracks how many times each
+  template-formatted `out_name` has been produced *within this run*. The first
+  occurrence is unchanged; the 2nd+ gets `_{count}` inserted before the
+  extension (`Introduction.pdf`, `Introduction_2.pdf`, `Introduction_3.pdf`, …),
+  so every group's output survives as a distinct file even with a template that
+  has no `{n}`. Verified empirically: 3 chapters all titled "Introduction"
+  previously produced 3 identical `output_paths` and only 1 file on disk (the
+  last chapter's 3 pages, the first two silently discarded); now all 3 produce
+  distinct paths with the correct page count each. Regression test:
+  `tests/test_pdf_ops.py::TestSplitChapters::test_repeated_titles_disambiguate_instead_of_overwriting`.
+- **Verification:** CONFIRMED; now covered by an automated test.
 
 #### OPS-05 — `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality"
 - **Location:** `pdf_ops.py:543` (docstring), `:592-593` / `:606` (behaviour).

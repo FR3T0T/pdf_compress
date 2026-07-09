@@ -372,6 +372,31 @@ class TestSplitChapters:
         with pytest.raises(ValueError, match="Chapters list required"):
             split_pdf(pdf_with_toc, str(tmp_path), mode="chapters")
 
+    @pytest.mark.integration
+    def test_repeated_titles_disambiguate_instead_of_overwriting(self, pdf_with_toc, tmp_path):
+        # OPS-04: chapters that sanitize to the same name (a common repeated
+        # TOC title like "Introduction") must not silently overwrite each
+        # other -- every group's output must survive as a distinct file.
+        out_dir = str(tmp_path / "chapters_out")
+        chapters = [
+            {"title": "Introduction", "start_page": 1, "end_page": 3},
+            {"title": "Introduction", "start_page": 4, "end_page": 7},
+            {"title": "Introduction", "start_page": 8, "end_page": 10},
+        ]
+        result = split_pdf(
+            pdf_with_toc, out_dir,
+            mode="chapters", chapters=chapters,
+            name_template="{name}_{title}",
+        )
+        assert len(result.output_paths) == 3
+        assert len(set(result.output_paths)) == 3  # all distinct
+        assert result.pages_per_output == [3, 4, 3]
+
+        for p, expected_pages in zip(result.output_paths, result.pages_per_output, strict=True):
+            assert os.path.isfile(p)
+            with pikepdf.open(p) as pdf:
+                assert len(pdf.pages) == expected_pages
+
 
 class TestSanitizeTitle:
     def test_basic(self):
