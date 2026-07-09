@@ -270,3 +270,27 @@ class TestDecryptMalformedHeader:
 
         with pytest.raises(EPDFFormatError):
             epdf_decrypt(enc, str(tmp_path / "out.pdf"), "pw")
+
+
+class TestDecryptNonDictKdfParams:
+    """CRY-02: a non-mapping kdf_params (e.g. a JSON list or string) must
+    raise EPDFFormatError, not a raw TypeError escaping
+    _validate_kdf_params' error-handling contract entirely."""
+
+    @pytest.mark.integration
+    def test_kdf_params_as_list(self, sample_pdf, tmp_path):
+        enc = str(tmp_path / "bad.epdf")
+        epdf_encrypt(sample_pdf, enc, "pw")
+        _tamper_epdf_metadata(enc, lambda m: m.__setitem__("kdf_params", [1, 2, 3]))
+
+        with pytest.raises(EPDFFormatError):
+            epdf_decrypt(enc, str(tmp_path / "out.pdf"), "pw")
+
+    @pytest.mark.integration
+    def test_kdf_params_as_string(self, sample_pdf, tmp_path):
+        enc = str(tmp_path / "bad.epdf")
+        epdf_encrypt(sample_pdf, enc, "pw")
+        _tamper_epdf_metadata(enc, lambda m: m.__setitem__("kdf_params", "not-a-dict"))
+
+        with pytest.raises(EPDFFormatError):
+            epdf_decrypt(enc, str(tmp_path / "out.pdf"), "pw")

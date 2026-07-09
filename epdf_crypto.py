@@ -131,6 +131,14 @@ def _derive_key(password: str, salt: bytes, kdf: str = "argon2id",
     """Derive a 32-byte encryption key from a password using Argon2."""
     import argon2.low_level
 
+    # kdf_params can come straight from an attacker-controlled .epdf header
+    # (decrypt path); a non-mapping value (e.g. a JSON list or string) would
+    # otherwise raise a raw TypeError from the ** spread below, escaping
+    # _validate_kdf_params' EPDFFormatError path entirely (CRY-02).
+    if kdf_params is not None and not isinstance(kdf_params, dict):
+        raise EPDFFormatError(
+            f"Invalid kdf_params: expected an object, got {type(kdf_params).__name__}")
+
     params = _validate_kdf_params({**DEFAULT_KDF_PARAMS, **(kdf_params or {})})
 
     if kdf == "argon2id":
