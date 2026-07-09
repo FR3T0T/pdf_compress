@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -446,9 +447,18 @@ def protect_pdf(input_path, output_path, user_password="", owner_password="",
     use_aes = encryption.startswith("AES")
     R = 6 if encryption == "AES-256" else 4
 
+    # Permission flags are only enforceable against someone without the
+    # owner password. Without a distinct one, owner==user, so anyone who
+    # can open the file (holds the user password) also holds owner rights
+    # and can strip every restriction (OPS-01). Generate a random one the
+    # caller never needs to know -- it only gates permission bits, never
+    # the ability to open the file.
+    if not owner_password:
+        owner_password = secrets.token_urlsafe(24)
+
     src = pikepdf.open(input_path)
     enc = pikepdf.Encryption(
-        owner=owner_password or user_password,
+        owner=owner_password,
         user=user_password,
         allow=allow,
         aes=use_aes,

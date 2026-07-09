@@ -21,10 +21,12 @@ from pdf_ops import (
     get_toc,
     is_within_directory,
     merge_pdfs,
+    protect_pdf,
     read_metadata,
     redact_pdf,
     repair_pdf,
     split_pdf,
+    unlock_pdf,
     write_metadata,
 )
 
@@ -632,3 +634,58 @@ class TestRedactPdf:
         # …and the rest of the scan is intact (still red), not blanked.
         assert outside[0] > 200 and outside[1] < 60 and outside[2] < 60, \
             f"outside rect not preserved: {outside}"
+
+
+class TestProtectPdf:
+    """OPS-01: without a distinct owner password, owner == user, so anyone
+    holding the user password also holds owner rights and can strip every
+    permission restriction. protect_pdf must generate a random owner
+    password when the caller doesn't supply one."""
+
+    def test_round_trip_with_password(self, sample_pdf, tmp_path):
+        out = str(tmp_path / "protected.pdf")
+        protect_pdf(sample_pdf, out, user_password="userpass123")
+
+        with pytest.raises(pikepdf.PasswordError):
+            pikepdf.open(out)  # no password -> refused
+
+        with pikepdf.open(out, password="userpass123") as pdf:
+            assert len(pdf.pages) >= 1
+
+    def test_no_owner_password_still_denies_owner_rights(self, sample_pdf, tmp_path):
+        out = str(tmp_path / "protected.pdf")
+        protect_pdf(
+            sample_pdf, out, user_password="userpass123", owner_password="",
+            permissions={"print": False, "copy": False, "edit": False, "annotate": False},
+        )
+
+        with pikepdf.open(out, password="userpass123") as pdf:
+            assert pdf.user_password_matched is True
+            # This is the bug: without a distinct owner password, the user
+            # password matches as owner too, granting full bypass rights.
+            assert pdf.owner_password_matched is False
+
+    def test_distinct_owner_password_is_respected(self, sample_pdf, tmp_path):
+        out = str(tmp_path / "protected.pdf")
+        protect_pdf(
+            sample_pdf, out, user_password="userpass123",
+            owner_password="ownerpass456",
+        )
+
+        with pikepdf.open(out, password="ownerpass456") as pdf:
+            assert pdf.owner_password_matched is True
+
+        with pikepdf.open(out, password="userpass123") as pdf:
+            assert pdf.owner_password_matched is False
+
+
+class TestUnlockPdf:
+    def test_unlock_removes_password(self, sample_pdf, tmp_path):
+        protected = str(tmp_path / "protected.pdf")
+        unlocked = str(tmp_path / "unlocked.pdf")
+        protect_pdf(sample_pdf, protected, user_password="userpass123")
+
+        unlock_pdf(protected, unlocked, password="userpass123")
+
+        with pikepdf.open(unlocked) as pdf:  # no password needed
+            assert len(pdf.pages) >= 1
