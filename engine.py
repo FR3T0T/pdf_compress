@@ -39,6 +39,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import zlib
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -906,7 +907,13 @@ def compress_images_smart(
 
             try:
                 raw = bytes(xobj.read_raw_bytes())
-                img = Image.open(io.BytesIO(raw))
+                try:
+                    # Decode via the PDF's own filter/colorspace so
+                    # Flate/CCITT/LZW/indexed images decode too, not just
+                    # self-describing formats like JPEG (ENG-01).
+                    img = pikepdf.PdfImage(xobj).as_pil_image()
+                except Exception:
+                    img = Image.open(io.BytesIO(raw))
 
                 # ── Handle soft mask (transparency) ──────────────
                 smask_obj = xobj.get("/SMask")
@@ -946,10 +953,13 @@ def compress_images_smart(
                 if info.is_monochrome or info.bits_per_component == 1:
                     # ── B&W (1-bit) encoding ─────────────────────
                     bw_data, bw_w, bw_h = _encode_as_bw(img)
+                    bw_compressed = zlib.compress(bw_data, level=9)
 
-                    # Only replace if we save space
-                    if len(bw_data) < info.raw_size:
-                        xobj.write(bw_data, filter=pikepdf.Name("/FlateDecode"))
+                    # Only replace if we save space (compare actual
+                    # post-compression sizes, not raw packed bits vs an
+                    # already-compressed original — ENG-05).
+                    if len(bw_compressed) < info.raw_size:
+                        xobj.write(bw_compressed, filter=pikepdf.Name("/FlateDecode"))
                         xobj["/Type"]             = pikepdf.Name("/XObject")
                         xobj["/Subtype"]          = pikepdf.Name("/Image")
                         xobj["/ColorSpace"]       = pikepdf.Name("/DeviceGray")
@@ -974,10 +984,13 @@ def compress_images_smart(
                             img = img.convert("RGB")
 
                     raw_pixels, cs_name, enc_w, enc_h = _encode_as_flate(img)
+                    flate_compressed = zlib.compress(raw_pixels, level=9)
 
-                    # Only replace if we save space
-                    if len(raw_pixels) < info.raw_size:
-                        xobj.write(raw_pixels, filter=pikepdf.Name("/FlateDecode"))
+                    # Only replace if we save space (compare actual
+                    # post-compression sizes, not raw pixel bytes vs an
+                    # already-compressed original — ENG-05).
+                    if len(flate_compressed) < info.raw_size:
+                        xobj.write(flate_compressed, filter=pikepdf.Name("/FlateDecode"))
                         xobj["/Type"]             = pikepdf.Name("/XObject")
                         xobj["/Subtype"]          = pikepdf.Name("/Image")
                         xobj["/ColorSpace"]       = pikepdf.Name(cs_name)
@@ -990,7 +1003,7 @@ def compress_images_smart(
 
                         stats.images_recompressed += 1
                         stats.images_kept_lossless += 1
-                    elif len(raw_pixels) >= info.raw_size:
+                    else:
                         # Flate didn't save space — try JPEG as fallback
                         # for diagrams that happen to have many colors
                         if img.mode == "L":
