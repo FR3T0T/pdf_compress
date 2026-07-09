@@ -172,7 +172,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | DOC-01 | 🟡 Low | docs | README advertises a Windows context-menu + About dialog that no longer exist | `README.md:185` | ✅ Fixed |
 | DOC-02 | 🟡 Low | docs | CHANGELOG documents a "stanza" security upgrade for a never-present dep | `CHANGELOG.md:546` (v4.20 section) | ✅ Fixed |
 | PKG-01 | 🟡 Low | build | `assets/fonts/DejaVuSans.ttf` not bundled in the PyInstaller spec | `pdf_toolkit.spec:29` | ✅ Fixed |
-| PKG-02 | 🟡 Low | build | Spec lists a deleted module `ui.dialogs` as a hidden import | `pdf_toolkit.spec:75` | Open |
+| PKG-02 | 🟡 Low | build | Spec lists a deleted module `ui.dialogs` as a hidden import | `pdf_toolkit.spec` (entry removed) | ✅ Fixed |
 | TST-05 | ⚪ Info | tests | Crypto round-trip tests check only the 5-byte `%PDF-` magic | `tests/test_epdf_crypto.py:46` | Open |
 | PKG-03 | 🔵 Plaus | build | UPX enabled for all binaries incl. Qt/WebEngine DLLs (frozen-build trap) | `pdf_toolkit.spec:118` | Open |
 
@@ -1073,16 +1073,18 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   already-working `WEB_REACT_DIST` pattern, not a full PyInstaller build.
 - **Verification:** CONFIRMED. (Finder rated Medium; downgraded to Low.)
 
-#### PKG-02 — Spec lists a deleted module `ui.dialogs` as a hidden import
-- **Location:** `pdf_toolkit.spec:75`.
-- **What:** `hiddenimports` still includes `"ui.dialogs"`, but `ui/dialogs.py` was
-  deleted in v4.21. The only repo reference to `ui.dialogs` is this line.
-- **Impact:** PyInstaller emits a "hidden import 'ui.dialogs' not found" warning;
-  non-fatal, no runtime effect. Stale-config drift (independently surfaced by both
-  the docs and deps finders). The app-module block is also somewhat redundant —
-  `pdf_analyze`/`pdf_translate`/`net_guard` are pulled in transitively.
-- **Fix:** Delete the `"ui.dialogs"` entry (optionally trim the redundant
-  app-module block).
+#### PKG-02 — Spec lists a deleted module `ui.dialogs` as a hidden import ✅ Fixed
+- **Location:** `pdf_toolkit.spec` (entry removed).
+- **What:** `hiddenimports` still included `"ui.dialogs"`, but `ui/dialogs.py` was
+  deleted in v4.21. The only repo reference to `ui.dialogs` was this line.
+- **Impact:** PyInstaller emitted a "hidden import 'ui.dialogs' not found"
+  warning; non-fatal, no runtime effect. Stale-config drift (independently
+  surfaced by both the docs and deps finders).
+- **Fix (applied):** Deleted the `"ui.dialogs"` entry. Re-verified `ui/dialogs.py`
+  doesn't exist and nothing else in the repo references `ui.dialogs` before
+  removing. Left the (optional, separately-scoped) app-module block trimming
+  suggestion alone — `pdf_analyze`/`pdf_translate`/`net_guard` being pulled in
+  transitively is redundant-but-harmless, not a defect.
 - **Verification:** CONFIRMED.
 
 ### ⚪ Info
