@@ -151,7 +151,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | TST-02 | 🟠 Med | tests | Path-containment guard `contained_output_path()` untested | `pdf_ops.py:22` | ✅ Fixed |
 | RED-01 | 🟠 Med | pdf_ops | Redaction destroys entire page on image-only (scanned) PDFs | `pdf_ops.py:1649` | ✅ Fixed |
 | ENG-05 | 🟡 Low | engine | Size-benefit check compares uncompressed candidate vs compressed original | `engine.py:987` | ✅ Fixed |
-| ENG-06 | 🟡 Low | engine | Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px` | `engine.py:721` | Open |
+| ENG-06 | 🟡 Low | engine | Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px` | `engine.py:716` | ✅ Fixed |
 | OPS-01 | 🟡 Low | pdf_ops | `protect_pdf` sets owner password = user password → restrictions bypassable | `pdf_ops.py:430` | Open |
 | OPS-03 | 🟡 Low | pdf_ops | `add_watermark` leaks open file handle on malformed range/color | `pdf_ops.py:823` | Open |
 | OPS-04 | 🟡 Low | pdf_ops | `split_pdf` filename collisions silently overwrite | `pdf_ops.py:300` | Open |
@@ -644,17 +644,30 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `pikepdf.PdfImage(...).as_pil_image()` after a full save/reopen cycle).
 - **Verification:** CONFIRMED; now covered by automated tests.
 
-#### ENG-06 — Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px`
-- **Location:** `engine.py:452-453`, `:721`.
-- **What:** `_should_skip` returns "tiny" when `info.is_tiny or max(w,h) <
-  preset.skip_below_px`. `is_tiny` is hardcoded `<64`, and all presets set
-  `skip_below_px ≤ 64` (64/48/32/24/16), so the OR always subsumes the preset
-  clause — the finer per-preset thresholds never take effect.
-- **Impact:** Dead configuration; no corruption. `estimate_output` inherits the
-  same behaviour (self-consistent).
-- **Fix:** Drop the hardcoded `is_tiny` clause and rely on `preset.skip_below_px`,
-  or raise the preset thresholds where a larger floor is intended.
-- **Verification:** CONFIRMED.
+#### ENG-06 — Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px` ✅ Fixed
+- **Location:** `engine.py:716` (`_should_skip`); removed `ImageInfo.is_tiny`
+  property (was `:452-453`).
+- **What:** `_should_skip` returned "tiny" when `info.is_tiny or max(w,h) <
+  preset.skip_below_px`. `is_tiny` was hardcoded `<64`, and all presets set
+  `skip_below_px ≤ 64` (64/48/32/24/16), so the OR always subsumed the preset
+  clause — the finer per-preset thresholds never took effect; every preset
+  behaved identically (a flat 64px floor) for any image below 64px.
+- **Impact:** Dead configuration; no corruption. `estimate_output` inherited the
+  same behaviour (self-consistent) since it calls `_should_skip` directly.
+- **Fix (applied):** Took the "drop the hardcoded clause" option (matches the
+  presets' evident intent — five distinct threshold values would be pointless
+  if they all behaved identically below 64px). `_should_skip` now checks only
+  `max(info.pixel_w, info.pixel_h) < preset.skip_below_px`; the now-unused
+  `ImageInfo.is_tiny` property was removed (its only caller). `estimate_output`
+  picks up the fix automatically, no separate change needed. Verified
+  empirically: before the fix, every preset returned identical skip decisions
+  for 20/40/50px test images; after, each preset's own threshold is honored
+  (e.g. a 40px image is now processed by `standard`/`high`/`prepress` — whose
+  thresholds are 32/24/16 — but still skipped by `screen`/`ebook`, 64/48).
+  Regression tests: `tests/test_engine.py::TestShouldSkipTiny` (per-preset
+  threshold boundary check for all five presets, plus the 40px cross-preset
+  case; 5 of 6 assertions fail against the pre-fix code).
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 #### OPS-01 — `protect_pdf` sets owner password = user password
 - **Location:** `pdf_ops.py:430`; caller `ui/bridge.py:1019/1073`.
