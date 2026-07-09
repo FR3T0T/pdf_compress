@@ -110,6 +110,17 @@
   to Fixed.
 
 ### Fixes
+- **`protect_pdf` no longer lets the user password double as the owner
+  password (OPS-01).** Permission flags (print/copy/edit/annotate) are only
+  enforceable against someone without the owner password; without a distinct
+  one, `owner == user`, so anyone who could open the file also held owner
+  rights and could strip every restriction against a compliant reader. Now
+  generates a random owner password via `secrets.token_urlsafe(24)` whenever
+  the caller doesn't supply one -- never surfaced to the caller, and it only
+  gates permission bits, never the ability to open the file. Verified via
+  pikepdf's `owner_password_matched` flag before/after. Added
+  `tests/test_pdf_ops.py::TestProtectPdf` and `TestUnlockPdf` (there was no
+  protect/unlock test at all before -- also flips `TST-03` to Fixed).
 - **Each compression preset's own tiny-image threshold now actually applies
   (ENG-06).** `_should_skip` skipped recompressing an image when
   `info.is_tiny or max(w,h) < preset.skip_below_px` -- but `is_tiny` was

@@ -152,7 +152,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | RED-01 | 🟠 Med | pdf_ops | Redaction destroys entire page on image-only (scanned) PDFs | `pdf_ops.py:1649` | ✅ Fixed |
 | ENG-05 | 🟡 Low | engine | Size-benefit check compares uncompressed candidate vs compressed original | `engine.py:987` | ✅ Fixed |
 | ENG-06 | 🟡 Low | engine | Hardcoded `is_tiny` (<64px) overrides per-preset `skip_below_px` | `engine.py:716` | ✅ Fixed |
-| OPS-01 | 🟡 Low | pdf_ops | `protect_pdf` sets owner password = user password → restrictions bypassable | `pdf_ops.py:430` | Open |
+| OPS-01 | 🟡 Low | pdf_ops | `protect_pdf` sets owner password = user password → restrictions bypassable | `pdf_ops.py:430` | ✅ Fixed |
 | OPS-03 | 🟡 Low | pdf_ops | `add_watermark` leaks open file handle on malformed range/color | `pdf_ops.py:823` | Open |
 | OPS-04 | 🟡 Low | pdf_ops | `split_pdf` filename collisions silently overwrite | `pdf_ops.py:300` | Open |
 | OPS-05 | 🟡 Low | pdf_ops | `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality" | `pdf_ops.py:593` | Open |
@@ -167,7 +167,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | FE-02 | 🟡 Low | frontend | Workspace risk badge/findings never refreshed after a transform | `WorkspaceContext.tsx:123` | ✅ Fixed |
 | FE-03 | 🟡 Low | frontend | `RedactPage` advances workspace with an unguarded `output_path` | `RedactPage.tsx:191` | ✅ Fixed |
 | FE-04 | 🟡 Low | frontend | Preview pane stays stale after a merge — never points at the merged output | `MergePage.tsx:105` | ✅ Fixed |
-| TST-03 | 🟡 Low | tests | Password protect/unlock round-trip untested | `pdf_ops.py:408` | Open |
+| TST-03 | 🟡 Low | tests | Password protect/unlock round-trip untested | `pdf_ops.py:408` | ✅ Fixed |
 | TST-04 | 🟡 Low | tests | Backup-on-overwrite test asserts nothing when compression skips | `tests/test_engine.py:239` | ✅ Fixed |
 | DOC-01 | 🟡 Low | docs | README advertises a Windows context-menu + About dialog that no longer exist | `README.md:180` | Open |
 | DOC-02 | 🟡 Low | docs | CHANGELOG documents a "stanza" security upgrade for a never-present dep | `CHANGELOG.md:115` | Open |
@@ -669,22 +669,32 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   case; 5 of 6 assertions fail against the pre-fix code).
 - **Verification:** CONFIRMED; now covered by automated tests.
 
-#### OPS-01 — `protect_pdf` sets owner password = user password
-- **Location:** `pdf_ops.py:430`; caller `ui/bridge.py:1019/1073`.
+#### OPS-01 — `protect_pdf` sets owner password = user password ✅ Fixed
+- **Location:** `pdf_ops.py:430`; caller `ui/bridge.py:1123`.
 - **What:** `owner=owner_password or user_password`. PDF permission flags are only
-  enforceable against someone **without** the owner password. When a user sets an
+  enforceable against someone **without** the owner password. When a user set an
   open password + restrictions but no owner password, `owner == user`, so anyone
-  who can open the file (they hold the user password) has owner rights and can
-  strip every restriction.
-- **Impact:** Real and reachable from the UI, and the tool reports success. But
+  who could open the file (they held the user password) had owner rights and
+  could strip every restriction.
+- **Impact:** Real and reachable from the UI, and the tool reported success. But
   largely **inherent PDF-permission behaviour** (any non-compliant tool strips
-  permission bits regardless), and the empty-owner / no-open-password variant is
+  permission bits regardless), and the empty-owner / no-open-password variant was
   **not** reachable (the UI requires a user password). Only hardens against
   compliant readers.
-- **Fix:** When restrictions are set but no distinct owner password is supplied,
-  generate a strong random owner password (or require one) — with the caveat that
-  this only defends against compliant readers.
-- **Verification:** CONFIRMED. (Finder rated Medium; downgraded to Low.)
+- **Fix (applied):** When `owner_password` isn't supplied, `protect_pdf` now
+  generates one via `secrets.token_urlsafe(24)` — random, never surfaced to the
+  caller, and only gates permission bits (never the ability to open the file,
+  which still requires `user_password`). Verified empirically via pikepdf's
+  `owner_password_matched`/`user_password_matched` flags: before the fix,
+  opening with only the user password reported `owner_password_matched=True`
+  (the bypass); after, it correctly reports `False` while
+  `user_password_matched=True`, and a distinct explicitly-supplied owner
+  password still works as before. Regression tests:
+  `tests/test_pdf_ops.py::TestProtectPdf` plus a companion `TestUnlockPdf`
+  round-trip test — together these also flip `TST-03` to Fixed (no test
+  existed for `protect_pdf`/`unlock_pdf` at all before).
+- **Verification:** CONFIRMED; now covered by automated tests. (Finder rated
+  Medium; downgraded to Low.)
 
 #### OPS-03 — `add_watermark` leaks open file handle on malformed input
 - **Location:** `pdf_ops.py:823`; validations at `:826-827` (`_parse_ranges`) and
@@ -909,17 +919,20 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Verification:** CONFIRMED. (No unit test — Qt-bridge/preview UI; validated by
   build + a real-app merge→preview-updates check.)
 
-#### TST-03 — Password protect/unlock round-trip untested
-- **Location:** `pdf_ops.py:408` (`protect_pdf`), `:452` (`unlock_pdf`).
-- **What:** Both are wired to the bridge (`:1073`, `:1150`) but have no test. The
-  crypto suite covers only the separate `.epdf` format; the pikepdf-based
-  protect/unlock path has no round-trip or wrong-password test.
+#### TST-03 — Password protect/unlock round-trip untested ✅ Fixed
+- **Location:** `pdf_ops.py:430` (`protect_pdf`), `:474` (`unlock_pdf`).
+- **What:** Both are wired to the bridge but had no test. The crypto suite
+  covers only the separate `.epdf` format; the pikepdf-based protect/unlock
+  path had no round-trip or wrong-password test.
 - **Impact:** Pure coverage gap (code reads correct). A silent regression could
   leave a file unencrypted while the UI reports success.
-- **Fix:** Integration test: protect with a user password, assert
-  `pikepdf.open(out)` raises without it and opens with it; unlock back and assert
-  it opens without a password.
-- **Verification:** CONFIRMED. (Finder rated Medium; downgraded to Low.)
+- **Fix (applied):** Added while fixing `OPS-01` (same file, same functions):
+  `tests/test_pdf_ops.py::TestProtectPdf::test_round_trip_with_password`
+  (protect with a user password, assert `pikepdf.open(out)` raises without it
+  and opens with it) and `TestUnlockPdf::test_unlock_removes_password` (unlock
+  back and assert it opens without a password).
+- **Verification:** CONFIRMED; now covered by automated tests. (Finder rated
+  Medium; downgraded to Low.)
 
 #### TST-04 — Backup-on-overwrite test asserts nothing when compression skips ✅ Fixed
 - **Location:** `tests/test_engine.py:238-241`.
