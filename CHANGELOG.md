@@ -110,6 +110,21 @@
   to Fixed.
 
 ### Fixes
+- **Content-stream cleanup no longer corrupts text or inline images (ENG-03).**
+  `_optimize_content_streams`' empty-`q`/`Q`-pair removal ran a raw-byte regex
+  over the untokenized content stream, so a literal "q Q" inside a `Tj`/`TJ`
+  string literal or an inline image's (`BI…ID…EI`) binary payload got deleted
+  along with genuinely empty save/restore pairs — reproduced empirically: a
+  string `(q Q inside a string)` was mangled to `( inside a string)`, and an
+  inline image payload of literally `b"q Q"` was wiped to nothing. Content
+  streams are now parsed with pikepdf's own tokenizer
+  (`pikepdf.parse_content_stream`), which represents strings, hex strings, and
+  inline images as opaque units, and empty-pair removal operates purely at the
+  instruction level before re-serializing with `pikepdf.unparse_content_stream`
+  — string/image bytes are never exposed to a byte-level pass at all. Also now
+  correctly coalesces `/Contents` arrays (previously naively joined with
+  `read_raw_bytes()` + `b"\n"`, ignoring per-part filters). Added
+  `tests/test_engine.py::TestOptimizeContentStreams`.
 - **Transparency is no longer destroyed when a soft mask can't be decoded
   (ENG-02).** Every image re-encode branch deleted `/SMask` whenever the
   original had one, gated only on the mask *existing* — not on compositing

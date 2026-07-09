@@ -1666,10 +1666,42 @@ def _merge_duplicate_fonts(pdf: pikepdf.Pdf) -> int:
     return merged
 
 
+def _remove_empty_qq_pairs(
+    instructions: list,
+) -> tuple[list, int]:
+    """
+    Drop operator-level empty `q`/`Q` (save/restore) pairs — a `q`
+    instruction immediately followed by `Q` with nothing between them.
+    Operates on already-tokenized instructions (see
+    `pikepdf.parse_content_stream`), so a literal "q Q" inside a string
+    literal, hex string, or inline-image binary payload is never mistaken
+    for the operators (ENG-03).
+    """
+    result = []
+    removed = 0
+    i = 0
+    n = len(instructions)
+    while i < n:
+        cur = instructions[i]
+        nxt = instructions[i + 1] if i + 1 < n else None
+        if (nxt is not None
+                and str(cur.operator) == "q"
+                and str(nxt.operator) == "Q"):
+            i += 2
+            removed += 1
+            continue
+        result.append(cur)
+        i += 1
+    return result, removed
+
+
 def _optimize_content_streams(pdf: pikepdf.Pdf) -> None:
     """
     Optimize page content streams by removing redundant operators.
-    Removes duplicate consecutive state saves/restores and empty groups.
+    Removes empty save/restore (q/Q) pairs via pikepdf's own tokenizer
+    (see `_remove_empty_qq_pairs`) rather than a raw-byte regex, so
+    operator-level bytes are never confused with the same bytes inside a
+    string literal, hex string, or inline-image binary payload.
     """
     for page in pdf.pages:
         try:
@@ -1677,29 +1709,30 @@ def _optimize_content_streams(pdf: pikepdf.Pdf) -> None:
             if contents is None:
                 continue
 
-            # Read and parse the content stream
+            # Original (still-filter-encoded) size, for the savings check.
             if isinstance(contents, pikepdf.Array):
-                raw_parts = []
+                original_len = 0
                 for part in contents:
                     try:
-                        raw_parts.append(bytes(part.read_raw_bytes()))
+                        original_len += len(bytes(part.read_raw_bytes()))
                     except Exception:
-                        raw_parts.append(b"")
-                raw = b"\n".join(raw_parts)
+                        pass
             else:
-                raw = bytes(contents.read_raw_bytes())
+                original_len = len(bytes(contents.read_raw_bytes()))
 
-            if len(raw) > MAX_CONTENT_STREAM_BYTES:
+            if original_len > MAX_CONTENT_STREAM_BYTES:
                 continue
 
-            # Remove redundant q/Q pairs (empty save/restore)
-            # Pattern: q followed immediately by Q with only whitespace between
-            original_len = len(raw)
-            cleaned = re.sub(rb'\bq\s+Q\b', b'', raw)
+            instructions = pikepdf.parse_content_stream(page)
+            cleaned, removed = _remove_empty_qq_pairs(instructions)
+            if removed == 0:
+                continue
+
+            new_bytes = pikepdf.unparse_content_stream(cleaned)
 
             # Only rewrite if we actually saved something meaningful
-            if len(cleaned) < original_len - 16:
-                page["/Contents"] = pdf.make_stream(cleaned)
+            if len(new_bytes) < original_len - 16:
+                page["/Contents"] = pdf.make_stream(new_bytes)
 
         except Exception as e:
             log.debug("Content stream optimization failed on page: %s", e)
