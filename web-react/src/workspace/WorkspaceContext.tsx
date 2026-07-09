@@ -92,16 +92,15 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   // before A's scan resolves.
   const scanPathRef = useRef<string | null>(null);
 
-  const load = useCallback((path: string) => {
-    setState((prev) => {
-      if (ownedRef.current && prev.path) bridgeApi.deleteFile(prev.path);
-      return { path, originalName: bridgeApi.basename(path), ops: [] };
-    });
-    ownedRef.current = false;
-
-    // Non-blocking, best-effort security scan -- never delays or blocks
-    // loading, and any failure just leaves scan at idle (no badge) rather
-    // than surfacing an error.
+  // Non-blocking, best-effort security scan of `path` -- never delays or
+  // blocks the caller, and any failure just leaves scan at idle (no badge)
+  // rather than surfacing an error. The scanPathRef guard makes the newest
+  // scan win: if the workspace moves on to a different (or no) document
+  // before this scan resolves, its result is discarded. Called on load AND
+  // after every transform (applyResult), so the badge always reflects the
+  // CURRENT working document -- e.g. a Flatten that strips JS lowers the
+  // badge instead of showing the pre-transform findings (FE-02).
+  const startScan = useCallback((path: string) => {
     scanPathRef.current = path;
     setScan({ status: 'scanning' });
     bridgeApi
@@ -120,6 +119,15 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       });
   }, []);
 
+  const load = useCallback((path: string) => {
+    setState((prev) => {
+      if (ownedRef.current && prev.path) bridgeApi.deleteFile(prev.path);
+      return { path, originalName: bridgeApi.basename(path), ops: [] };
+    });
+    ownedRef.current = false;
+    startScan(path);
+  }, [startScan]);
+
   const applyResult = useCallback((newPath: string, opLabel: string) => {
     setState((prev) => {
       if (ownedRef.current && prev.path && prev.path !== newPath) {
@@ -128,7 +136,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       return { ...prev, path: newPath, ops: [...prev.ops, { label: opLabel }] };
     });
     ownedRef.current = true;
-  }, []);
+    // Re-scan the transform's output so the badge reflects the new document.
+    startScan(newPath);
+  }, [startScan]);
 
   const clear = useCallback(() => {
     setState((prev) => {

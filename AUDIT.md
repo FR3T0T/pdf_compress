@@ -160,7 +160,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | CLI-02 | 🟡 Low | CLI | Batch: two inputs sharing a basename overwrite each other's output | `compress_pdf.py:128` | Open |
 | CLI-03 | 🟡 Low | CLI | `input()` at exit raises `EOFError` traceback on non-interactive stdin | `compress_pdf.py:211` | Open |
 | CLI-04 | 🟡 Low | CLI | Not-found inputs omitted from summary counts / failure tally | `compress_pdf.py:115` | Open |
-| FE-02 | 🟡 Low | frontend | Workspace risk badge/findings never refreshed after a transform | `WorkspaceContext.tsx:123` | Open |
+| FE-02 | 🟡 Low | frontend | Workspace risk badge/findings never refreshed after a transform | `WorkspaceContext.tsx:123` | ✅ Fixed |
 | FE-03 | 🟡 Low | frontend | `RedactPage` advances workspace with an unguarded `output_path` | `RedactPage.tsx:191` | ✅ Fixed |
 | TST-03 | 🟡 Low | tests | Password protect/unlock round-trip untested | `pdf_ops.py:408` | Open |
 | TST-04 | 🟡 Low | tests | Backup-on-overwrite test asserts nothing when compression skips | `tests/test_engine.py:239` | ✅ Fixed |
@@ -725,7 +725,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Fix:** Increment `n_err` (or a dedicated `n_missing`) for not-found inputs.
 - **Verification:** CONFIRMED.
 
-#### FE-02 — Workspace risk badge not refreshed after a transform
+#### FE-02 — Workspace risk badge not refreshed after a transform ✅ Fixed
 - **Location:** `web-react/src/workspace/WorkspaceContext.tsx:123` (`applyResult`).
 - **What:** The scan-on-load result (`scan` state) is set only in `load` and reset
   in `clear`. `applyResult` (which repoints `path` to each tool's output) never
@@ -738,6 +738,14 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Fix:** Re-run `analyzeDocument` inside `applyResult` (guarded by `scanPathRef`
   like `load`), or reset `scan` to a neutral state. *(Requires a `dist/` rebuild.)*
 - **Verification:** CONFIRMED.
+- **✅ Fixed** — extracted the scan block into a `startScan(path)` `useCallback`
+  (the exact logic previously inline in `load`, including the `scanPathRef` guard
+  so the newest scan wins). `load` now calls `startScan(path)`, and `applyResult`
+  calls `startScan(newPath)` after repointing `path` — so every transform re-scans
+  its output and the WorkspaceBar badge always reflects the current working
+  document (a Flatten that strips JS now lowers/clears the badge). `clear` still
+  resets to `IDLE_SCAN`/`scanPathRef=null`, unchanged. Frontend-only; `dist/`
+  rebuilt.
 
 #### FE-03 — `RedactPage` advances workspace with an unguarded `output_path` ✅ Fixed
 - **Location:** `web-react/src/pages/tools/RedactPage.tsx:181-200` (done handler).
