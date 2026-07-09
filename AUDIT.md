@@ -156,7 +156,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | OPS-03 | 🟡 Low | pdf_ops | `add_watermark` leaks open file handle on malformed range/color | `pdf_ops.py:836` | ✅ Fixed |
 | OPS-04 | 🟡 Low | pdf_ops | `split_pdf` filename collisions silently overwrite | `pdf_ops.py:306` | ✅ Fixed |
 | OPS-05 | 🟡 Low | pdf_ops | `images_to_pdf` re-encodes to JPEG q92 despite "preserves quality" | `pdf_ops.py:644` | ✅ Fixed |
-| CRY-01 | 🟡 Low | crypto | Decrypt raises non-`EPDFError` types on malformed headers | `epdf_crypto.py:442` | Open |
+| CRY-01 | 🟡 Low | crypto | Decrypt raises non-`EPDFError` types on malformed headers | `epdf_crypto.py:446` | ✅ Fixed |
 | CRY-02 | 🟡 Low | crypto | Non-dict `kdf_params` bypasses validation → uncaught `TypeError` | `epdf_crypto.py:134` | Open |
 | TRN-02 | 🟡 Low | translate | Temp PNG leaks if `pix.save` fails before the cleanup try/finally | `pdf_translate.py:450` | ✅ Fixed |
 | BRG-02 | 🟡 Low | bridge | `deleteFile`/`copyFile` lack workspace-dir path containment | `ui/bridge.py:851` | ✅ Fixed |
@@ -768,21 +768,28 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `/DCTDecode`. Regression tests: `tests/test_pdf_ops.py::TestImagesToPdf`.
 - **Verification:** CONFIRMED; now covered by automated tests.
 
-#### CRY-01 — Decrypt raises non-`EPDFError` types on malformed headers
-- **Location:** `epdf_crypto.py:421` (`version = int(...)`), `:442-443`
+#### CRY-01 — Decrypt raises non-`EPDFError` types on malformed headers ✅ Fixed
+- **Location:** `epdf_crypto.py:422` (`version = int(...)`), `:446-447`
   (`b64decode(metadata["salt"/"nonce"])`).
-- **What:** Attacker-controllable header fields are read with unguarded ops: a
-  non-numeric `version` → `ValueError`; a missing `salt`/`nonce` key → `KeyError`;
-  non-base64 content → `binascii.Error`. None are wrapped as `EPDFError`, unlike
-  `epdf_read_metadata` which normalises bad input to `EPDFFormatError` (and a test
-  asserts `EPDFError` on a tampered header).
+- **What:** Attacker-controllable header fields were read with unguarded ops: a
+  non-numeric `version` raised `ValueError`; a missing `salt`/`nonce` key raised
+  `KeyError`; non-base64 content raised `binascii.Error`. None were wrapped as
+  `EPDFError`, unlike `epdf_read_metadata` which normalises bad input to
+  `EPDFFormatError` (and a test asserts `EPDFError` on a tampered header).
 - **Impact:** Callers relying on `except EPDFError` to distinguish "bad file" from
-  a programming bug get the wrong type. Not exploitable, no crypto weakness (any
+  a programming bug got the wrong type. Not exploitable, no crypto weakness (any
   parsed-but-tampered field still fails AEAD/HMAC); the bridge catches
   `Exception` generically so no crash. Consistency/hardening gap.
-- **Fix:** Wrap the salt/nonce lookup+`b64decode` and the `version` parse in
-  try/except and re-raise as `EPDFFormatError`.
-- **Verification:** CONFIRMED.
+- **Fix (applied):** Both spots now wrap the read and re-raise as
+  `EPDFFormatError`: the `version` parse catches `(TypeError, ValueError)`; the
+  salt/nonce lookup+decode catches `(KeyError, ValueError)` — `binascii.Error`
+  is a `ValueError` subclass, so it's covered without a separate import.
+  Verified empirically against three tampered-header cases (non-numeric
+  version, missing salt, non-base64 salt): pre-fix, each raised its raw type
+  (`ValueError`/`KeyError`/`binascii.Error`); post-fix, all three (plus a
+  missing-nonce case) raise `EPDFFormatError`. Regression tests:
+  `tests/test_epdf_crypto.py::TestDecryptMalformedHeader`.
+- **Verification:** CONFIRMED; now covered by automated tests.
 
 #### CRY-02 — Non-dict `kdf_params` bypasses validation → uncaught `TypeError`
 - **Location:** `epdf_crypto.py:134` (`_derive_key`), fed from `:444`.
