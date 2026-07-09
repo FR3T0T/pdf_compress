@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 
+import pikepdf
 import pytest
 
 
@@ -52,3 +53,35 @@ class TestCLI:
         os.makedirs(out_dir)
         result = self._run(sample_pdf, invalid_file, "-o", out_dir, "--no-pause")
         assert result.returncode == 1
+
+    @pytest.mark.integration
+    def test_same_basename_batch_produces_distinct_outputs(self, tmp_path):
+        # CLI-02: two inputs sharing a basename (from different source
+        # directories) must not silently overwrite each other's output.
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        out_dir = tmp_path / "out"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        out_dir.mkdir()
+
+        path_a = str(dir_a / "report.pdf")
+        path_b = str(dir_b / "report.pdf")
+        for path, marker in ((path_a, "FROM_A"), (path_b, "FROM_B")):
+            pdf = pikepdf.Pdf.new()
+            pdf.add_blank_page(page_size=(200, 200))
+            pdf.Root["/Marker"] = marker
+            pdf.save(path)
+            pdf.close()
+
+        result = self._run(path_a, path_b, "-o", str(out_dir), "--no-pause")
+        assert result.returncode == 0
+
+        out_files = sorted(os.listdir(out_dir))
+        assert len(out_files) == 2
+
+        markers = set()
+        for f in out_files:
+            with pikepdf.open(str(out_dir / f)) as pdf:
+                markers.add(str(pdf.Root["/Marker"]))
+        assert markers == {"FROM_A", "FROM_B"}

@@ -110,6 +110,15 @@
   to Fixed.
 
 ### Fixes
+- **CLI batch mode no longer overwrites outputs for same-basename inputs
+  (CLI-02).** In `-o <dir>` mode the output name was `<basename>_compressed.pdf`
+  keyed only on basename, so `a/report.pdf` and `b/report.pdf` both resolved to
+  `out/report_compressed.pdf` -- the second silently overwrote the first
+  (lost derived output, not source data). Same disambiguation approach as
+  OPS-04: a `seen_out_names` map tracks each generated name within the batch;
+  the first occurrence is unchanged, later ones get `_2`, `_3`, … inserted
+  before the extension. Verified empirically before/after. Added
+  `tests/test_cli.py::TestCLI::test_same_basename_batch_produces_distinct_outputs`.
 - **Non-dict `kdf_params` in an `.epdf` header now raises `EPDFError` instead
   of a raw `TypeError` (CRY-02).** `_derive_key` merged `kdf_params` via
   `{**DEFAULT_KDF_PARAMS, **(kdf_params or {})}`; a crafted header setting

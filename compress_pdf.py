@@ -110,6 +110,7 @@ def main():
     total_saved = 0
     total_orig = 0
     n_ok = n_skip = n_err = 0
+    seen_out_names: dict[str, int] = {}
 
     for path in args.inputs:
         if not os.path.isfile(path):
@@ -127,7 +128,18 @@ def main():
             if os.path.isdir(args.output):
                 base = os.path.basename(path)
                 name, ext = os.path.splitext(base)
-                out = os.path.join(args.output, f"{name}_compressed{ext}")
+                out_name = f"{name}_compressed{ext}"
+
+                # Disambiguate batch output-name collisions -- e.g. two
+                # inputs from different directories sharing a basename --
+                # rather than letting the later one silently overwrite the
+                # earlier one's output (CLI-02).
+                seen_out_names[out_name] = seen_out_names.get(out_name, 0) + 1
+                if seen_out_names[out_name] > 1:
+                    name_root, name_ext = os.path.splitext(out_name)
+                    out_name = f"{name_root}_{seen_out_names[out_name]}{name_ext}"
+
+                out = os.path.join(args.output, out_name)
             else:
                 out = args.output
         else:
