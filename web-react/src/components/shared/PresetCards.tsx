@@ -19,7 +19,7 @@ export function PresetCards({ presets, selected, onChange }: PresetCardsProps) {
             style={{
               textAlign: 'left',
               background: active ? 'var(--panel-bg-elevated)' : 'var(--panel-bg)',
-              border: `1px solid ${active ? 'var(--sev-info)' : 'var(--border)'}`,
+              border: `1px solid ${active ? 'var(--accent)' : 'var(--border)'}`,
               borderRadius: 'var(--radius-panel-sm)',
               padding: '10px 12px',
               color: 'var(--text-1)',

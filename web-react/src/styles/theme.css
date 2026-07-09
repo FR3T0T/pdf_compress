@@ -1,40 +1,179 @@
 /* ==========================================================================
-   Security console design tokens.
-   Sharp corners, dark technical palette, monospace for machine-readable
-   data. No web fonts — system mono/sans stacks only (offline-safe).
+   Warm-cream / cool-dark design tokens.
+   Precise and restrained (crisp 1px hairlines, whisper-soft shadows, tight
+   4px spacing rhythm, ~8px corners), with serif display headings over a
+   system-sans UI and monospace for machine-readable data. No web fonts —
+   Georgia + system stacks only (offline-safe).
 
-   Dark is the default/:root palette; [data-theme="light"] below overrides
-   every token with a light counterpart tuned for the SAME identity (cool
-   graphite/steel, not a generic light UI) — see Sidebar.tsx for how the
-   toggle sets data-theme and persists the choice.
+   LIGHT is the default/:root palette — warm cream/ivory with a paper
+   feel: warm near-white panels sit a whisper above the cream page,
+   separated by warm-greige hairlines + faint warm shadows (not a value
+   jump), with a muted TERRACOTTA accent marking interaction only.
+   [data-theme="dark"] below overrides every token with a deep COOL-grey
+   counterpart keeping the indigo-BLUE accent — the temperature split
+   between themes (warm light / cool dark) is deliberate. Depth on dark
+   comes from surface-value steps + hairlines (shadows barely read). See
+   Sidebar.tsx for how the toggle sets data-theme and persists the choice
+   (defaults to light).
+
+   ACCENT vs SEVERITY DISTINCTNESS (per theme):
+   - Light: the terracotta accent and --sev-high are BOTH warm, so they
+     are separated three ways. Hue/saturation: sev-high stays the vivid,
+     bright red-orange (#d85a30, high sat) while the accent is a deeper,
+     muted clay (#a85433) and its text variant (#8a4d24, ~24° brown) sits
+     clearly browner than sev-high-text (#9c3414, ~14° red). Value: the
+     accent fill is markedly darker than the sev-high fill. Context:
+     accent appears only on interactive elements (fills, rings, tints,
+     links) and sev-high only in badges/stripes/status — and sev-high
+     text always arrives inside its red-tinted, red-bordered badge.
+   - Dark: the accent is a violet-cast indigo (~233°) and --sev-low stays
+     steel/sky blue (~210°), same value/context separation as above.
 
    Severity colors have two variants each: --sev-X (saturated fill, for
    borders/badge-tint backgrounds/progress fills — non-text UI, WCAG
-   1.4.11 3:1) and --sev-X-text (for text/labels, WCAG AA 4.5:1). These
-   necessarily diverge in light mode: a fill bright enough to read behind
-   black button text is too light to use AS text on a white page, and the
-   reverse for text darkened enough to read on white would be too dark to
-   read against a near-black panel. All contrast figures below verified
-   against both --panel-bg and --panel-bg-elevated with a WCAG relative-
-   luminance calculator, not eyeballed.
-   --sev-X-rgb mirrors --sev-X as an unpacked "r, g, b" triplet so the
-   badge tint backgrounds below can alpha-blend via rgba(var(--x-rgb), a)
-   and stay correct per-theme instead of hardcoding the dark-mode hex.
+   1.4.11 3:1) and --sev-X-text (for text/labels, WCAG AA 4.5:1). All
+   contrast figures below verified against --panel-bg, --panel-bg-elevated
+   AND the 0.14-alpha badge-tint / 0.10-alpha accent-tint blends over
+   both, with a WCAG relative-luminance calculator, not eyeballed.
+   --sev-X-rgb / --accent-rgb mirror their hex as unpacked "r, g, b"
+   triplets so tint backgrounds can alpha-blend via rgba(var(--x-rgb), a)
+   and stay correct per-theme instead of hardcoding one theme's hex.
    ========================================================================== */
 
 :root {
-  --page-bg: #0c0d10;
-  --panel-bg: #14161a;
-  --panel-bg-elevated: #1b1e24;
-  --border: #262a30;
-  --border-strong: #33383f;
+  /* Warm cream/ivory with a paper feel — NOT cool white, NOT stark. */
+  --page-bg: #f4f1ea;
+  /* Warm near-white, a gentle step above the cream page. */
+  --panel-bg: #faf8f3;
+  /* Second-step surface: inner wells/insets (inputs, result rows, icon
+     chips, ghost-button hover) sitting ON a panel. */
+  --panel-bg-elevated: #eeeae0;
+  /* Crisp warm-greige hairline — carries panel separation together with
+     the faint shadow (deliberately visible, unlike a decorative divider). */
+  --border: #e4dfd3;
+  /* "Lit from above" top edge for dark panels; = --border in light. */
+  --panel-border-top: #e4dfd3;
+  /* Input/control borders are a real (non-text) UI component:
+     3.88:1 on panel, 3.43:1 on elevated. */
+  --border-strong: #857c6c;
 
-  --text-1: #e4e6e9;
-  --text-2: #8a9099;
-  /* 2.91:1 pre-fix (#5c6169) — below even the 3:1 non-text floor despite
-     being used as real label/caption text across ~23 files. 4.69:1 now. */
-  --text-3: #7c828e;
+  --text-1: #1e1a15; /* 16.30:1 panel / 14.40:1 elevated / 15.34:1 page */
+  --text-2: #5b5348; /* 7.13:1 / 6.30:1 / 6.71:1 */
+  --text-3: #665e51; /* 6.02:1 / 5.32:1 / 5.67:1 */
 
+  /* Interaction accent — muted terracotta/clay, deepened from the
+     reference (~#c0664a) so WHITE label text passes AA on every state:
+     on-accent 5.28:1 base / 4.72:1 hover / 6.45:1 active; the fill
+     clears 3:1 on panel (4.97:1) and page (4.68:1). --accent-text
+     (links, active nav, tint-button labels) is a browner, darker clay:
+     6.25:1 panel / 5.52:1 elevated / 5.88:1 page, and still 5.49:1 on
+     the 0.10 active-nav tint and 4.87:1 on the 0.10 tint-button blend.
+     Distinctness from --sev-high is documented in the header. */
+  --accent: #a85433;
+  --accent-hover: #b25b39;
+  --accent-active: #96482a;
+  --on-accent: #ffffff;
+  --accent-text: #8a4d24;
+  --accent-rgb: 168, 84, 51;
+  /* Keyboard focus indicator: 4.68:1 vs page, 4.97:1 vs panel (≥3:1). */
+  --focus-ring: #a85433;
+
+  /* Fills ≥3:1 on both panel and elevated (worst case listed): high
+     3.22:1, medium 3.31:1, low 3.23:1, info 3.59:1 — all vs elevated.
+     The warm elevated surface is darker than the old cool one, so
+     medium/low/info fills were deepened a step and high/medium text
+     darkened to keep every ratio: text variants ≥4.5:1 everywhere
+     INCLUDING on their own 0.14 badge tints over elevated (the binding
+     case): high 5.14:1, medium 5.03:1, low 5.12:1, info 5.09:1. */
+  --sev-high: #d85a30;
+  --sev-high-text: #9c3414;
+  --sev-medium: #ad7415;
+  --sev-medium-text: #775200;
+  --sev-low: #3384d6;
+  --sev-low-text: #1a5a96;
+  --sev-info: #178a67;
+  --sev-info-text: #0b6448;
+
+  --sev-high-rgb: 216, 90, 48;
+  --sev-medium-rgb: 173, 116, 21;
+  --sev-low-rgb: 51, 132, 214;
+  --sev-info-rgb: 23, 138, 103;
+
+  /* Crisp, not pillowy. */
+  --radius-panel: 8px;
+  --radius-panel-sm: 6px;
+  --radius-badge: 4px;
+
+  /* Tight 4px rhythm. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+
+  /* Depth is felt, not announced: very soft, very low-alpha (warm
+     #3e3323 base so shadows don't go cold on the cream page). The
+     hairline does most of the separating. */
+  --shadow-sm: 0 1px 2px rgba(62, 51, 35, 0.05), 0 1px 3px rgba(62, 51, 35, 0.04);
+  --shadow-md: 0 1px 3px rgba(62, 51, 35, 0.06), 0 3px 10px rgba(62, 51, 35, 0.05);
+  --shadow-lg: 0 4px 16px rgba(62, 51, 35, 0.1);
+
+  --font-sans:
+    -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  /* Serif display face for major headings only (page titles) — Georgia
+     ships with Windows/macOS, so this stays offline-safe. Body/UI text
+     stays sans; machine data stays mono. */
+  --font-serif: Georgia, 'Times New Roman', serif;
+  --font-mono:
+    ui-monospace, 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+
+  /* Tight, dense scale — clear hierarchy without consumer-app sizing.
+     xl is the serif display size for page titles. */
+  --font-size-xs: 11px;
+  --font-size-sm: 13px;
+  --font-size-md: 14px;
+  --font-size-lg: 16px;
+  --font-size-xl: 22px;
+}
+
+[data-theme='dark'] {
+  /* Deep cool grey (not pure black, not the old flat console): page →
+     panel → elevated are clear-but-subtle value steps, and the crisp
+     hairlines carry the rest of the separation. */
+  --page-bg: #0e0f12;
+  --panel-bg: #16181d;
+  --panel-bg-elevated: #1f222a;
+  --border: #262a31;
+  /* One step lighter than the side/bottom borders: the "lit from above"
+     edge that stands in for shadows on dark surfaces. */
+  --panel-border-top: #2e333b;
+  /* 3.79:1 on panel, 3.39:1 on elevated. */
+  --border-strong: #6d7484;
+
+  --text-1: #e9ebef; /* 14.88:1 panel / 13.32:1 elevated / 16.06:1 page */
+  --text-2: #a9b1bd; /* 8.21:1 / 7.35:1 / 8.86:1 */
+  --text-3: #8b93a1; /* 5.74:1 / 5.14:1 / 6.19:1 */
+
+  /* Same indigo family, lifted just enough to glow on dark while KEEPING
+     white label text (cohesive with light): on-accent 4.95:1 base /
+     4.59:1 hover / 5.88:1 active; fill 3.58:1 vs panel, 3.87:1 vs page.
+     --accent-text is a lighter periwinkle for text on surfaces: 7.41:1
+     panel / 6.63:1 elevated / 8.00:1 page, 6.73:1 on the 0.10 nav tint,
+     6.01:1 on the 0.10 tint-button blend. */
+  --accent: #5964d8;
+  --accent-hover: #5f6adb;
+  --accent-active: #4c57cf;
+  --on-accent: #ffffff;
+  --accent-text: #98a2f0;
+  --accent-rgb: 89, 100, 216;
+  /* 8.00:1 vs page, 7.41:1 vs panel. */
+  --focus-ring: #98a2f0;
+
+  /* Same hexes as the previous dark identity — re-verified against the
+     NEW (darker) surfaces, where every ratio improves. Fills ≥3:1, worst
+     case vs elevated: high 4.11:1, medium 8.53:1, low 4.42:1, info
+     4.70:1. Text ≥4.5:1 everywhere incl. 0.14 tints over elevated:
+     high 6.20:1, medium 6.39:1, low 5.80:1, info 6.33:1. */
   --sev-high: #d85a30;
   --sev-high-text: #f0997b;
   --sev-medium: #efb35a;
@@ -49,61 +188,10 @@
   --sev-low-rgb: 55, 138, 221;
   --sev-info-rgb: 29, 158, 117;
 
-  --radius-panel: 8px;
-  --radius-panel-sm: 6px;
-  --radius-badge: 4px;
-
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 12px;
-  --space-4: 20px;
-  --space-5: 28px;
-
-  --font-sans:
-    -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  --font-mono:
-    ui-monospace, 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
-
-  --font-size-xs: 11px;
-  --font-size-sm: 13px;
-  --font-size-md: 14px;
-  --font-size-lg: 17px;
-}
-
-[data-theme='light'] {
-  --page-bg: #e8eaed;
-  --panel-bg: #ffffff;
-  --panel-bg-elevated: #eef0f3;
-  --border: #d7dbe0;
-  /* 3.14:1 — input/control borders are a real (non-text) UI component,
-     not a decorative divider, so this needs to clear 3:1 too. */
-  --border-strong: #8a929e;
-
-  --text-1: #14171c;
-  --text-2: #565c66;
-  --text-3: #666d79;
-
-  /* Fills stay bright enough to sit behind black button/logo text
-     (verified: #0c0d10 on each of these is >= 4.9:1) and to clear 3:1 as
-     a border/tint against both --panel-bg and --panel-bg-elevated.
-     --sev-high/--sev-low keep their dark-mode hex (already >= 3:1 on
-     white); --sev-medium and --sev-info needed real darkening. */
-  --sev-high: #d85a30;
-  --sev-medium: #b87e1a;
-  --sev-low: #378add;
-  --sev-info: #1a9570;
-
-  /* Text variants: darkened well past the fills for 4.5:1 AA on white —
-     the exact "coral/amber/blue/teal wash out on white" case. */
-  --sev-high-text: #a8391a;
-  --sev-medium-text: #8f6000;
-  --sev-low-text: #1a5a96;
-  --sev-info-text: #0f7a5c;
-
-  --sev-high-rgb: 216, 90, 48;
-  --sev-medium-rgb: 184, 126, 26;
-  --sev-low-rgb: 55, 138, 221;
-  --sev-info-rgb: 26, 149, 112;
+  /* Faint grounding only — surface value steps + hairlines carry depth. */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 2px 6px rgba(0, 0, 0, 0.32);
+  --shadow-lg: 0 6px 20px rgba(0, 0, 0, 0.45);
 }
 
 * {
@@ -122,6 +210,7 @@ body {
   color: var(--text-1);
   font-family: var(--font-sans);
   font-size: var(--font-size-md);
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -131,10 +220,14 @@ body {
   padding: var(--space-5) var(--space-4) 64px;
 }
 
+/* Editorial serif display for page titles ("PDF Toolkit", tool names):
+   normal weight, a touch of letter-spacing — the serif carries the
+   emphasis, so bold would overdo it. */
 .console-heading {
-  font-family: var(--font-sans);
-  font-size: var(--font-size-lg);
-  font-weight: 700;
+  font-family: var(--font-serif);
+  font-size: var(--font-size-xl);
+  font-weight: 400;
+  letter-spacing: 0.01em;
   margin: 0 0 2px;
 }
 
@@ -152,12 +245,24 @@ body {
 .panel {
   background: var(--panel-bg);
   border: 1px solid var(--border);
+  border-top-color: var(--panel-border-top);
   border-radius: var(--radius-panel);
   padding: var(--space-4);
+  box-shadow: var(--shadow-sm);
 }
 
 .panel + .panel {
   margin-top: var(--space-3);
+}
+
+/* Tool-grid cards are `button.panel` — a quiet lift on hover so depth
+   reads as interactive. Static panels stay put. */
+button.panel {
+  transition: box-shadow 150ms ease, border-color 150ms ease;
+}
+
+button.panel:hover:not(:disabled) {
+  box-shadow: var(--shadow-md);
 }
 
 /* ---------------------------------------------------------------- badges */
@@ -226,8 +331,16 @@ button:disabled {
   opacity: 0.55;
 }
 
+/* Links take the interaction accent (status blues stay in badges). */
 a {
-  color: var(--sev-low-text);
+  color: var(--accent-text);
+}
+
+/* Accent-colored keyboard focus everywhere; ratios documented at
+   --focus-ring per theme. */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 /* --------------------------------------------------------- button variants
@@ -236,17 +349,40 @@ a {
    already established in Sidebar.tsx / dev tooling. */
 
 .btn-primary,
-.btn-ghost {
+.btn-ghost,
+.btn-tint {
   border-radius: var(--radius-panel-sm);
-  padding: 8px 16px;
+  padding: 7px 14px;
   font-size: var(--font-size-sm);
   font-weight: 600;
+  transition: background 150ms ease, box-shadow 150ms ease,
+    border-color 150ms ease;
 }
 
 .btn-primary {
-  background: var(--sev-info);
-  border: 1px solid var(--sev-info);
-  color: #0c0d10;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: var(--on-accent);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Hover brightens a step with a slightly larger (still quiet) shadow;
+   active presses flat. Every state's label contrast is documented at the
+   --accent block per theme. */
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  box-shadow: var(--shadow-md);
+}
+
+.btn-primary:active:not(:disabled) {
+  background: var(--accent-active);
+  border-color: var(--accent-active);
+  box-shadow: none;
+}
+
+.btn-primary:disabled {
+  box-shadow: none;
 }
 
 .btn-ghost {
@@ -254,6 +390,84 @@ a {
   border: 1px solid var(--border-strong);
   color: var(--text-1);
   font-weight: 400;
+}
+
+/* Quiet hover: a faint well fill, no shadow — secondary actions stay
+   recessive next to the primary button. */
+.btn-ghost:hover:not(:disabled) {
+  background: var(--panel-bg-elevated);
+}
+
+/* Quiet accent action for toolbars/bars (e.g. the workspace "Load"
+   button): accent-tinted fill + accent text, no border — present but not
+   shouting. Label contrast on the tint blends is documented at
+   --accent-text per theme. */
+.btn-tint {
+  background: rgba(var(--accent-rgb), 0.1);
+  border: 1px solid transparent;
+  color: var(--accent-text);
+}
+
+.btn-tint:hover:not(:disabled) {
+  background: rgba(var(--accent-rgb), 0.16);
+}
+
+.btn-tint:active:not(:disabled) {
+  background: rgba(var(--accent-rgb), 0.22);
+}
+
+/* ------------------------------------------------------------------ field
+   Bordered input wrapper (e.g. the Home search bar): the inner <input> is
+   borderless/outline-less, so the wrapper carries the control border and
+   the focus ring via :focus-within. */
+
+.field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-panel-sm);
+  padding: 6px 10px;
+}
+
+.field:focus-within {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* --------------------------------------------------------------- dropzone
+   Precise empty-state file target: crisp dashed control border on a flat
+   (unshadowed) panel, with a quiet accent-tinted hover/drag-over.
+   Applied on top of .panel (className="panel dropzone"). */
+
+.dropzone {
+  border-style: dashed;
+  border-color: var(--border-strong);
+  box-shadow: none;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+
+.dropzone:hover:not(.dropzone--disabled),
+.dropzone--over {
+  border-color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.04);
+}
+
+.dropzone--over {
+  background: rgba(var(--accent-rgb), 0.08);
+}
+
+.dropzone-icon {
+  width: 32px;
+  height: 32px;
+  margin: 0 auto var(--space-2);
+  border-radius: var(--radius-panel-sm);
+  background: rgba(var(--accent-rgb), 0.1);
+  color: var(--accent-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 @keyframes spin {
@@ -266,9 +480,36 @@ a {
   display: inline-block;
   width: 13px;
   height: 13px;
-  border: 2px solid rgba(255, 255, 255, 0.3);
+  /* Neutral mid-grey track: visible on light panels, dark panels, and
+     accent button fills alike. Arc color follows text via currentColor. */
+  border: 2px solid rgba(132, 140, 150, 0.35);
   border-top-color: currentColor;
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
   vertical-align: -2px;
+}
+
+/* Kill decorative motion for users who ask for it; state changes still
+   apply instantly. Loading spinners are exempted below: they're essential
+   status indication, not decoration — a frozen arc during a long
+   operation (e.g. Translate's model load) reads as a hung app. Note that
+   on Windows this media query follows Settings → Accessibility →
+   "Animation effects" (off on many machines and in ALL remote-desktop
+   sessions), so without the exemption every spinner freezes there. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Slower + gentler instead of frozen (must come after the universal
+     freeze; the class + later position wins the cascade). */
+  .spinner {
+    animation-duration: 1.6s !important;
+    animation-iteration-count: infinite !important;
+  }
 }

@@ -97,7 +97,11 @@ function createEventBus(): RealEventBus {
 
 /** Port of web/js/app.js's applyTheme() — same CSS var injection + "theme"
  *  emit, so the contract holds even though theme.css currently uses a
- *  different token set (see shell/Sidebar.tsx comment). */
+ *  different token set (see shell/Sidebar.tsx comment). Deliberately does
+ *  NOT touch [data-theme]: Sidebar.tsx owns that attribute (restored from
+ *  the JS-persisted setting, light by default). Python's themeChanged
+ *  carries its OWN independently-persisted preference (Ctrl+T), so letting
+ *  it set data-theme here would stomp the user's restored choice at boot. */
 function applyTheme(bus: RealEventBus, vars: Record<string, string>): void {
   const root = document.documentElement;
   const themeName = vars['--theme-name'] || 'light';
@@ -105,7 +109,6 @@ function applyTheme(bus: RealEventBus, vars: Record<string, string>): void {
     if (key === '--theme-name') continue;
     root.style.setProperty(key, vars[key]);
   }
-  root.setAttribute('data-theme', themeName);
   bus.emit('theme', themeName);
 }
 

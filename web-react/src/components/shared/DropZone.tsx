@@ -85,9 +85,20 @@ export const DropZone = forwardRef<DropZoneHandle, DropZoneProps>(function DropZ
       ? files[0].name
       : `${files.length} files selected`;
 
+  // Visual states (idle / hover / drag-over / disabled) live in theme.css
+  // as .dropzone classes so the empty-state treatment stays token-driven.
+  const zoneClass = [
+    'panel',
+    'dropzone',
+    dragOver && 'dropzone--over',
+    disabled && 'dropzone--disabled',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
   return (
     <div
-      className="panel"
+      className={zoneClass}
       onClick={browse}
       onDragOver={(e) => {
         e.preventDefault();
@@ -104,10 +115,6 @@ export const DropZone = forwardRef<DropZoneHandle, DropZoneProps>(function DropZ
         cursor: disabled ? 'default' : 'pointer',
         textAlign: 'center',
         padding: compact ? 'var(--space-3) var(--space-4)' : 'var(--space-5) var(--space-4)',
-        borderStyle: 'dashed',
-        borderColor: dragOver ? 'var(--sev-info)' : 'var(--border)',
-        background: dragOver ? 'var(--panel-bg-elevated)' : 'var(--panel-bg)',
-        transition: 'border-color 120ms, background 120ms',
         opacity: disabled ? 0.6 : 1,
       }}
     >
@@ -117,6 +124,24 @@ export const DropZone = forwardRef<DropZoneHandle, DropZoneProps>(function DropZ
         </div>
       ) : (
         <>
+          {!compact && (
+            <div className="dropzone-icon" aria-hidden="true">
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 20 20"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={1.6}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M10 13V4" />
+                <polyline points="6,8 10,4 14,8" />
+                <path d="M3 13v2.5A1.5 1.5 0 0 0 4.5 17h11a1.5 1.5 0 0 0 1.5-1.5V13" />
+              </svg>
+            </div>
+          )}
           <div style={{ fontWeight: 700, fontSize: 'var(--font-size-md)' }}>{title}</div>
           <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)', marginTop: 4 }}>
             {subtitle} — the file never leaves your computer
