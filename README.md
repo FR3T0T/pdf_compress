@@ -182,7 +182,6 @@ Each preset has per-image-type DPI targets (color, grayscale, monochrome). Your 
 - **Cancellation** — cancel a running batch at any time without leaving partial files
 - **System tray notifications** — notified when a long operation finishes while minimized
 - **Folder drag-and-drop** — drop a folder to add all PDFs recursively
-- **Windows context menu** — register "Compress with PDF Compress" in the Explorer right-click menu (via About dialog)
 - **Background analysis** — files are analyzed in a background thread without freezing the UI
 - **Programmatic app icon** — no external icon file needed
 
