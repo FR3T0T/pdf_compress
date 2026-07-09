@@ -163,7 +163,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | FE-02 | 🟡 Low | frontend | Workspace risk badge/findings never refreshed after a transform | `WorkspaceContext.tsx:123` | Open |
 | FE-03 | 🟡 Low | frontend | `RedactPage` advances workspace with an unguarded `output_path` | `RedactPage.tsx:191` | ✅ Fixed |
 | TST-03 | 🟡 Low | tests | Password protect/unlock round-trip untested | `pdf_ops.py:408` | Open |
-| TST-04 | 🟡 Low | tests | Backup-on-overwrite test asserts nothing when compression skips | `tests/test_engine.py:239` | Open |
+| TST-04 | 🟡 Low | tests | Backup-on-overwrite test asserts nothing when compression skips | `tests/test_engine.py:239` | ✅ Fixed |
 | DOC-01 | 🟡 Low | docs | README advertises a Windows context-menu + About dialog that no longer exist | `README.md:180` | Open |
 | DOC-02 | 🟡 Low | docs | CHANGELOG documents a "stanza" security upgrade for a never-present dep | `CHANGELOG.md:115` | Open |
 | PKG-01 | 🟡 Low | build | `assets/fonts/DejaVuSans.ttf` not bundled in the PyInstaller spec | `pdf_toolkit.spec:25` | Open |
@@ -770,7 +770,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   it opens without a password.
 - **Verification:** CONFIRMED. (Finder rated Medium; downgraded to Low.)
 
-#### TST-04 — Backup-on-overwrite test asserts nothing when compression skips
+#### TST-04 — Backup-on-overwrite test asserts nothing when compression skips ✅ Fixed
 - **Location:** `tests/test_engine.py:238-241`.
 - **What:** The only assertions (`backup_path is not None`; file exists) are inside
   `if not result.skipped:`. If the fixture ever compresses to no gain, the test
@@ -780,6 +780,13 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Fix:** Assert backup behaviour unconditionally (or add an explicit skip-branch
   case).
 - **Verification:** CONFIRMED.
+- **✅ Fixed** — the `if not result.skipped:` guard is removed; the test now asserts
+  `backup_path is not None` and the file exists unconditionally, and additionally
+  checks the backup is a real copy (`getsize(backup) == getsize(original)`). This
+  is safe because the engine creates the backup unconditionally at
+  `engine.py:1763` (before the skip branch) and both return paths carry
+  `backup_path`. Verified: the un-guarded assertions pass, confirming the backup
+  is genuinely created whether or not compression skips.
 
 #### DOC-01 — README advertises a removed Windows context-menu + About dialog
 - **Location:** `README.md:180`.
