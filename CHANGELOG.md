@@ -110,6 +110,17 @@
   to Fixed.
 
 ### Fixes
+- **CLI now exits nonzero when any input fails (CLI-01).** `compress_pdf.py`'s
+  `main()` tallied failures (invalid magic, encrypted, invalid, too-large,
+  catch-all) in `n_err` but never called `sys.exit()` on that count, so the
+  process always exited 0 regardless — any chained/scripted use (the
+  documented `... -o out/ && next_step` batch pattern) treated an all-failed
+  run as success. Now calls `sys.exit(1 if n_err else 0)` after the summary.
+  An existing test had asserted `returncode == 0` on a failed run, codifying
+  the bug; fixed to assert `returncode == 1`, plus added
+  `test_success_exits_zero` and `test_mixed_batch_with_one_failure_exits_nonzero`.
+  Note: `CLI-04` (not-found inputs never increment `n_err`) is a separate,
+  still-open finding — a batch of only missing files still exits 0.
 - **Flatten with "remove form fields" but not "remove annotations" now
   actually removes the form fields (OPS-02).** `flatten_pdf`'s `/Annots`
   handling was entirely nested inside `if annotations`, so the
