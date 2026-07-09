@@ -851,20 +851,25 @@ def add_watermark(input_path, output_path, text="WATERMARK", opacity=0.3,
     stream). Opacity applies to both fill and stroke via the page's
     /ExtGState, same as single mode.
     """
-    src = pikepdf.open(input_path)
-    num_pages = len(src.pages)
-
-    if page_range:
-        ranges = _parse_ranges(page_range, num_pages)
-        target_pages = set()
-        for s, e in ranges:
-            target_pages.update(range(s - 1, e))
-    else:
-        target_pages = set(range(num_pages))
-
-    # Convert hex color to RGB floats
+    # Validate the color before opening the PDF -- a malformed value must
+    # not leak an open file handle (OPS-03).
     c = color.lstrip("#")
     r, g, b = int(c[0:2], 16) / 255, int(c[2:4], 16) / 255, int(c[4:6], 16) / 255
+
+    src = pikepdf.open(input_path)
+    try:
+        num_pages = len(src.pages)
+
+        if page_range:
+            ranges = _parse_ranges(page_range, num_pages)
+            target_pages = set()
+            for s, e in ranges:
+                target_pages.update(range(s - 1, e))
+        else:
+            target_pages = set(range(num_pages))
+    except Exception:
+        src.close()
+        raise
 
     angle_rad = math.radians(rotation)
     cos_a = math.cos(angle_rad)

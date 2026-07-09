@@ -14,6 +14,7 @@ from pdf_ops import (
     SplitResult,
     _parse_ranges,
     _sanitize_title,
+    add_watermark,
     apply_page_operations,
     contained_output_path,
     extract_text,
@@ -689,3 +690,43 @@ class TestUnlockPdf:
 
         with pikepdf.open(unlocked) as pdf:  # no password needed
             assert len(pdf.pages) >= 1
+
+
+class TestAddWatermark:
+    @pytest.mark.integration
+    def test_basic_watermark(self, sample_pdf, tmp_path):
+        out = str(tmp_path / "watermarked.pdf")
+        add_watermark(sample_pdf, out, text="CONFIDENTIAL")
+        assert os.path.isfile(out)
+        with pikepdf.open(out) as pdf:
+            assert len(pdf.pages) >= 1
+
+    def test_malformed_page_range_does_not_leak_file_handle(self, sample_pdf, tmp_path):
+        # OPS-03: a malformed page_range used to raise with `src` (the open
+        # pikepdf.Pdf) never closed. On Windows this leaves the input file
+        # locked. The exception is caught (not via pytest.raises) and held
+        # in `caught`, deliberately keeping its traceback -- and therefore
+        # `src`'s frame -- alive, mirroring how a real caller (e.g. the
+        # bridge) holds the exception to build an error message before it's
+        # released; CPython's refcounting GC would otherwise close the
+        # leaked handle "by accident" the moment the traceback is dropped,
+        # masking the bug (pytest.raises releases it too promptly to catch
+        # this).
+        out = str(tmp_path / "watermarked.pdf")
+        caught = None
+        try:
+            add_watermark(sample_pdf, out, page_range="not-a-range")
+        except ValueError as e:
+            caught = e
+        assert caught is not None
+        os.remove(sample_pdf)  # must not raise -- proves the handle was released
+
+    def test_malformed_color_does_not_leak_file_handle(self, sample_pdf, tmp_path):
+        out = str(tmp_path / "watermarked.pdf")
+        caught = None
+        try:
+            add_watermark(sample_pdf, out, color="#88")  # too short to parse
+        except ValueError as e:
+            caught = e
+        assert caught is not None
+        os.remove(sample_pdf)  # must not raise -- proves the handle was released
