@@ -21,10 +21,12 @@ from engine import (
     CancelledError,
     CompressionStats,
     EncryptedPDFError,
+    ImageInfo,
     InvalidPDFError,
     Result,
     _optimize_content_streams,
     _sanitize_path_for_subprocess,
+    _should_skip,
     analyze_pdf,
     compress_images_smart,
     compress_pdf,
@@ -584,3 +586,45 @@ class TestCompressWithGhostscript:
         # (here shortened) gs_timeout and return None.
         assert elapsed < 2.0
         assert result is not None
+
+
+def _make_image_info(pixel_w: int, pixel_h: int) -> ImageInfo:
+    return ImageInfo(
+        key="x", obj_id=1, pixel_w=pixel_w, pixel_h=pixel_h,
+        display_w_pts=0, display_h_pts=0, effective_dpi_x=0, effective_dpi_y=0,
+        raw_size=1000, is_grayscale=False, is_jpeg=False, has_soft_mask=False,
+        estimated_quality=100, page_index=0, is_monochrome=False,
+        filter_name="FlateDecode", bits_per_component=8,
+    )
+
+
+class TestShouldSkipTiny:
+    """ENG-06: each preset's own skip_below_px must actually take effect --
+    a hardcoded is_tiny (<64px) floor previously overrode every preset's
+    finer threshold (48/32/24/16), so images below 64px but above a given
+    preset's own threshold were always wrongly skipped."""
+
+    @pytest.mark.parametrize("preset_key,skip_below_px", [
+        ("screen", 64), ("ebook", 48), ("standard", 32),
+        ("high", 24), ("prepress", 16),
+    ])
+    def test_skip_threshold_matches_preset(self, preset_key, skip_below_px):
+        preset = PRESETS[preset_key]
+        assert preset.skip_below_px == skip_below_px
+
+        just_below = _make_image_info(skip_below_px - 1, skip_below_px - 1)
+        at_threshold = _make_image_info(skip_below_px, skip_below_px)
+
+        assert _should_skip(just_below, preset) == "tiny"
+        assert _should_skip(at_threshold, preset) != "tiny"
+
+    def test_40px_image_not_skipped_by_higher_quality_presets(self):
+        # 40px is below the old hardcoded 64px floor but at/above standard
+        # (32), high (24), and prepress (16)'s own thresholds -- those
+        # presets must process it, not skip it.
+        info = _make_image_info(40, 40)
+        assert _should_skip(info, PRESETS["screen"]) == "tiny"
+        assert _should_skip(info, PRESETS["ebook"]) == "tiny"
+        assert _should_skip(info, PRESETS["standard"]) != "tiny"
+        assert _should_skip(info, PRESETS["high"]) != "tiny"
+        assert _should_skip(info, PRESETS["prepress"]) != "tiny"

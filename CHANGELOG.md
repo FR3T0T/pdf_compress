@@ -110,6 +110,19 @@
   to Fixed.
 
 ### Fixes
+- **Each compression preset's own tiny-image threshold now actually applies
+  (ENG-06).** `_should_skip` skipped recompressing an image when
+  `info.is_tiny or max(w,h) < preset.skip_below_px` -- but `is_tiny` was
+  hardcoded to `<64px`, and every preset's own threshold (64/48/32/24/16 for
+  screen/ebook/standard/high/prepress) is `≤ 64`, so the hardcoded clause
+  always subsumed the preset's finer threshold. Every preset behaved
+  identically (a flat 64px floor) for any image below 64px -- e.g. a 40px
+  image was skipped by `standard`, `high`, and `prepress` even though their
+  own thresholds (32/24/16) say it should be processed. Removed the hardcoded
+  `is_tiny` clause (and the now-unused `ImageInfo.is_tiny` property); each
+  preset's `skip_below_px` is now the sole floor. `estimate_output` picks up
+  the fix automatically (calls `_should_skip` directly). Verified empirically
+  before/after. Added `tests/test_engine.py::TestShouldSkipTiny`.
 - **CLI now exits nonzero when any input fails (CLI-01).** `compress_pdf.py`'s
   `main()` tallied failures (invalid magic, encrypted, invalid, too-large,
   catch-all) in `n_err` but never called `sys.exit()` on that count, so the

@@ -449,10 +449,6 @@ class ImageInfo:
     def pixel_count(self) -> int:
         return self.pixel_w * self.pixel_h
 
-    @property
-    def is_tiny(self) -> bool:
-        return max(self.pixel_w, self.pixel_h) < 64
-
 
 def _estimate_jpeg_quality(raw_size: int, pixel_w: int, pixel_h: int,
                            channels: int) -> int:
@@ -719,7 +715,7 @@ class CompressionStats:
 
 def _should_skip(info: ImageInfo, preset: Preset) -> Optional[str]:
     """Return a reason to skip, or None if the image should be processed."""
-    if info.is_tiny or max(info.pixel_w, info.pixel_h) < preset.skip_below_px:
+    if max(info.pixel_w, info.pixel_h) < preset.skip_below_px:
         return "tiny"
 
     # Get the appropriate DPI for this image type
