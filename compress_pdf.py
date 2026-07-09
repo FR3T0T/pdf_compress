@@ -114,6 +114,7 @@ def main():
 
     for path in args.inputs:
         if not os.path.isfile(path):
+            n_err += 1
             print(f"\n  SKIP: {path} — not found")
             continue
 
