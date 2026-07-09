@@ -1281,12 +1281,18 @@ def compress_with_ghostscript(
     output_path: str,
     preset_key: str,
     cancel: Optional[threading.Event] = None,
+    gs_timeout: float = 300.0,
 ) -> Optional[int]:
     """
     Run Ghostscript to further optimize a PDF (font subsetting, etc.).
 
     Returns the output file size on success, or None if Ghostscript is
     not available or the process fails.
+
+    Args:
+        gs_timeout: maximum wall-clock time (seconds) to wait for the
+            Ghostscript process before killing it. Overridable so tests can
+            verify polling behavior without waiting the full default.
     """
     gs_path = find_ghostscript()
     if gs_path is None:
@@ -1323,9 +1329,6 @@ def compress_with_ghostscript(
         safe_input,
     ]
 
-    # Maximum wall-clock time for the Ghostscript process (5 minutes).
-    gs_timeout = 300
-
     try:
         _check_cancel(cancel)
 
@@ -1335,30 +1338,35 @@ def compress_with_ghostscript(
             stderr=subprocess.PIPE,
         )
 
-        # Poll for completion, checking cancellation and enforcing timeout
+        # Poll for completion, checking cancellation and enforcing timeout.
+        # Use communicate() rather than wait() so stdout/stderr are
+        # continuously drained while polling -- otherwise Ghostscript can
+        # fill the OS pipe buffer (~64KB) with font-substitution/recoverable-
+        # error diagnostics and block on the full pipe while we block in
+        # wait(), deadlocking until the timeout kills it (ENG-04). Retrying
+        # communicate() after a TimeoutExpired is safe and loses no output
+        # (see subprocess docs).
         elapsed = 0.0
+        stderr_data = b""
         while True:
             try:
-                retcode = proc.wait(timeout=2.0)
+                _, stderr_data = proc.communicate(timeout=2.0)
+                retcode = proc.returncode
                 break
             except subprocess.TimeoutExpired:
                 elapsed += 2.0
                 if cancel is not None and cancel.is_set():
                     proc.kill()
-                    proc.wait()
+                    proc.communicate()
                     raise CancelledError("Compression cancelled during Ghostscript pass") from None
                 if elapsed >= gs_timeout:
                     proc.kill()
-                    proc.wait()
+                    proc.communicate()
                     log.warning("Ghostscript timed out after %d seconds", int(elapsed))
                     return None
 
         if retcode != 0:
-            stderr_out = ""
-            try:
-                stderr_out = proc.stderr.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                pass
+            stderr_out = stderr_data.decode("utf-8", errors="replace")[:500]
             log.warning("Ghostscript failed (code %d): %s", retcode, stderr_out)
             return None
 

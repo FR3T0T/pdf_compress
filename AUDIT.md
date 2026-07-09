@@ -138,7 +138,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | TRN-03 | 🔴 High | translate | Source text in non-Latin/Cyrillic scripts returned untranslated | `pdf_translate.py:305` | ✅ Fixed |
 | ANL-02 | 🔴 High | analyze | Sanitiser leaves JS/Launch/Submit in `/Next` action chains | `pdf_analyze.py:778` | ✅ Fixed |
 | ENG-03 | 🟠 Med | engine | `q Q` regex can corrupt text / inline images in uncompressed streams | `engine.py:1698` | ✅ Fixed |
-| ENG-04 | 🟠 Med | engine | Ghostscript pipes never drained → deadlock until 5-min timeout | `engine.py:1318` | Open |
+| ENG-04 | 🟠 Med | engine | Ghostscript pipes never drained → deadlock until 5-min timeout | `engine.py:1279` | ✅ Fixed |
 | OPS-02 | 🟠 Med | pdf_ops | `flatten(forms=True, annotations=False)` leaves form-field values | `pdf_ops.py:1291` | Open |
 | ANL-01 | 🟠 Med | analyze | In-place sanitise fails on Windows (`os.replace` over open handle) | `pdf_analyze.py:884` | ✅ Fixed |
 | ANL-03 | 🟠 Med | analyze | Invisible-text ("failed redaction") detector largely non-functional | `pdf_analyze.py:620` | ✅ Fixed |
@@ -345,20 +345,37 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   threshold triggers no rewrite at all).
 - **Verification:** CONFIRMED; now covered by automated tests.
 
-#### ENG-04 — Ghostscript pipes never drained → deadlock until timeout
-- **Location:** `engine.py:1318-1349` (`compress_with_ghostscript`).
-- **What:** `gs` is launched with `stdout=PIPE, stderr=PIPE`, but the poll loop
-  only calls `proc.wait(timeout=2.0)` and never drains the pipes (stderr is read
-  only after the loop). If `gs` writes more than the ~64 KB OS pipe buffer (font
-  substitution / recoverable-error diagnostics that `-dQUIET` doesn't suppress),
-  it blocks on the full pipe while the parent blocks in `wait()` — the classic
-  Popen deadlock.
-- **Impact:** Not an infinite hang — the 300 s timeout kills it — but a wasted
-  ~5-minute stall on affected inputs, after which the GS pass is silently
+#### ENG-04 — Ghostscript pipes never drained → deadlock until timeout ✅ Fixed
+- **Location:** `engine.py:1279` (`compress_with_ghostscript`), poll loop at
+  `:1349`.
+- **What:** `gs` was launched with `stdout=PIPE, stderr=PIPE`, but the poll loop
+  only called `proc.wait(timeout=2.0)` and never drained the pipes (stderr was
+  read only after the loop, via `proc.stderr.read()`). If `gs` wrote more than
+  the ~64 KB OS pipe buffer (font substitution / recoverable-error diagnostics
+  that `-dQUIET` doesn't suppress), it blocked on the full pipe while the parent
+  blocked in `wait()` — the classic Popen deadlock.
+- **Impact:** Not an infinite hang — the 300 s timeout killed it — but a wasted
+  ~5-minute stall on affected inputs, after which the GS pass was silently
   discarded (no font-subsetting benefit). No crash / data loss.
-- **Fix:** Use `proc.communicate(timeout=…)` in the poll loop, or redirect
-  stdout/stderr to temp files / `DEVNULL`.
-- **Verification:** CONFIRMED.
+- **Fix (applied):** Took the `proc.communicate(timeout=…)` option. The poll
+  loop now calls `proc.communicate(timeout=2.0)` instead of `proc.wait()`,
+  continuously draining both pipes while polling; per the `subprocess` docs,
+  retrying `communicate()` after a `TimeoutExpired` is safe and loses no
+  output, so cancellation/timeout handling is otherwise unchanged (still kills
+  the process and re-drains once to reap it). The post-failure `stderr` log now
+  uses the bytes already captured by the successful `communicate()` call
+  (`proc.stderr` is closed by then, so re-reading it isn't an option). Also
+  added an optional `gs_timeout` parameter (default unchanged at `300.0`) so
+  tests can verify the polling behavior without waiting the full 5 minutes on
+  a regression. Verified empirically: reproduced the deadlock directly (a
+  child writing 500 KB to a piped stdout never returns from a `wait()`-only
+  poll loop) and confirmed `communicate()`-based polling drains it and lets
+  the child exit in milliseconds. Regression test:
+  `tests/test_engine.py::TestCompressWithGhostscript` (a fake "gs" that writes
+  500 KB to stderr, run through the real polling loop via a monkeypatched
+  `subprocess.Popen`, must complete in well under a shortened `gs_timeout`
+  rather than exhausting it and returning `None`).
+- **Verification:** CONFIRMED; now covered by an automated test.
 
 #### OPS-02 — `flatten(forms=True, annotations=False)` leaves form-field values
 - **Location:** `pdf_ops.py:1290-1309`.
