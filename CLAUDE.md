@@ -43,17 +43,10 @@ same change**, not "later":
   frontend architecture, parity status, or the bridge surface changes.
 - **`CLAUDE.md`** (this file) — update when a rule, convention, or workflow here
   changes.
-- **`AUDIT.md`** — the standing code-audit snapshot: known open findings with
-  severity, evidence, and suggested fixes. Two obligations: **(1) consult it**
-  before working on a subsystem — skim that area's findings so you don't
-  reintroduce or trip over a known one; **(2) keep it current** — when you fix a
-  finding, flip its **Status** in the §4 master table (and record the fix in
-  `CHANGELOG.md`). It's anchored to a git SHA, so treat *file + description* as the
-  stable anchor when line numbers drift.
 - **GitHub Project board** — <https://github.com/users/FR3T0T/projects/7>
-  tracks work items (audit findings from `AUDIT.md`, plus other feature work)
-  with a `Status` field (`Todo` / `In progress` / `Done`) and an `owner:<name>`
-  label per item. Keep it in step with actual repo state, not just intentions:
+  tracks work items with a `Status` field (`Todo` / `In progress` / `Done`) and
+  an `owner:<name>` label per item. Keep it in step with actual repo state, not
+  just intentions:
   - Flip an item to **In progress** *before* starting work on it, not after.
   - Only flip it to **Done** once the fix is **merged into `main`** — a local
     commit or an open PR is still `In progress`. This matches how every

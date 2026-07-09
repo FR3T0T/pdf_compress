@@ -2,7 +2,7 @@
 
 Fully offline PDF toolkit with 22 professional tools — compress, merge, split, convert, protect, redact, watermark, and more. DPI-aware image recompression, AES-256 encryption, and PDF/A compliance. No cloud services, no accounts, no tracking.
 
-**v4.22**
+**v4.23**
 
 ---
 
@@ -57,11 +57,6 @@ Pure, unit-testable logic is kept in **top-level modules that import no Qt/PySid
 Importing anything under `ui/` pulls in the Qt GUI stack (`ui/__init__` → `web_shell`
 → QtWebEngine), which a headless CI runner can't load — so tests import the pure
 helpers directly instead of through `ui.bridge`.
-
-**Known issues:** [`AUDIT.md`](AUDIT.md) is a standing code-audit snapshot of the
-current known open findings (severity, evidence, and suggested fixes) across every
-subsystem. Skim the relevant entries before working on a module, and update a
-finding's Status there when you fix it.
 
 ---
 
@@ -266,7 +261,6 @@ Text and vector graphics are never modified.
 | `assets/fonts/` | Bundled fonts (DejaVu Sans) for image-preserving PDF translation output |
 | `tests/` | Pytest suite (pure-Python, no Qt import required) |
 | `.github/workflows/ci.yml` | CI — ruff lint + pytest matrix (Linux/Windows, py3.10/3.12) |
-| `AUDIT.md` | Standing code-audit snapshot — known open findings by severity, with evidence and suggested fixes |
 | `requirements.txt` | Python runtime dependencies |
 | `requirements-dev.txt` | Dev/test dependencies (pytest, pytest-cov, ruff) |
 

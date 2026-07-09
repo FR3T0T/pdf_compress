@@ -1,5 +1,5 @@
 # Changelog
-## Unreleased
+## v4.23
 
 ### Added
 - **Image metadata privacy analyzer (backend).** `pdf_analyze.py` can now scan
@@ -441,6 +441,15 @@
   checks the backup is a real copy of the pre-compress original (same size). Safe
   because the engine creates the backup unconditionally before the skip decision;
   the un-guarded assertions pass. Production code unchanged. Flips TST-04 to Fixed.
+- **Crypto round-trip tests now assert full byte equality, not just the 5-byte
+  `%PDF-` magic (TST-05).** `tests/test_epdf_crypto.py`'s per-cipher round-trip
+  tests (ChaCha20-Poly1305, AES-256-GCM, Camellia-256-CBC, Argon2d KDF) only
+  checked that the decrypted file started with `%PDF-`; a separate
+  `test_file_sizes_match` checked size alone. Both are now one assertion per
+  test — `open(dec, "rb").read() == open(sample_pdf, "rb").read()` — which
+  subsumes magic bytes and size and catches any content-fidelity regression the
+  narrower checks would miss. `test_file_sizes_match` removed as redundant.
+  Flips TST-05 to Fixed — closes out every finding in `AUDIT.md`.
 
 ### Docs
 - **Removed a fabricated "stanza" security-upgrade line from the v4.20 section
@@ -462,6 +471,12 @@
 - **`CLAUDE.md` / `README.md`** — contributors now consult the relevant `AUDIT.md`
   findings before touching a subsystem and flip a finding's **Status** when they
   fix it (recording the fix in this changelog too).
+- **Removed `AUDIT.md`.** Every finding in its master list is now `✅ Fixed` (the
+  last, `TST-05`, closes above) — the snapshot has fully served its purpose and
+  each fix is already recorded here in detail, so the standalone doc is now
+  redundant rather than current. Removed the doc-currency bullet and the "consult
+  before touching a subsystem" workflow it described from `CLAUDE.md`, and the
+  "Known issues" pointer + Files-table row from `README.md`.
 
 ## v4.22
 

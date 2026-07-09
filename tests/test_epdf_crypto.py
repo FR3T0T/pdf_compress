@@ -41,9 +41,9 @@ class TestEncryptDecryptRoundtrip:
         epdf_decrypt(enc, dec, self.PASSWORD)
         assert os.path.isfile(dec)
 
-        # Decrypted file must start with %PDF-
-        with open(dec, "rb") as f:
-            assert f.read(5) == b"%PDF-"
+        # Decrypted file must be byte-for-byte identical to the original
+        with open(dec, "rb") as f, open(sample_pdf, "rb") as f_orig:
+            assert f.read() == f_orig.read()
 
     @pytest.mark.integration
     def test_aes_256_gcm(self, sample_pdf, tmp_path):
@@ -53,8 +53,8 @@ class TestEncryptDecryptRoundtrip:
         epdf_encrypt(sample_pdf, enc, self.PASSWORD, cipher="aes-256-gcm")
         epdf_decrypt(enc, dec, self.PASSWORD)
 
-        with open(dec, "rb") as f:
-            assert f.read(5) == b"%PDF-"
+        with open(dec, "rb") as f, open(sample_pdf, "rb") as f_orig:
+            assert f.read() == f_orig.read()
 
     @pytest.mark.integration
     def test_camellia_256_cbc(self, sample_pdf, tmp_path):
@@ -65,8 +65,8 @@ class TestEncryptDecryptRoundtrip:
                      cipher="camellia-256-cbc")
         epdf_decrypt(enc, dec, self.PASSWORD)
 
-        with open(dec, "rb") as f:
-            assert f.read(5) == b"%PDF-"
+        with open(dec, "rb") as f, open(sample_pdf, "rb") as f_orig:
+            assert f.read() == f_orig.read()
 
     @pytest.mark.integration
     def test_argon2d_kdf(self, sample_pdf, tmp_path):
@@ -77,19 +77,8 @@ class TestEncryptDecryptRoundtrip:
         assert info["kdf"] == "argon2d"
 
         epdf_decrypt(enc, dec, self.PASSWORD)
-        with open(dec, "rb") as f:
-            assert f.read(5) == b"%PDF-"
-
-    @pytest.mark.integration
-    def test_file_sizes_match(self, sample_pdf, tmp_path):
-        """Decrypted file should be the same size as the original."""
-        enc = str(tmp_path / "encrypted.epdf")
-        dec = str(tmp_path / "decrypted.pdf")
-
-        epdf_encrypt(sample_pdf, enc, self.PASSWORD)
-        epdf_decrypt(enc, dec, self.PASSWORD)
-
-        assert os.path.getsize(dec) == os.path.getsize(sample_pdf)
+        with open(dec, "rb") as f, open(sample_pdf, "rb") as f_orig:
+            assert f.read() == f_orig.read()
 
 
 # ═══════════════════════════════════════════════════════════════════
