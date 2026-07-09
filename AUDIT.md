@@ -171,7 +171,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | TST-04 | 🟡 Low | tests | Backup-on-overwrite test asserts nothing when compression skips | `tests/test_engine.py:239` | ✅ Fixed |
 | DOC-01 | 🟡 Low | docs | README advertises a Windows context-menu + About dialog that no longer exist | `README.md:185` | ✅ Fixed |
 | DOC-02 | 🟡 Low | docs | CHANGELOG documents a "stanza" security upgrade for a never-present dep | `CHANGELOG.md:546` (v4.20 section) | ✅ Fixed |
-| PKG-01 | 🟡 Low | build | `assets/fonts/DejaVuSans.ttf` not bundled in the PyInstaller spec | `pdf_toolkit.spec:25` | Open |
+| PKG-01 | 🟡 Low | build | `assets/fonts/DejaVuSans.ttf` not bundled in the PyInstaller spec | `pdf_toolkit.spec:29` | ✅ Fixed |
 | PKG-02 | 🟡 Low | build | Spec lists a deleted module `ui.dialogs` as a hidden import | `pdf_toolkit.spec:75` | Open |
 | TST-05 | ⚪ Info | tests | Crypto round-trip tests check only the 5-byte `%PDF-` magic | `tests/test_epdf_crypto.py:46` | Open |
 | PKG-03 | 🔵 Plaus | build | UPX enabled for all binaries incl. Qt/WebEngine DLLs (frozen-build trap) | `pdf_toolkit.spec:118` | Open |
@@ -1051,21 +1051,26 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   than fabricate a replacement.
 - **Verification:** CONFIRMED.
 
-#### PKG-01 — `assets/fonts/DejaVuSans.ttf` not bundled in the spec
-- **Location:** `pdf_toolkit.spec:25-27` (`datas`); loader
+#### PKG-01 — `assets/fonts/DejaVuSans.ttf` not bundled in the spec ✅ Fixed
+- **Location:** `pdf_toolkit.spec:29` (`datas`); loader
   `pdf_translate.py:473-523`.
 - **What:** `pdf_translate` resolves its font dir relative to `__file__` and
   prefers the committed `DejaVuSans.ttf` for image-preserving translated-PDF
-  output. The spec's `datas` bundles only `web-react/dist` — not `assets/fonts/` —
-  so in the frozen build the bundled font is absent and the loader falls through
-  to OS fonts, then to Latin-only `helv` with only a warning.
-- **Impact:** Defeats the advertised "portable across machines" guarantee.
+  output. The spec's `datas` bundled only `web-react/dist` — not `assets/fonts/`
+  — so in the frozen build the bundled font was absent and the loader fell
+  through to OS fonts, then to Latin-only `helv` with only a warning.
+- **Impact:** Defeated the advertised "portable across machines" guarantee.
   Overstated in practice on the primary platform: the Windows fallback
   `C:\Windows\Fonts\arial.ttf` covers Latin+Cyrillic+Greek and is present on
-  virtually all installs, so output usually still renders — unless arial **and**
-  tahoma are both missing.
-- **Fix:** Add the fonts dir to `datas`:
-  `(os.path.join(PROJECT_ROOT, "assets", "fonts"), os.path.join("assets", "fonts"))`.
+  virtually all installs, so output usually still rendered — unless arial
+  **and** tahoma were both missing.
+- **Fix (applied):** Exactly the suggested fix — added
+  `(os.path.join(PROJECT_ROOT, "assets", "fonts"), os.path.join("assets",
+  "fonts"))` to `datas`, mirroring the existing `WEB_REACT_DIST` entry.
+  Verified the source path resolves to the real, committed
+  `assets/fonts/DejaVuSans.ttf`. No frozen-build CI job exists to exercise this
+  end-to-end (see `PKG-03`), so this is verified by inspection matching the
+  already-working `WEB_REACT_DIST` pattern, not a full PyInstaller build.
 - **Verification:** CONFIRMED. (Finder rated Medium; downgraded to Low.)
 
 #### PKG-02 — Spec lists a deleted module `ui.dialogs` as a hidden import
