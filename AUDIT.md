@@ -161,7 +161,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | TRN-02 | 🟡 Low | translate | Temp PNG leaks if `pix.save` fails before the cleanup try/finally | `pdf_translate.py:450` | ✅ Fixed |
 | BRG-02 | 🟡 Low | bridge | `deleteFile`/`copyFile` lack workspace-dir path containment | `ui/bridge.py:851` | ✅ Fixed |
 | BRG-03 | 🟡 Low | bridge | Slot-level param parse runs outside worker try/except → UI hangs | `ui/bridge.py:722` | ✅ Fixed |
-| CLI-02 | 🟡 Low | CLI | Batch: two inputs sharing a basename overwrite each other's output | `compress_pdf.py:128` | Open |
+| CLI-02 | 🟡 Low | CLI | Batch: two inputs sharing a basename overwrite each other's output | `compress_pdf.py:126` | ✅ Fixed |
 | CLI-03 | 🟡 Low | CLI | `input()` at exit raises `EOFError` traceback on non-interactive stdin | `compress_pdf.py:211` | Open |
 | CLI-04 | 🟡 Low | CLI | Not-found inputs omitted from summary counts / failure tally | `compress_pdf.py:115` | Open |
 | FE-02 | 🟡 Low | frontend | Workspace risk badge/findings never refreshed after a transform | `WorkspaceContext.tsx:123` | ✅ Fixed |
@@ -869,18 +869,27 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `ui/` pulls the full PySide6 stack (the test suite is kept Qt-free, same
   constraint as BRG-01). The pattern now matches `startMerge`.
 
-#### CLI-02 — Batch: same-basename inputs overwrite each other's output
-- **Location:** `compress_pdf.py:128-130`.
-- **What:** In `-o <dir>` mode the output name is `<basename>_compressed.pdf`,
-  keyed only on basename. `a/report.pdf` and `b/report.pdf` both resolve to
-  `out/report_compressed.pdf`; the second silently overwrites the first. No
+#### CLI-02 — Batch: same-basename inputs overwrite each other's output ✅ Fixed
+- **Location:** `compress_pdf.py:126-141`.
+- **What:** In `-o <dir>` mode the output name was `<basename>_compressed.pdf`,
+  keyed only on basename. `a/report.pdf` and `b/report.pdf` both resolved to
+  `out/report_compressed.pdf`; the second silently overwrote the first. No
   collision guard.
 - **Impact:** Lost **derived** output (regenerable), not source data (inputs and
   outputs live in different dirs). No backup fires in `-o` mode (backup only on
   in-place).
-- **Fix:** Detect collisions across the batch's resolved output paths and
-  disambiguate (append a counter) or error before overwriting.
-- **Verification:** CONFIRMED. (Finder rated Medium; downgraded to Low.)
+- **Fix (applied):** Same `seen_counts`-style disambiguation as `OPS-04`: a
+  `seen_out_names` dict tracks how many times each generated output name has
+  been produced within the batch. The first occurrence is unchanged; the 2nd+
+  gets `_{count}` inserted before the extension
+  (`report_compressed.pdf`, `report_compressed_2.pdf`, …). Verified
+  empirically: two same-basename inputs from different directories previously
+  produced only 1 output file (the second input's content, first silently
+  discarded); now produce 2 distinct files, each with the correct content.
+  Regression test:
+  `tests/test_cli.py::TestCLI::test_same_basename_batch_produces_distinct_outputs`.
+- **Verification:** CONFIRMED; now covered by an automated test. (Finder rated
+  Medium; downgraded to Low.)
 
 #### CLI-03 — `input()` at exit raises `EOFError` on non-interactive stdin
 - **Location:** `compress_pdf.py:210-211`.
