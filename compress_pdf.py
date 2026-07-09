@@ -219,7 +219,11 @@ def main():
             print(f"  Total saved: {fmt_size(total_saved)} ({pct:.0f}%)")
 
     print()
-    if not args.no_pause:
+    # Skip the pause on non-interactive stdin (piped/redirected/CI) -- an
+    # unguarded input() there raises EOFError, which would crash with exit
+    # code 1 regardless of n_err, masking the real exit status set below
+    # (CLI-03).
+    if not args.no_pause and sys.stdin.isatty():
         input("  Done. Press Enter to exit...")
 
     sys.exit(1 if n_err else 0)
