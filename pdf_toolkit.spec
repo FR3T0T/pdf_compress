@@ -78,7 +78,6 @@ hiddenimports = [
     "ui.web_shell",
     "ui.bridge",
     "ui.theme",
-    "ui.dialogs",
     "ui.tool_registry",
 ]
 

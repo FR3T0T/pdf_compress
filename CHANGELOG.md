@@ -110,6 +110,11 @@
   to Fixed.
 
 ### Fixes
+- **PyInstaller spec no longer lists a deleted module as a hidden import
+  (PKG-02).** `hiddenimports` still included `"ui.dialogs"`, but `ui/dialogs.py`
+  was deleted in v4.21 -- PyInstaller emitted a harmless "hidden import not
+  found" warning on every build. Removed the stale entry (re-verified nothing
+  else references it first).
 - **Frozen (PyInstaller) build now bundles the portable translation font
   (PKG-01).** `pdf_translate` prefers the committed `assets/fonts/DejaVuSans.ttf`
   for image-preserving translated-PDF output, but the spec's `datas` only
