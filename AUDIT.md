@@ -170,7 +170,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | TST-03 | 🟡 Low | tests | Password protect/unlock round-trip untested | `pdf_ops.py:408` | ✅ Fixed |
 | TST-04 | 🟡 Low | tests | Backup-on-overwrite test asserts nothing when compression skips | `tests/test_engine.py:239` | ✅ Fixed |
 | DOC-01 | 🟡 Low | docs | README advertises a Windows context-menu + About dialog that no longer exist | `README.md:185` | ✅ Fixed |
-| DOC-02 | 🟡 Low | docs | CHANGELOG documents a "stanza" security upgrade for a never-present dep | `CHANGELOG.md:115` | Open |
+| DOC-02 | 🟡 Low | docs | CHANGELOG documents a "stanza" security upgrade for a never-present dep | `CHANGELOG.md:546` (v4.20 section) | ✅ Fixed |
 | PKG-01 | 🟡 Low | build | `assets/fonts/DejaVuSans.ttf` not bundled in the PyInstaller spec | `pdf_toolkit.spec:25` | Open |
 | PKG-02 | 🟡 Low | build | Spec lists a deleted module `ui.dialogs` as a hidden import | `pdf_toolkit.spec:75` | Open |
 | TST-05 | ⚪ Info | tests | Crypto round-trip tests check only the 5-byte `%PDF-` magic | `tests/test_epdf_crypto.py:46` | Open |
@@ -1036,14 +1036,19 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 - **Verification:** CONFIRMED. (Finder rated Medium; downgraded to Low — pure
   doc-drift.)
 
-#### DOC-02 — CHANGELOG documents a "stanza" upgrade for a never-present dep
-- **Location:** `CHANGELOG.md:115`.
-- **What:** The v4.20 entry claims *"Upgraded stanza to resolve CVE-2026-54499…"*.
-  The translation stack is Argos + Tesseract + langdetect; `stanza` appears
-  nowhere in the code or dependency files — the only repo occurrence is this line.
-- **Impact:** A security-relevant changelog line references a dependency the
+#### DOC-02 — CHANGELOG documents a "stanza" upgrade for a never-present dep ✅ Fixed
+- **Location:** `CHANGELOG.md`, v4.20 section (bullet removed).
+- **What:** The v4.20 entry claimed *"Upgraded stanza to resolve CVE-2026-54499…"*.
+  The translation stack is Argos + Tesseract + langdetect; `stanza` appeared
+  nowhere in the code or dependency files — the only repo occurrence was this
+  line.
+- **Impact:** A security-relevant changelog line referenced a dependency the
   project never used — misleading, no runtime impact.
-- **Fix:** Correct or remove the stanza/CVE bullet.
+- **Fix (applied):** Took the "remove" option — re-verified `stanza` appears
+  nowhere in code/deps/git history (only in the original v4.20 commit that
+  introduced this line, and the later commit quoting it in this finding), so
+  there's no real event to correct the bullet *to*; removed it entirely rather
+  than fabricate a replacement.
 - **Verification:** CONFIRMED.
 
 #### PKG-01 — `assets/fonts/DejaVuSans.ttf` not bundled in the spec

@@ -417,6 +417,12 @@
   the un-guarded assertions pass. Production code unchanged. Flips TST-04 to Fixed.
 
 ### Docs
+- **Removed a fabricated "stanza" security-upgrade line from the v4.20 section
+  (DOC-02).** It claimed *"Upgraded stanza to resolve CVE-2026-54499…"*, but
+  the translation stack is Argos + Tesseract + langdetect and `stanza` never
+  appeared anywhere in code, dependency files, or git history outside this one
+  line — nothing to correct it *to*, so it's removed rather than replaced with
+  a fabricated event.
 - **README no longer advertises a removed Windows context-menu + About dialog
   (DOC-01).** Both belonged to the native-Qt widget UI deleted in v4.21; a
   repo-wide grep for `winreg`/`HKEY_`/About-dialog code returns nothing.
@@ -544,7 +550,6 @@ Major release: the entire frontend rebuilt in React, plus new tools, a redaction
 - **`.epdf` header authentication (v2)** — cipher/KDF/salt/nonce bound as Associated Data; tampering and downgrade attacks are detected on decrypt. v1 files still decrypt.
 - **Output-path containment** — user-supplied names/templates can no longer escape the chosen folder (blocks `../` traversal and absolute-path override).
 - **`openFile`/`openFolder` validation** — only real local paths are opened; URLs and protocol handlers are refused.
-- Upgraded **stanza** to resolve **CVE-2026-54499** (critical RCE via unsafe pickle deserialization in model loading).
 
 ### Fixes
 - **Translate page-load freeze** — a synchronous `argostranslate` import on tool open froze the whole window ~5s; provisioning status now runs off the UI thread with a loading state.
