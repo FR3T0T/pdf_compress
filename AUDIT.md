@@ -163,7 +163,7 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
 | BRG-03 | 🟡 Low | bridge | Slot-level param parse runs outside worker try/except → UI hangs | `ui/bridge.py:722` | ✅ Fixed |
 | CLI-02 | 🟡 Low | CLI | Batch: two inputs sharing a basename overwrite each other's output | `compress_pdf.py:126` | ✅ Fixed |
 | CLI-03 | 🟡 Low | CLI | `input()` at exit raises `EOFError` traceback on non-interactive stdin | `compress_pdf.py:222` | ✅ Fixed |
-| CLI-04 | 🟡 Low | CLI | Not-found inputs omitted from summary counts / failure tally | `compress_pdf.py:115` | Open |
+| CLI-04 | 🟡 Low | CLI | Not-found inputs omitted from summary counts / failure tally | `compress_pdf.py:116` | ✅ Fixed |
 | FE-02 | 🟡 Low | frontend | Workspace risk badge/findings never refreshed after a transform | `WorkspaceContext.tsx:123` | ✅ Fixed |
 | FE-03 | 🟡 Low | frontend | `RedactPage` advances workspace with an unguarded `output_path` | `RedactPage.tsx:191` | ✅ Fixed |
 | FE-04 | 🟡 Low | frontend | Preview pane stays stale after a merge — never points at the merged output | `MergePage.tsx:105` | ✅ Fixed |
@@ -540,9 +540,9 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `test_mixed_batch_with_one_failure_exits_nonzero` (any failure in a batch
   must make the whole run exit nonzero, even when other inputs succeed).
   Confirmed both new/updated assertions fail against the pre-fix code and pass
-  with the fix. Note: `CLI-04`'s bug (not-found inputs never increment
-  `n_err`) is unaffected by this fix and remains open — a batch of only
-  missing files will still exit 0.
+  with the fix. (At the time this landed, `CLI-04`'s bug — not-found inputs
+  never incrementing `n_err` — meant a batch of only missing files still
+  exited 0 despite this fix; `CLI-04` closes that gap.)
 - **Verification:** CONFIRMED; now covered by automated tests.
 
 #### FE-01 — Drag-drop not scoped to the active page ✅ Fixed
@@ -909,14 +909,22 @@ The v4.20-era class of bug (frontend reading `data.foo` while the bridge sent
   `tests/test_cli.py::TestCLI::test_no_pause_flag_omitted_on_closed_stdin_does_not_crash`.
 - **Verification:** CONFIRMED; now covered by an automated test.
 
-#### CLI-04 — Not-found inputs omitted from summary / failure tally
-- **Location:** `compress_pdf.py:115-117`.
-- **What:** A non-existent input prints a `SKIP` line and `continue`s without
+#### CLI-04 — Not-found inputs omitted from summary / failure tally ✅ Fixed
+- **Location:** `compress_pdf.py:116-118`.
+- **What:** A non-existent input printed a `SKIP` line and `continue`d without
   incrementing `n_ok`/`n_skip`/`n_err` — inconsistent with the invalid-magic case
-  just below (which does `n_err += 1`). Missing files never appear in `Summary:`
-  and (combined with `CLI-01`) are invisible to any count/exit-status check.
-- **Fix:** Increment `n_err` (or a dedicated `n_missing`) for not-found inputs.
-- **Verification:** CONFIRMED.
+  just below (which does `n_err += 1`). Missing files never appeared in
+  `Summary:` and (combined with `CLI-01`) were invisible to any
+  count/exit-status check.
+- **Fix (applied):** Took the suggested `n_err` option (consistent with the
+  invalid-magic case right below it, rather than a separate `n_missing`
+  counter). Verified empirically: a batch with one valid input and one missing
+  input now exits 1 and shows `Summary: 1 skipped, 1 failed`; pre-fix it
+  exited 0 with no `Summary:` line at all (the missing file didn't count
+  toward the `n_ok + n_skip + n_err > 1` threshold that gates printing it).
+  Regression test:
+  `tests/test_cli.py::TestCLI::test_missing_input_counts_as_failure`.
+- **Verification:** CONFIRMED; now covered by an automated test.
 
 #### FE-02 — Workspace risk badge not refreshed after a transform ✅ Fixed
 - **Location:** `web-react/src/workspace/WorkspaceContext.tsx:123` (`applyResult`).

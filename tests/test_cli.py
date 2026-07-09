@@ -105,3 +105,17 @@ class TestCLI:
         _, stderr = proc.communicate(input="", timeout=60)
         assert proc.returncode == 0, stderr
         assert "EOFError" not in stderr
+
+    @pytest.mark.integration
+    def test_missing_input_counts_as_failure(self, sample_pdf, tmp_path):
+        # CLI-04: a not-found input used to be omitted from every counter
+        # (n_ok/n_skip/n_err), inconsistent with the invalid-magic case right
+        # below it -- invisible to the Summary line and (combined with
+        # CLI-01) to the exit code.
+        missing = str(tmp_path / "does_not_exist.pdf")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        result = self._run(sample_pdf, missing, "-o", str(out_dir), "--no-pause")
+        assert result.returncode == 1
+        assert "1 failed" in result.stdout

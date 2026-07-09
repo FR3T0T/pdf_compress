@@ -110,6 +110,15 @@
   to Fixed.
 
 ### Fixes
+- **Missing CLI inputs now count toward the failure tally and exit code
+  (CLI-04).** A non-existent input printed a `SKIP` line and moved on without
+  incrementing any counter, inconsistent with the invalid-magic case right
+  below it -- missing files never appeared in the `Summary:` line and
+  (combined with CLI-01) were invisible to the exit code. Now increments
+  `n_err`, same as the invalid-magic case. Verified: a batch with one valid
+  and one missing input now exits 1 and shows `Summary: 1 skipped, 1 failed`;
+  pre-fix it exited 0 with no summary line at all. Added
+  `tests/test_cli.py::TestCLI::test_missing_input_counts_as_failure`.
 - **CLI no longer crashes at exit on non-interactive stdin (CLI-03).** Without
   `--no-pause`, `main()` ended with a blocking `input("Press Enter…")` with no
   `isatty()` guard; piped/redirected/CI stdin raised `EOFError`. Post-CLI-01,
