@@ -110,6 +110,23 @@
   to Fixed.
 
 ### Fixes
+- **Transparency is no longer destroyed when a soft mask can't be decoded
+  (ENG-02).** Every image re-encode branch deleted `/SMask` whenever the
+  original had one, gated only on the mask *existing* — not on compositing
+  against it having actually succeeded. `_load_smask_image` decoded masks with
+  a raw-byte-length heuristic that (like ENG-01) failed on standard
+  FlateDecode/CCITT/LZW soft masks, so compositing silently skipped while
+  `/SMask` was deleted anyway — baking previously-transparent regions into an
+  opaque rectangle on re-encode (the common JPEG-base + FlateDecode-mask case).
+  The mask now decodes via `pikepdf.PdfImage(...).as_pil_image()` (same fix as
+  ENG-01), and all four deletion sites now gate on the composite having
+  actually happened (`mask_img is not None`) rather than the mask merely being
+  present — an undecodable mask now survives untouched (still valid against
+  the re-encoded base image regardless of dimension changes) instead of being
+  discarded. Added
+  `tests/test_engine.py::TestCompressImagesSmartSoftMask` (decodable mask
+  composites and is removed; undecodable mask is preserved; both fail
+  pre-fix).
 - **Compression now recompresses non-JPEG images instead of silently skipping
   them (ENG-01, ENG-05).** `compress_images_smart` decoded every image via
   `Image.open()` on the still-filter-encoded `read_raw_bytes()` output, which

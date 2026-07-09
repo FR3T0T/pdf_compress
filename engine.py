@@ -765,20 +765,20 @@ def _composite_with_mask(img: Image.Image, mask_img: Image.Image) -> Image.Image
 def _load_smask_image(smask_obj) -> Optional[Image.Image]:
     """Try to decode a soft-mask XObject into a PIL Image."""
     try:
-        raw = bytes(smask_obj.read_raw_bytes())
         w = int(smask_obj.get("/Width", 0))
         h = int(smask_obj.get("/Height", 0))
-        bpc = int(smask_obj.get("/BitsPerComponent", 8))
-
         if w <= 0 or h <= 0:
             return None
 
-        # Soft masks are single-channel (grayscale)
-        if bpc == 8 and len(raw) >= w * h:
-            return Image.frombytes("L", (w, h), raw[:w * h])
-
-        # Fallback: try PIL
-        return Image.open(io.BytesIO(raw)).convert("L")
+        # Decode via the PDF's own filter/colorspace (same fix as ENG-01) so
+        # Flate/CCITT/LZW-encoded soft masks decode too, not just formats PIL
+        # can open directly. The old raw-byte-length heuristic here could
+        # also misread still-encoded bytes as decoded pixels when their
+        # length happened to be >= w*h.
+        img = pikepdf.PdfImage(smask_obj).as_pil_image()
+        if img.mode != "L":
+            img = img.convert("L")
+        return img
     except Exception:
         return None
 
@@ -917,6 +917,7 @@ def compress_images_smart(
 
                 # ── Handle soft mask (transparency) ──────────────
                 smask_obj = xobj.get("/SMask")
+                mask_img = None
                 if smask_obj is not None:
                     mask_img = _load_smask_image(smask_obj)
                     if mask_img is not None:
@@ -967,7 +968,7 @@ def compress_images_smart(
                         xobj["/Width"]            = bw_w
                         xobj["/Height"]           = bw_h
 
-                        if smask_obj is not None and "/SMask" in xobj:
+                        if mask_img is not None and "/SMask" in xobj:
                             del xobj["/SMask"]
 
                         stats.images_recompressed += 1
@@ -998,7 +999,7 @@ def compress_images_smart(
                         xobj["/Width"]            = enc_w
                         xobj["/Height"]           = enc_h
 
-                        if smask_obj is not None and "/SMask" in xobj:
+                        if mask_img is not None and "/SMask" in xobj:
                             del xobj["/SMask"]
 
                         stats.images_recompressed += 1
@@ -1028,7 +1029,7 @@ def compress_images_smart(
                             xobj["/Width"]            = img.width
                             xobj["/Height"]           = img.height
 
-                            if smask_obj is not None and "/SMask" in xobj:
+                            if mask_img is not None and "/SMask" in xobj:
                                 del xobj["/SMask"]
 
                             stats.images_recompressed += 1
@@ -1061,7 +1062,7 @@ def compress_images_smart(
                         xobj["/Width"]            = img.width
                         xobj["/Height"]           = img.height
 
-                        if smask_obj is not None and "/SMask" in xobj:
+                        if mask_img is not None and "/SMask" in xobj:
                             del xobj["/SMask"]
 
                         stats.images_recompressed += 1
