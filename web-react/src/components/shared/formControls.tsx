@@ -34,7 +34,7 @@ export function Checkbox({
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
-        style={{ accentColor: 'var(--sev-info)' }}
+        style={{ accentColor: 'var(--accent)' }}
       />
       {label}
     </label>
@@ -114,7 +114,7 @@ export function Slider({
       max={max}
       step={step}
       onChange={(e: ChangeEvent<HTMLInputElement>) => onChange(Number(e.target.value))}
-      style={{ width: '100%', accentColor: 'var(--sev-info)' }}
+      style={{ width: '100%', accentColor: 'var(--accent)' }}
     />
   );
 }

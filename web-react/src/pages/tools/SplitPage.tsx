@@ -300,7 +300,7 @@ export function SplitPage() {
                           type="checkbox"
                           checked={selectedChapters.has(i)}
                           onChange={() => toggleChapter(i)}
-                          style={{ accentColor: 'var(--sev-info)', flexShrink: 0 }}
+                          style={{ accentColor: 'var(--accent)', flexShrink: 0 }}
                         />
                         <span
                           style={{
@@ -427,7 +427,7 @@ function Stat({ label, value, accent }: { label: string; value: string; accent?:
       <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
         {label}
       </div>
-      <div className="mono" style={{ fontWeight: 700, fontSize: 'var(--font-size-md)', color: accent ? 'var(--sev-info-text)' : 'var(--text-1)' }}>
+      <div className="mono" style={{ fontWeight: 700, fontSize: 'var(--font-size-md)', color: accent ? 'var(--accent-text)' : 'var(--text-1)' }}>
         {value}
       </div>
     </div>

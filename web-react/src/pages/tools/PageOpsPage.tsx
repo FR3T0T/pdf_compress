@@ -151,8 +151,8 @@ export function PageOpsPage() {
                 style={{
                   background: 'transparent',
                   border: 'none',
-                  borderBottom: `2px solid ${tab === t ? 'var(--sev-info)' : 'transparent'}`,
-                  color: tab === t ? 'var(--sev-info-text)' : 'var(--text-2)',
+                  borderBottom: `2px solid ${tab === t ? 'var(--accent)' : 'transparent'}`,
+                  color: tab === t ? 'var(--accent-text)' : 'var(--text-2)',
                   padding: '0 0 var(--space-2) 0',
                   marginRight: 'var(--space-4)',
                   fontSize: 'var(--font-size-sm)',

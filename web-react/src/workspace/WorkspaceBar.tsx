@@ -162,11 +162,39 @@ export function WorkspaceBar() {
           </>
         ) : (
           <>
-            <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-3)' }}>
-              No workspace document loaded — load one to carry it across tools.
+            {/* Tight two-part empty state — short primary + quiet hint — so
+                the bar reads as status + action, not one floaty sentence. */}
+            <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 8, minWidth: 0 }}>
+              <span style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600, color: 'var(--text-2)' }}>
+                No document loaded
+              </span>
+              <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-3)' }}>
+                Load one to use it across tools
+              </span>
             </span>
-            <button onClick={loadFile} disabled={workspace.busy} className="btn-ghost" style={{ marginLeft: 'auto' }}>
-              Load a file into workspace
+            {/* Quiet accent-tinted bar action (.btn-tint) instead of the old
+                lone bordered pill — the helper text to the left carries the
+                "workspace" explanation, so the label stays compact. */}
+            <button
+              onClick={loadFile}
+              disabled={workspace.busy}
+              className="btn-tint"
+              style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 6 }}
+            >
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 14 14"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={1.5}
+                strokeLinecap="round"
+                aria-hidden="true"
+              >
+                <line x1="7" y1="2" x2="7" y2="12" />
+                <line x1="2" y1="7" x2="12" y2="7" />
+              </svg>
+              Load document
             </button>
             <input
               ref={inputRef}

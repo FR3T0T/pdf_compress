@@ -31,7 +31,8 @@ export function Sidebar() {
   const { currentRoute, navigate } = useRouter();
   const [registry, setRegistry] = useState<ToolRegistry>(EMPTY_REGISTRY);
   const [collapsed, setCollapsed] = useState(true);
-  const [themeName, setThemeName] = useState<'light' | 'dark'>('dark');
+  // Light is the app default (matches :root in theme.css); dark is opt-in.
+  const [themeName, setThemeName] = useState<'light' | 'dark'>('light');
 
   useEffect(() => {
     bridgeApi.getToolRegistry().then(setRegistry);
@@ -44,7 +45,8 @@ export function Sidebar() {
       setCollapsed(raw !== 'false');
     });
     bridgeApi.loadSetting('theme').then((raw) => {
-      const name = raw === 'light' ? 'light' : 'dark';
+      // Anything but an explicit stored 'dark' resolves to the light default.
+      const name = raw === 'dark' ? 'dark' : 'light';
       document.documentElement.setAttribute('data-theme', name);
       setThemeName(name);
     });
@@ -96,18 +98,21 @@ export function Sidebar() {
           flex: '0 0 auto',
         }}
       >
+        {/* Placeholder mark (rebrand pending — don't invest in this):
+            a quiet accent-tinted chip instead of a heavy solid block. */}
         <div
           className="mono"
           style={{
-            width: 28,
-            height: 28,
+            width: 24,
+            height: 24,
             borderRadius: 'var(--radius-panel-sm)',
-            background: 'var(--sev-info)',
-            color: '#0c0d10',
+            background: 'rgba(var(--accent-rgb), 0.12)',
+            color: 'var(--accent-text)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            fontWeight: 800,
+            fontWeight: 700,
+            fontSize: 13,
             flex: '0 0 auto',
           }}
         >
@@ -213,9 +218,12 @@ function NavItem({
       title={collapsed ? label : undefined}
       style={{
         ...navButtonStyle,
-        background: active ? 'var(--panel-bg-elevated)' : 'transparent',
-        color: active ? 'var(--sev-info-text)' : 'var(--text-2)',
-        borderLeft: active ? '2px solid var(--sev-info)' : '2px solid transparent',
+        // Linear-style active state: subtle accent-tinted fill + accent
+        // text + a thin accent indicator (label contrast on the 0.10 tint
+        // is verified — see --accent-text in theme.css).
+        background: active ? 'rgba(var(--accent-rgb), 0.1)' : 'transparent',
+        color: active ? 'var(--accent-text)' : 'var(--text-2)',
+        borderLeft: active ? '2px solid var(--accent)' : '2px solid transparent',
       }}
     >
       <span style={{ display: 'flex', width: 20, justifyContent: 'center', flex: '0 0 auto' }}>

@@ -1,4 +1,58 @@
 # Changelog
+## Unreleased
+
+### Changed
+- **UI: warm cream light theme with terracotta accent and serif headings;
+  cool dark theme with blue accent; refined workspace bar and tool cards.**
+  The old near-black "security console" look is replaced across the token
+  system (`web-react/src/styles/theme.css`) with a precise, restrained
+  design: crisp 1px hairlines and whisper-soft shadows carry surface
+  separation, corners at 8/6/4px, spacing on a tight 4px rhythm
+  (`--space-4` 16px, `--space-5` 24px), and a single accent that marks
+  interaction only. **Light (default, `:root`)**: warm cream/ivory page
+  (`#f4f1ea`) with warm near-white panels (`#faf8f3`), warm-greige
+  hairlines, warm-tinted text, warm shadows, and a muted terracotta accent
+  (`--accent #a85433`, white label text). **Dark (opt-in,
+  `[data-theme='dark']`)**: kept cool — deep cool grey (`#0e0f12` page →
+  `#16181d` panels → `#1f222a` wells) with the indigo-blue accent
+  (`#5964d8`); the warm-light/cool-dark temperature split is deliberate.
+  **Typography**: major page headings (the `PageHeader`/Home titles) now
+  use an offline-safe serif display face (`--font-serif` Georgia, 22px,
+  normal weight, slight letter-spacing) over the system-sans UI text and
+  mono machine data. **Accent/severity distinctness** (documented in
+  theme.css): in light, terracotta and `--sev-high` are both warm, so they
+  separate by saturation/value (vivid bright `#d85a30` badge fill vs
+  deeper muted clay), hue of the text variants (red `#9c3414` vs brown
+  `#8a4d24`), and context (accent only on interactive elements, sev-high
+  only in red-tinted badges/stripes); in dark, indigo (~233°) stays
+  hue-separated from steel-blue `--sev-low` (~210°). Light severity
+  fills/text were re-deepened for the warm surfaces (`--sev-medium
+  #ad7415`, `--sev-low #3384d6`, `--sev-info #178a67`, high/medium text
+  darkened). Every color in both themes verified with a WCAG
+  relative-luminance calculator (94 checks: text ≥4.5:1, fills/borders/
+  focus ≥3:1, including 0.14 badge-tint and 0.10 accent-tint blends).
+  Element refinements: active nav items get an accent-tinted fill + thin
+  indicator; the sidebar "P" logo is a quiet accent-tinted placeholder
+  chip pending the rebrand; the workspace bar's empty state is a compact
+  "No document loaded" + quiet hint beside an accent-tinted "Load
+  document" button (was one long sentence and a lone bordered pill); tool
+  cards group title + description as one anchored block; the DropZone is
+  a precise empty state (32px icon chip, dashed border, accent-tinted
+  hover/drag-over). Accessibility retained: global accent
+  `:focus-visible` ring, `prefers-reduced-motion` guard (loading spinners
+  are exempted as essential status — under reduced motion they slow to a
+  gentle 1.6s rotation instead of freezing, since Windows maps its
+  "Animation effects off" setting — common, and forced in RDP sessions —
+  to `reduce`, where a frozen arc would read as a hung app), system font
+  stacks only (offline-safe). Also includes the carried-forward
+  structural work: light-as-default inversion end-to-end (Sidebar
+  boot/persistence read; the bridge's `applyTheme` no longer sets
+  `[data-theme]`, so Python's independently-persisted Ctrl+T theme can't
+  stomp the restored choice) and the `--accent*` token family decoupling
+  interaction color from `--sev-info` across primary buttons, checkboxes/
+  sliders, preset selection, tabs, and the progress fill. Frontend rebuilt
+  (`web-react/dist/`).
+
 ## v4.23
 
 ### Added

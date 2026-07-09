@@ -40,7 +40,7 @@ export function ProgressPanel({ pct, filename, current, total, onCancel }: Progr
           style={{
             height: '100%',
             width: `${clamped}%`,
-            background: 'var(--sev-info)',
+            background: 'var(--accent)',
             transition: 'width 150ms ease-out',
           }}
         />

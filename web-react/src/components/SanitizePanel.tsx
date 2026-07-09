@@ -76,7 +76,7 @@ export function SanitizePanel({ defaults, onPickOutput, onSanitize, busy, imageM
                 type="checkbox"
                 checked={options[key]}
                 onChange={() => toggle(key)}
-                style={{ accentColor: 'var(--sev-info)' }}
+                style={{ accentColor: 'var(--accent)' }}
               />
               {label}
             </label>
@@ -115,9 +115,9 @@ export function SanitizePanel({ defaults, onPickOutput, onSanitize, busy, imageM
           onClick={run}
           disabled={busy || !outputPath}
           style={{
-            background: 'var(--sev-info)',
-            border: '1px solid var(--sev-info)',
-            color: '#0c0d10',
+            background: 'var(--accent)',
+            border: '1px solid var(--accent)',
+            color: 'var(--on-accent)',
             fontWeight: 700,
             borderRadius: 'var(--radius-panel-sm)',
             padding: '7px 16px',
