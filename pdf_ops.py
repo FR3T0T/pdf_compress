@@ -302,6 +302,7 @@ def split_pdf(
     os.makedirs(output_dir, exist_ok=True)
     output_paths = []
     pages_per_output = []
+    seen_counts: dict[str, int] = {}
 
     for idx, (start, end) in enumerate(groups):
         if cancel and cancel.is_set():
@@ -314,6 +315,16 @@ def split_pdf(
             start=start, end=end, n=start,        # {start}/{end}/{n} all work
             title=title,
         ) + ".pdf"
+
+        # Disambiguate within-run name collisions (e.g. chapters mode with
+        # repeated/sanitized-to-the-same titles, or a template with no {n})
+        # rather than silently letting a later group overwrite an earlier
+        # one's output (OPS-04).
+        seen_counts[out_name] = seen_counts.get(out_name, 0) + 1
+        if seen_counts[out_name] > 1:
+            root, ext = os.path.splitext(out_name)
+            out_name = f"{root}_{seen_counts[out_name]}{ext}"
+
         out_path = contained_output_path(output_dir, out_name)
 
         dest = pikepdf.Pdf.new()
