@@ -7,9 +7,12 @@ interface Props {
   onPickOutput: () => Promise<string | null>;
   onSanitize: (outputPath: string, options: SanitizeOptions) => Promise<void>;
   busy: boolean;
+  /** Image mode: strip removes all EXIF/GPS metadata, so the per-item PDF
+   *  checkboxes don't apply — hide them and show image-appropriate copy. */
+  imageMode?: boolean;
 }
 
-export function SanitizePanel({ defaults, onPickOutput, onSanitize, busy }: Props) {
+export function SanitizePanel({ defaults, onPickOutput, onSanitize, busy, imageMode = false }: Props) {
   const [options, setOptions] = useState<SanitizeOptions>(defaults);
   const [outputPath, setOutputPath] = useState<string | null>(null);
   const [outputLabel, setOutputLabel] = useState('No output file selected');
@@ -34,7 +37,7 @@ export function SanitizePanel({ defaults, onPickOutput, onSanitize, busy }: Prop
   return (
     <div className="panel">
       <div style={{ fontWeight: 700, fontSize: 'var(--font-size-md)', marginBottom: 2 }}>
-        Sanitize
+        {imageMode ? 'Strip metadata' : 'Sanitize'}
       </div>
       <div
         style={{
@@ -43,40 +46,43 @@ export function SanitizePanel({ defaults, onPickOutput, onSanitize, busy }: Prop
           marginBottom: 'var(--space-3)',
         }}
       >
-        Write a cleaned copy with the selected items removed. Your original file is never
-        modified.
+        {imageMode
+          ? 'Remove all EXIF metadata (GPS location, camera details, thumbnail, authorship) and write a clean copy. Your original file is never modified.'
+          : 'Write a cleaned copy with the selected items removed. Your original file is never modified.'}
       </div>
 
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: '1fr 1fr',
-          gap: '2px var(--space-4)',
-        }}
-      >
-        {SANITIZE_FIELDS.map(([key, label]) => (
-          <label
-            key={key}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 10,
-              padding: '6px 0',
-              cursor: 'pointer',
-              fontSize: 'var(--font-size-sm)',
-              color: 'var(--text-1)',
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={options[key]}
-              onChange={() => toggle(key)}
-              style={{ accentColor: 'var(--sev-info)' }}
-            />
-            {label}
-          </label>
-        ))}
-      </div>
+      {!imageMode && (
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '1fr 1fr',
+            gap: '2px var(--space-4)',
+          }}
+        >
+          {SANITIZE_FIELDS.map(([key, label]) => (
+            <label
+              key={key}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                padding: '6px 0',
+                cursor: 'pointer',
+                fontSize: 'var(--font-size-sm)',
+                color: 'var(--text-1)',
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={options[key]}
+                onChange={() => toggle(key)}
+                style={{ accentColor: 'var(--sev-info)' }}
+              />
+              {label}
+            </label>
+          ))}
+        </div>
+      )}
 
       <div
         style={{
@@ -118,7 +124,9 @@ export function SanitizePanel({ defaults, onPickOutput, onSanitize, busy }: Prop
             fontSize: 'var(--font-size-sm)',
           }}
         >
-          {busy ? 'Sanitizing…' : 'Sanitize'}
+          {busy
+            ? (imageMode ? 'Cleaning…' : 'Sanitizing…')
+            : (imageMode ? 'Clean copy' : 'Sanitize')}
         </button>
       </div>
     </div>

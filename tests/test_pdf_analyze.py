@@ -22,6 +22,8 @@ from pdf_analyze import (
     analyze_file,
     analyze_image,
     sanitize_pdf,
+    strip_file,
+    strip_image_metadata,
 )
 
 try:
@@ -604,3 +606,100 @@ class TestEmbeddedImageExif:
         assert loc is not None
         assert loc["count"] == 1
         assert len(loc["items"]) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Strip image metadata (the "remove" half — Phase 3)
+# ═══════════════════════════════════════════════════════════════════
+#
+#  detect → remove completion: strip_image_metadata writes a clean copy of
+#  the same format, and re-scanning the OUTPUT must find nothing. Uses the
+#  Phase-1 `_gps_jpeg` builder (module-level, defined above).
+
+
+class TestStripImageMetadata:
+    def test_strip_gps_jpeg_output_rescans_clean(self, tmp_path):
+        src = _gps_jpeg(tmp_path / "geo.jpg")            # GPS + camera EXIF
+        assert _finding_ids(analyze_image(src))          # sanity: source is dirty
+        out = str(tmp_path / "geo_clean.jpg")
+
+        result = strip_image_metadata(src, out)
+        assert result["removed"].get("gps") == 1
+        assert result["total_removed"] >= 1
+        assert result["output"] == out
+
+        # The whole point: the output carries no metadata any more.
+        rescan = analyze_image(out)
+        assert rescan["findings"] == []
+        assert rescan["overallRisk"] == "info"
+
+    def test_output_is_valid_same_size_and_mode(self, tmp_path):
+        src = _gps_jpeg(tmp_path / "geo.jpg")
+        out = str(tmp_path / "clean.jpg")
+        strip_image_metadata(src, out)
+        with Image.open(src) as before, Image.open(out) as after:
+            assert after.format == "JPEG"
+            assert after.size == before.size
+            assert after.mode == before.mode
+
+    def test_strip_clean_jpeg_removes_nothing(self, tmp_path):
+        src = _gps_jpeg(tmp_path / "clean.jpg", with_gps=False, camera=False)
+        out = str(tmp_path / "clean_out.jpg")
+        result = strip_image_metadata(src, out)
+        assert result["total_removed"] == 0
+        assert result["removed"] == {}
+        with Image.open(out) as im:
+            assert im.size == (64, 48)      # still a valid image
+
+    def test_strip_png_removes_gps(self, tmp_path):
+        exif = Image.Exif()
+        exif[0x8825] = {1: "N", 2: (1.0, 2.0, 3.0), 3: "E", 4: (4.0, 5.0, 6.0)}
+        src = str(tmp_path / "geo.png")
+        Image.new("RGB", (30, 20), (5, 5, 5)).save(src, exif=exif)
+        assert "location.gps" in _finding_ids(analyze_image(src))
+        out = str(tmp_path / "geo_clean.png")
+
+        result = strip_image_metadata(src, out)
+        assert result["removed"].get("gps") == 1
+        assert analyze_image(out)["findings"] == []
+        with Image.open(out) as im:
+            assert im.format == "PNG"
+            assert im.size == (30, 20)
+
+    def test_rejects_non_image(self, tmp_path):
+        bad = str(tmp_path / "note.txt")
+        with open(bad, "wb") as fh:
+            fh.write(b"not an image at all")
+        with pytest.raises(ValueError):
+            strip_image_metadata(bad, str(tmp_path / "out.jpg"))
+
+
+class TestStripFileDispatch:
+    def test_image_routes_to_strip(self, tmp_path):
+        src = _gps_jpeg(tmp_path / "g.jpg")
+        out = str(tmp_path / "g_clean.jpg")
+        result = strip_file(src, out)
+        assert result["removed"].get("gps") == 1
+        assert analyze_image(out)["findings"] == []
+
+    def test_pdf_routes_to_sanitize_with_options(self, tmp_path):
+        # A JS /OpenAction is removed by sanitize_pdf; strip_file must route a
+        # PDF there AND pass the options through (same removed report).
+        pdf = pikepdf.Pdf.new()
+        _blank_page(pdf)
+        pdf.Root.OpenAction = _js_action()
+        src = str(tmp_path / "js.pdf")
+        pdf.save(src)
+        pdf.close()
+
+        via_strip = strip_file(src, str(tmp_path / "a.pdf"), {"javascript": True})
+        via_direct = sanitize_pdf(src, str(tmp_path / "b.pdf"), {"javascript": True})
+        assert via_strip["removed"] == via_direct["removed"]
+        assert via_strip["removed"].get("open_action") == 1
+
+    def test_unsupported_type_raises(self, tmp_path):
+        bad = str(tmp_path / "note.txt")
+        with open(bad, "wb") as fh:
+            fh.write(b"plain text, unsupported")
+        with pytest.raises(ValueError):
+            strip_file(bad, str(tmp_path / "out"))

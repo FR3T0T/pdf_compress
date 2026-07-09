@@ -32,6 +32,7 @@ import io
 import logging
 import os
 import re
+import tempfile
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
@@ -1420,7 +1421,6 @@ def sanitize_pdf(input_path: str, output_path: str,
                 pass
 
         # Atomic write
-        import tempfile
         out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
         fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=out_dir)
         os.close(fd)
@@ -1439,6 +1439,119 @@ def sanitize_pdf(input_path: str, output_path: str,
         "output": output_path,
         "output_size": os.path.getsize(output_path),
     }
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Public API — strip image metadata (the "remove" half of the image tool)
+# ════════════════════════════════════════════════════════════════════
+#
+#  Mirrors sanitize_pdf: detect what sensitive metadata is present (reusing
+#  the Phase-1 scanners so the "removed" report matches what analyze_image
+#  would flag), then write a metadata-free copy of the SAME format,
+#  atomically. JPEGs are re-saved losslessly (quality="keep" preserves the
+#  original DCT coefficients — no recompression artifacts) while dropping the
+#  EXIF/GPS/thumbnail blocks; other formats are rebuilt from a copy with a
+#  cleared info dict. Verified empirically: re-scanning the output yields no
+#  findings.
+
+# Finding id (from the Phase-1 image scanners) -> removed[] category key.
+_IMAGE_STRIP_CATEGORIES = {
+    "location.gps": "gps",
+    "metadata.camera": "camera",
+    "content.thumbnail": "thumbnail",
+    "metadata.authorship": "authorship",
+}
+
+
+def _detect_image_metadata(tags: dict, gps: dict, ifd1: dict) -> dict:
+    """Run the Phase-1 image scanners against resolved EXIF blocks and report
+    which sensitive categories are present, as ``{category: 1}``. Reuses the
+    exact detection logic so ``removed`` matches ``analyze_image``'s findings."""
+    probe = AnalysisResult()
+    _scan_image_gps(gps, probe)
+    _scan_image_camera(tags, probe)
+    _scan_image_thumbnail(ifd1, probe)
+    _scan_image_authorship(tags, probe)
+    removed: dict[str, int] = {}
+    for f in probe.findings:
+        key = _IMAGE_STRIP_CATEGORIES.get(f.id)
+        if key:
+            removed[key] = 1
+    return removed
+
+
+def strip_image_metadata(input_path: str, output_path: str) -> dict:
+    """Remove privacy metadata (EXIF/GPS/thumbnail/authorship) from a JPEG or
+    PNG and write a clean copy of the same format.
+
+    Returns a dict describing what was removed (same shape as
+    :func:`sanitize_pdf`). Writes atomically (temp file + ``os.replace``).
+    """
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(input_path)
+
+    size = os.path.getsize(input_path)
+    if size > MAX_FILE_SIZE:
+        raise ValueError(f"File too large: {_fmt_size(size)} (max 2 GB)")
+
+    with open(input_path, "rb") as fh:
+        head = fh.read(8)
+    if not (head.startswith(_JPEG_MAGIC) or head.startswith(_PNG_MAGIC)):
+        raise ValueError("Not a supported image (expected JPEG or PNG)")
+
+    from PIL import Image
+
+    out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    with Image.open(input_path) as img:
+        fmt = (img.format or "").upper()
+        tags, gps, ifd1 = _read_exif_blocks(img)
+        removed = _detect_image_metadata(tags, gps, ifd1)
+
+        suffix = ".jpg" if fmt in ("JPEG", "MPO") else ".png" if fmt == "PNG" else ".img"
+        tmp_fd, tmp = tempfile.mkstemp(suffix=suffix, dir=out_dir)
+        os.close(tmp_fd)
+        try:
+            if fmt in ("JPEG", "MPO"):
+                # Lossless re-encode (keeps DCT coefficients); no exif= arg, so
+                # every metadata block is dropped.
+                img.save(tmp, format="JPEG", quality="keep")
+            else:
+                # PNG (and any other supported raster): rebuild from a copy with
+                # a cleared info dict so no ancillary chunks / exif ride along.
+                clean = img.copy()
+                clean.info = {}
+                clean.save(tmp, format="PNG")
+            os.replace(tmp, output_path)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    return {
+        "removed": removed,
+        "total_removed": sum(removed.values()),
+        "output": output_path,
+        "output_size": os.path.getsize(output_path),
+    }
+
+
+def strip_file(input_path: str, output_path: str,
+               options: Optional[dict] = None) -> dict:
+    """Sniff the file type and route to the right cleaner.
+
+    ``%PDF-`` → :func:`sanitize_pdf` (honouring ``options``); JPEG/PNG →
+    :func:`strip_image_metadata`. Mirrors :func:`analyze_file`. Raises
+    ValueError for anything else.
+    """
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(input_path)
+    with open(input_path, "rb") as fh:
+        head = fh.read(8)
+    if head.startswith(b"%PDF-"):
+        return sanitize_pdf(input_path, output_path, options)
+    if head.startswith(_JPEG_MAGIC) or head.startswith(_PNG_MAGIC):
+        return strip_image_metadata(input_path, output_path)
+    raise ValueError("Unsupported file type (expected PDF, JPEG, or PNG)")
 
 
 # ════════════════════════════════════════════════════════════════════
