@@ -20,7 +20,7 @@ pip install pikepdf pillow PySide6 PyMuPDF argon2-cffi pycryptodome cryptography
 
 **Optional dependencies:**
 - [Ghostscript](https://www.ghostscript.com/releases/gsdnld.html) — font subsetting (auto-detected if on PATH)
-- **Offline translation** (Translate tool) — `pip install argostranslate pytesseract langdetect`, the [Tesseract](https://github.com/tesseract-ocr/tesseract) binary, then `python setup_translation.py --install all` to download the language models. This download is the only step that uses the network; translation itself is fully offline.
+- **Offline translation** (Translate tool) — provisioned on demand: open the Translate tool, pick your languages, and it downloads what it needs once (in the packaged app that includes the ML runtime itself, ~204 MB — pinned wheels verified against `translate_runtime_lock.json`); afterwards translation is fully offline. From a source checkout you can also do it manually: `pip install argostranslate pytesseract`, the [Tesseract](https://github.com/tesseract-ocr/tesseract) binary (needed for OCR of images/scans either way), then `python setup_translation.py --install all`. These explicit setup downloads are the only network use in the entire toolkit.
 - [NumPy](https://numpy.org/) — improves photo vs diagram detection accuracy (`pip install numpy`)
 - [python-docx](https://python-docx.readthedocs.io/) — PDF to Word conversion (`pip install python-docx`)
 
@@ -249,7 +249,9 @@ Text and vector graphics are never modified.
 | `epdf_crypto.py` | Enhanced encryption engine (.epdf format — ChaCha20, AES-256, Camellia; header-authenticated v2) |
 | `pdf_analyze.py` | Offline privacy/security audit + sanitizer engine |
 | `pdf_translate.py` | Offline translation + OCR engine (Argos + Tesseract) |
-| `setup_translation.py` | One-time provisioning of offline translation/OCR models |
+| `translate_runtime.py` | On-demand provisioning of the translation ML runtime (frozen builds exclude torch & friends; this downloads pinned wheels into a user dir once) |
+| `translate_runtime_lock.json` | Pinned wheel manifest for that runtime (regenerate: `python translate_runtime.py --make-lockfile`) |
+| `setup_translation.py` | CLI provisioning of offline translation/OCR models (source checkouts) |
 | `compress_pdf.py` | Command-line interface for compression |
 | `compress_pdf.bat` | Windows launcher (no console window) |
 | `ui/` | GUI package — web shell, bridge, theme |

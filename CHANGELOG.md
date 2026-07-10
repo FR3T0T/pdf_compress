@@ -2,6 +2,52 @@
 ## Unreleased
 
 ### Changed
+- **Frozen build: translation is now provisioned on demand instead of
+  bundled — fixes the native PyTorch crash and shrinks the installer from
+  1.26 GB to ~670 MB.** The packaged app crashed with a native c10 abort
+  (inside `torch_python.dll`, no Python traceback) the first time Translate
+  was used: `argostranslate.translate` unconditionally imports
+  `stanza` → `torch` at import time, and frozen PyTorch does not survive
+  PyInstaller's DLL relayout on this stack (Python 3.14 + PyInstaller 6.21;
+  a chronic upstream failure class). Rather than fighting frozen-torch,
+  `pdf_toolkit.spec` now **excludes the entire ML stack** (torch, spacy,
+  thinc, stanza, ctranslate2, onnxruntime, sentencepiece, sacremoses,
+  argostranslate, minisbd — ~1 GB for one tool of 22) and the new
+  `translate_runtime.py` provisions it at runtime: on first use the
+  Translate tool offers a one-time, user-initiated download (~204 MB, 64
+  wheels pinned by name/version/URL/sha256 in the new
+  `translate_runtime_lock.json`; regenerate with
+  `python translate_runtime.py --make-lockfile`), verifies checksums,
+  unpacks into `%LOCALAPPDATA%/PDFToolkit/translate-runtime`, and appends
+  it to `sys.path` — torch then imports from a real directory layout
+  exactly like a source checkout, sidestepping the frozen-DLL problem
+  entirely. The Translate page gained a setup flow (language multi-select
+  for the 12 supported languages, engine-size notice, live progress with
+  cancel, and an "Add languages…" path once ready) backed by a new
+  `startSetupTranslation` bridge slot; `pdf_translate.install_languages()`
+  is the single language-pack installer shared by the UI and
+  `setup_translation.py` (now a thin CLI wrapper around it).
+  `translation_status()` now reports the runtime state so the UI can drive
+  setup. Source checkouts with argostranslate in the venv are unaffected
+  (the runtime activates only when the stack isn't natively importable),
+  and the offline invariant holds: the explicit setup download is the only
+  network operation, and after it translation runs fully offline (Argos
+  language packs live in Argos's own per-user dir, as before). Because the
+  ML stack is invisible to PyInstaller's analysis, the bundle now ships the
+  **complete Python stdlib** (all top-level modules plus
+  `collect_submodules` for every stdlib package, minus POSIX-only/GUI
+  corners; `unittest` is no longer excluded) — runtime-provisioned wheels
+  import stdlib modules the analyzed app graph never references, and the
+  first builds broke exactly that way (torch → `timeit`, requests →
+  `http.cookies`); costs ~3 MB. `pdf_translate`'s not-provisioned error now
+  carries the underlying exception so real environment failures can't hide
+  behind the generic "not set up" message. Added
+  Qt-free `tests/test_translate_runtime.py` (lockfile schema/pins,
+  download+verify+unpack+activate over `file://` synthetic wheels,
+  checksum/zip-slip/cancel failure paths, lock-change invalidation).
+  Verified end-to-end on the rebuilt frozen exe: all tools load, the setup
+  flow provisions the runtime + German pack in-app, and translation works
+  offline afterwards.
 - **UI: warm cream light theme with terracotta accent and serif headings;
   cool dark theme with blue accent; refined workspace bar and tool cards.**
   The old near-black "security console" look is replaced across the token

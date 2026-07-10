@@ -26,7 +26,7 @@ from __future__ import annotations
 import sys
 
 try:
-    from pdf_translate import LANG_BY_CODE, SUPPORTED_LANGUAGES, translation_status
+    from pdf_translate import SUPPORTED_LANGUAGES, translation_status
 except Exception as exc:  # pragma: no cover
     print(f"Could not import pdf_translate: {exc}")
     sys.exit(1)
@@ -72,70 +72,32 @@ def _print_list() -> None:
 
 
 def _install(codes: list[str]) -> int:
+    # Single implementation shared with the app's in-app setup flow — this
+    # CLI is now a thin wrapper around pdf_translate.install_languages().
+    from pdf_translate import ModelMissingError, TranslationError, install_languages
+
+    def _progress(i: int, total: int, label: str) -> None:
+        print(f"  [{i}/{total}] {label}", flush=True)
+
     try:
-        import argostranslate.package as package
-    except Exception:
-        print("argostranslate is not installed. Run:\n    pip install argostranslate")
+        res = install_languages(codes, progress=_progress)
+    except ModelMissingError as exc:
+        print(exc)
         return 1
-
-    # Expand 'all'
-    if "all" in codes:
-        codes = [l.code for l in SUPPORTED_LANGUAGES]
-
-    # Validate
-    unknown = [c for c in codes if c not in LANG_BY_CODE]
-    if unknown:
-        print(f"Unknown language code(s): {', '.join(unknown)}")
+    except TranslationError as exc:
+        print(exc)
         print("Run  python setup_translation.py --list  to see valid codes.")
         return 1
 
-    # Build the set of en<->X pairs needed (skip English itself).
-    pairs: set[tuple[str, str]] = set()
-    for c in codes:
-        argos = LANG_BY_CODE[c].argos
-        if argos == "en":
-            continue
-        pairs.add(("en", argos))
-        pairs.add((argos, "en"))
-
-    if not pairs:
+    if res["requested"] == 0:
         print("Nothing to install (English needs no translation model).")
         return 0
 
-    print("Updating Argos package index (network)…")
-    try:
-        package.update_package_index()
-        available = package.get_available_packages()
-    except Exception as exc:
-        print(f"Could not reach the Argos package index: {exc}")
-        return 1
-
-    ok, failed = 0, 0
-    for from_code, to_code in sorted(pairs):
-        match = next((p for p in available
-                      if p.from_code == from_code and p.to_code == to_code), None)
-        if match is None:
-            print(f"  [skip] no package published for {from_code}->{to_code}")
-            failed += 1
-            continue
-        try:
-            print(f"  [get ] {from_code}->{to_code} …", end=" ", flush=True)
-            path = match.download()
-            try:
-                match.install()             # newer Argos
-            except Exception:
-                package.install_from_path(path)  # older Argos
-            print("installed")
-            ok += 1
-        except Exception as exc:
-            print(f"failed ({exc})")
-            failed += 1
-
-    print(f"\nDone. {ok} package(s) installed, {failed} skipped/failed.")
+    print(f"\nDone. {res['installed']} package(s) installed, {res['skipped']} skipped/failed.")
     print("Translation now runs fully offline. For reading text from images, "
           "make sure the matching Tesseract OCR packs are installed "
           "(python setup_translation.py --list).")
-    return 0 if ok else 1
+    return 0 if res["installed"] else 1
 
 
 def main(argv: list[str]) -> int:

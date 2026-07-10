@@ -3,7 +3,7 @@ import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
 import { ProgressPanel } from '../../components/shared/ProgressPanel';
-import { Select, TextInput } from '../../components/shared/formControls';
+import { Checkbox, Select, TextInput } from '../../components/shared/formControls';
 import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
 import { bridgeApi } from '../../bridge/bridgeApi';
@@ -19,11 +19,26 @@ interface Language {
   translateTo?: boolean;
   translateFrom?: boolean;
 }
+interface RuntimeStatus {
+  needed: boolean;
+  installed: boolean;
+  downloadSizeMB: number;
+  dir: string;
+}
 interface TranslationStatus {
   argosAvailable: boolean;
   ocrAvailable: boolean;
   argosPairs: string[];
   languages: Language[];
+  // Frozen builds provision the ML stack on demand — see translate_runtime.py.
+  runtime?: RuntimeStatus;
+}
+interface SetupResult {
+  runtimeInstalled?: boolean;
+  installed?: number;
+  skipped?: number;
+  requested?: number;
+  status?: TranslationStatus;
 }
 interface ImageTranslateResult {
   sourceText?: string;
@@ -120,6 +135,14 @@ export function TranslatePage() {
   // keeps that cost off the UI thread, same pattern as the translate
   // actions themselves.
   const statusOp = useOperation<TranslationStatus>('translationStatus');
+  // One-time translation setup (startSetupTranslation): frozen builds
+  // download the pinned ML runtime first, then the chosen Argos language
+  // packs; source checkouts skip straight to the packs. The worker's done
+  // payload carries a fresh translation_status(), so no second status
+  // round-trip is needed after setup.
+  const setupOp = useOperation<SetupResult>('translateSetup');
+  const [setupCodes, setSetupCodes] = useState<string[]>([]);
+  const [setupOpen, setSetupOpen] = useState(false);
 
   // -- Workspace (persistent working document) -----------------------------
   // See WatermarkPage.tsx for the reference pattern this mirrors. A
@@ -148,6 +171,25 @@ export function TranslatePage() {
       toast.error(statusOp.error || 'Could not check translation setup.');
     }
   }, [statusOp.status, statusOp.result, statusOp.error, toast]);
+
+  useEffect(() => {
+    if (setupOp.status === 'done' && setupOp.result?.results) {
+      const res = setupOp.result.results;
+      if (res.status) setStatus(res.status);
+      const n = res.installed ?? 0;
+      toast.success(
+        res.runtimeInstalled
+          ? `Translation engine installed · ${n} language pack(s) added.`
+          : `${n} language pack(s) added.`
+      );
+      if ((res.skipped ?? 0) > 0) toast.info(`${res.skipped} pack(s) could not be installed.`);
+      setSetupCodes([]);
+      setSetupOpen(false);
+    } else if (setupOp.status === 'error') {
+      toast.error(setupOp.error || 'Translation setup failed.');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setupOp.status]);
 
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
@@ -300,6 +342,16 @@ export function TranslatePage() {
 
   const running = op.status === 'running';
   const ready = !!status?.argosAvailable && (status?.argosPairs.length ?? 0) > 0;
+  const runtime = status?.runtime;
+  const needsEngine = !!runtime?.needed && !runtime.installed;
+  const setupRunning = setupOp.status === 'running';
+  const missingLangs = (status?.languages ?? []).filter(
+    (l) => l.code !== 'en' && !(l.translateTo && l.translateFrom)
+  );
+  const toggleSetupCode = (code: string, on: boolean) =>
+    setSetupCodes((cur) => (on ? [...cur, code] : cur.filter((c) => c !== code)));
+  const runSetup = () =>
+    setupOp.run(() => bridgeApi.startSetupTranslation({ toolKey: 'translateSetup', codes: setupCodes }));
   const r = op.status === 'done' ? op.result?.results : null;
   const pdfResult = r && lastMode === 'pdf' ? (r as PdfTranslateResult) : null;
   const imageResult = r && lastMode === 'image' ? (r as ImageTranslateResult) : null;
@@ -341,19 +393,94 @@ export function TranslatePage() {
             }}
           >
             {ready ? (
-              <>
-                Offline translation ready · {status.languages.filter((l) => l.translateTo).length} language(s)
-                installed
-                {status.ocrAvailable ? ' · OCR available' : ' · OCR not installed'}
-              </>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
+                <span style={{ flex: 1 }}>
+                  Offline translation ready · {status.languages.filter((l) => l.translateTo).length} language(s)
+                  installed
+                  {status.ocrAvailable ? ' · OCR available' : ' · OCR not installed'}
+                </span>
+                {missingLangs.length > 0 && !setupOpen && (
+                  <button className="btn-ghost" onClick={() => setSetupOpen(true)} disabled={setupRunning}>
+                    Add languages…
+                  </button>
+                )}
+              </div>
             ) : (
               <>
-                Translation models are not installed yet. Run{' '}
-                <code className="mono">python setup_translation.py --install all</code> once (the only online step),
-                then translation works fully offline.
+                Translation isn't set up on this machine yet — pick the languages you need below. It's a
+                one-time download; afterwards translation runs fully offline.
               </>
             )}
           </div>
+
+          {(!ready || setupOpen) && (
+            <Card style={{ marginBottom: 'var(--space-3)' }}>
+              <div style={{ fontWeight: 700, fontSize: 'var(--font-size-md)', marginBottom: 6 }}>
+                Set up offline translation
+              </div>
+              <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)', marginBottom: 'var(--space-3)' }}>
+                Each language installs the English ↔ language model pair (other combinations pivot through
+                English automatically).
+                {needsEngine
+                  ? ` The first setup also downloads the translation engine (~${runtime?.downloadSizeMB ?? 0} MB).`
+                  : ''}
+              </div>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
+                  gap: 2,
+                  marginBottom: 'var(--space-3)',
+                }}
+              >
+                {(status.languages ?? [])
+                  .filter((l) => l.code !== 'en')
+                  .map((l) =>
+                    l.translateTo && l.translateFrom ? (
+                      <div
+                        key={l.code}
+                        style={{ padding: '6px 0', fontSize: 'var(--font-size-sm)', color: 'var(--text-3)' }}
+                      >
+                        ✓ {l.name} — installed
+                      </div>
+                    ) : (
+                      <Checkbox
+                        key={l.code}
+                        checked={setupCodes.includes(l.code)}
+                        onChange={(on) => toggleSetupCode(l.code, on)}
+                        label={`${l.name}${l.native && l.native !== l.name ? ` (${l.native})` : ''}`}
+                      />
+                    )
+                  )}
+              </div>
+              <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                <button
+                  className="btn-primary"
+                  onClick={runSetup}
+                  disabled={setupRunning || setupCodes.length === 0}
+                >
+                  {setupRunning ? 'Setting up…' : 'Download & set up'}
+                </button>
+                {ready && setupOpen && (
+                  <button className="btn-ghost" onClick={() => setSetupOpen(false)} disabled={setupRunning}>
+                    Close
+                  </button>
+                )}
+              </div>
+            </Card>
+          )}
+
+          {setupRunning && (
+            <div style={{ marginBottom: 'var(--space-3)' }}>
+              <ProgressPanel
+                pct={setupOp.progress?.pct ?? 0}
+                current={setupOp.progress?.current}
+                total={setupOp.progress?.total}
+                filename={setupOp.progress?.filename}
+                onCancel={setupOp.cancel}
+              />
+            </div>
+          )}
 
       <Card>
         <div style={{ display: 'flex', gap: 'var(--space-4)', flexWrap: 'wrap', alignItems: 'flex-end' }}>

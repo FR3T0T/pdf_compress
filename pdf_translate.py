@@ -29,6 +29,8 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+import translate_runtime
+
 log = logging.getLogger(__name__)
 
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB, matches the rest of the toolkit
@@ -100,15 +102,27 @@ def supported_languages() -> list[dict]:
 # ════════════════════════════════════════════════════════════════════
 
 def _argos():
+    # In a frozen build the ML stack is deliberately NOT bundled (frozen
+    # PyTorch aborts natively; see translate_runtime's module docstring) —
+    # activate() makes a runtime provisioned by the in-app setup flow
+    # importable first. No-op in a source checkout with argos installed.
+    translate_runtime.activate()
     try:
         import argostranslate.package as p
         import argostranslate.translate as t
         return t, p
-    except Exception as exc:  # not installed
+    except Exception as exc:  # not installed (or the stack failed to load)
+        # Surface the underlying cause: a genuine not-installed reads as
+        # "No module named 'argostranslate'", while an environment problem
+        # (e.g. a missing module in a frozen build) would otherwise hide
+        # behind this generic message and be undebuggable from the toast.
         raise ModelMissingError(
-            "Offline translation isn't provisioned yet. Install it with:\n"
+            "Offline translation isn't set up yet. Use the Translate tool's "
+            "one-time setup (downloads the translation engine and your "
+            "chosen languages), or in a source checkout:\n"
             "    pip install argostranslate\n"
-            "then run:  python setup_translation.py --install all"
+            "    python setup_translation.py --install all\n"
+            f"({exc.__class__.__name__}: {exc})"
         ) from exc
 
 
@@ -168,6 +182,7 @@ def translation_status() -> dict:
             "translateFrom": from_ok,         # can translate FROM this language
         })
 
+    translate_runtime.activate()
     try:
         import argostranslate  # noqa: F401
         argos_available = True
@@ -180,7 +195,80 @@ def translation_status() -> dict:
         "ocrLangs": sorted(ocr),
         "argosPairs": [f"{a}->{b}" for a, b in sorted(pairs)],
         "languages": langs,
+        # Drives the in-app setup flow (frozen builds provision the ML
+        # stack on demand — see translate_runtime).
+        "runtime": translate_runtime.runtime_status(),
     }
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Language pack installation (network — explicit, user-initiated only)
+# ════════════════════════════════════════════════════════════════════
+
+def install_languages(codes: list[str],
+                      progress: Optional[Callable[[int, int, str], None]] = None,
+                      should_cancel: Optional[Callable[[], bool]] = None) -> dict:
+    """Download + install the Argos en<->X packages for ``codes``.
+
+    THE sanctioned in-app network operation (with translate_runtime's
+    wheel download): runs only when the user explicitly starts translation
+    setup from the Translate tool, or via setup_translation.py's CLI.
+    Argos stores the packages in its own per-user data dir, so they
+    survive app upgrades and work offline afterwards.
+
+    Returns {"installed": n, "skipped": n, "requested": n}.
+    """
+    _t, package = _argos()
+
+    if "all" in codes:
+        codes = [lang.code for lang in SUPPORTED_LANGUAGES]
+    unknown = [c for c in codes if c not in LANG_BY_CODE]
+    if unknown:
+        raise TranslationError(f"Unknown language code(s): {', '.join(unknown)}")
+
+    pairs: set[tuple[str, str]] = set()
+    for c in codes:
+        argos = LANG_BY_CODE[c].argos
+        if argos == "en":
+            continue
+        pairs.add(("en", argos))
+        pairs.add((argos, "en"))
+    if not pairs:
+        return {"installed": 0, "skipped": 0, "requested": 0}
+
+    try:
+        package.update_package_index()
+        available = package.get_available_packages()
+    except Exception as exc:
+        raise TranslationError(
+            f"Could not reach the Argos package index: {exc}") from exc
+
+    ordered = sorted(pairs)
+    ok, skipped = 0, 0
+    for i, (from_code, to_code) in enumerate(ordered):
+        if should_cancel and should_cancel():
+            raise InterruptedError("Cancelled")
+        if progress:
+            progress(i, len(ordered), f"Downloading {from_code}→{to_code}")
+        match = next((p for p in available
+                      if p.from_code == from_code and p.to_code == to_code), None)
+        if match is None:
+            log.warning("no Argos package published for %s->%s", from_code, to_code)
+            skipped += 1
+            continue
+        try:
+            path = match.download()
+            try:
+                match.install()                      # newer Argos
+            except Exception:
+                package.install_from_path(path)      # older Argos
+            ok += 1
+        except Exception as exc:
+            log.warning("installing %s->%s failed: %s", from_code, to_code, exc)
+            skipped += 1
+    if progress:
+        progress(len(ordered), len(ordered), "Language packs installed")
+    return {"installed": ok, "skipped": skipped, "requested": len(ordered)}
 
 
 # ════════════════════════════════════════════════════════════════════

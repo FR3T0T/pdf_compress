@@ -23,6 +23,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QSettings, QThread, Signal, Slot
 from PySide6.QtWidgets import QFileDialog
 
+import translate_runtime
 from compress_paths import compress_output_path
 from engine import (
     PRESET_ORDER,
@@ -78,6 +79,7 @@ from pdf_ops import (
 )
 from pdf_translate import (
     TranslationError,
+    install_languages,
     supported_languages,
     translate_image,
     translate_pdf,
@@ -661,6 +663,46 @@ class Bridge(QObject):
             st = translation_status()
             st["success"] = True
             return st
+
+        self._run_in_thread(tool_key, _work)
+
+    @Slot(str)
+    def startSetupTranslation(self, json_params: str = "{}"):
+        """One-time, user-initiated translation setup (network).
+
+        Two sequential phases behind one progress stream (toolKey
+        "translateSetup"): (1) in a frozen build without the provisioned
+        runtime, download/verify/unpack the pinned ML wheels via
+        translate_runtime.install_runtime(); (2) download the Argos en<->X
+        language packages for params.codes via install_languages(). Source
+        checkouts with argos in the venv skip phase 1 automatically, so
+        this slot also serves as the in-app "add languages" path there.
+        Cancellable via cancelOperation("translateSetup"). This and the
+        Argos package fetch are the ONLY sanctioned network operations in
+        the app — both run solely from this explicit user action (the web
+        view itself stays fully sandboxed by net_guard).
+        """
+        p = _normalize_params(json.loads(json_params)) if json_params else {}
+        tool_key = p.get("toolKey", "translateSetup")
+        codes = p.get("codes") or []
+        cancel = self._make_cancel_event(tool_key)
+
+        def _progress(current: int, total: int, label: str = ""):
+            self.progressUpdate.emit(
+                _progress_payload(tool_key, current, total, label))
+
+        def _work():
+            result = {"runtimeInstalled": False}
+            rt = translate_runtime.runtime_status()
+            if rt["needed"] and not rt["installed"]:
+                translate_runtime.install_runtime(
+                    progress=_progress, should_cancel=cancel.is_set)
+                result["runtimeInstalled"] = True
+            if codes:
+                result.update(install_languages(
+                    codes, progress=_progress, should_cancel=cancel.is_set))
+            result["status"] = translation_status()
+            return result
 
         self._run_in_thread(tool_key, _work)
 
