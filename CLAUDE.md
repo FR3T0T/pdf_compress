@@ -72,10 +72,23 @@ alone. If a change makes a doc wrong, fixing the doc is part of that change.
   `compress_paths.py`) and import it there from tests — never reach through
   `ui.bridge`. (This already broke Linux CI once.)
 
-- **Offline is a hard invariant.** The app must never make a network request.
-  `ui/net_guard.py` blocks every non-local request and the CSP sets
-  `connect-src 'none'`. Don't add anything that phones home. (The one explicit,
-  user-run online step is `setup_translation.py`, which is separate from the app.)
+- **Offline is a hard invariant.** The app must never make a network request
+  on its own. `ui/net_guard.py` blocks every non-local web-view request and
+  the CSP sets `connect-src 'none'`. Don't add anything that phones home.
+  The ONLY sanctioned network use is explicit, user-initiated translation
+  setup: the in-app flow (`translate_runtime.install_runtime` +
+  `pdf_translate.install_languages`, behind a button in the Translate tool)
+  and the `setup_translation.py` CLI. Nothing else may touch the network.
+
+- **The frozen build must not bundle the translation ML stack.**
+  torch/spacy/stanza/ctranslate2/… are excluded in `pdf_toolkit.spec` — a
+  frozen torch aborts natively at import (c10 abort, no traceback) and the
+  stack is ~1 GB for one tool. `translate_runtime.py` provisions it at
+  runtime from `translate_runtime_lock.json` (pinned wheels, user-writable
+  dir). If you bump translation dependency versions, regenerate the lock
+  (`python translate_runtime.py --make-lockfile`, needs network + the target
+  Python) and re-test the frozen build. `pdf_translate.py` must keep all ML
+  imports lazy for the same reason.
 
 - **The frontend build is committed.** `web-react/dist/` is checked in so end
   users need no Node. If you change `web-react/src/`, rebuild

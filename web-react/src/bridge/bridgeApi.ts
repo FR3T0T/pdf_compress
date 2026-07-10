@@ -94,6 +94,7 @@ const TOOL_KEYS = {
   nup: 'nup',
   translatePdf: 'translate',
   translationStatus: 'translationStatus',
+  translateSetup: 'translateSetup',
 } as const;
 
 /**
@@ -309,6 +310,22 @@ export const bridgeApi = {
           { code: 'de', name: 'German', native: 'Deutsch', ocr: false, translateTo: false, translateFrom: false },
           { code: 'zh', name: 'Mandarin Chinese', native: '中文', ocr: false, translateTo: false, translateFrom: false },
         ],
+      }));
+    }
+  },
+
+  // One-time, user-initiated translation setup (the app's only network
+  // operation): in the frozen build this downloads the pinned ML runtime
+  // first, then the chosen Argos language packs; from source it skips
+  // straight to the language packs. See ui/bridge.py startSetupTranslation.
+  startSetupTranslation(params: Record<string, unknown>): void {
+    if (window.BridgeAPI) window.BridgeAPI.startSetupTranslation(params);
+    else {
+      simulateOperation(TOOL_KEYS.translateSetup, [], () => ({
+        runtimeInstalled: true,
+        installed: (params.codes as string[] | undefined)?.length ?? 0,
+        skipped: 0,
+        requested: (params.codes as string[] | undefined)?.length ?? 0,
       }));
     }
   },

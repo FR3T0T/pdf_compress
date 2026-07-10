@@ -76,6 +76,11 @@ export interface RealBridgeAPI {
   // enough on the synchronous path to freeze the whole window.
   startTranslateText(params: Record<string, unknown>): void;
   startTranslateImage(params: Record<string, unknown>): void;
+  // One-time, user-initiated translation setup (network): frozen builds
+  // download the pinned ML runtime (translate_runtime.py) and then the
+  // chosen Argos language packs; source checkouts skip straight to the
+  // packs. Progress/done arrive under toolKey "translateSetup".
+  startSetupTranslation(params: Record<string, unknown>): void;
   checkEpdf(path: string): Promise<{
     isEpdf: boolean;
     cipher?: string;

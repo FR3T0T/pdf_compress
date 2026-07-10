@@ -40,6 +40,7 @@ interface RawBridge {
   startTranslatePdf(paramsJson: string): void;
   startTranslateText(paramsJson: string): void;
   startTranslateImage(paramsJson: string): void;
+  startSetupTranslation(paramsJson: string): void;
   checkEpdf(path: string): Promise<string>;
   startCompress(paramsJson: string): void;
   startMerge(paramsJson: string): void;
@@ -210,6 +211,9 @@ export function connectQWebChannel(): Promise<void> {
         },
         startTranslateImage(params) {
           raw.startTranslateImage(JSON.stringify(params));
+        },
+        startSetupTranslation(params) {
+          raw.startSetupTranslation(JSON.stringify(params));
         },
         async checkEpdf(path) {
           return safeJsonParse(await raw.checkEpdf(path), { isEpdf: false });

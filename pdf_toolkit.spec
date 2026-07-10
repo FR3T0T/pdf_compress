@@ -30,11 +30,52 @@ ASSETS_FONTS = os.path.join(PROJECT_ROOT, "assets", "fonts")
 datas = [
     (WEB_REACT_DIST, os.path.join("web-react", "dist")),
     (ASSETS_FONTS, os.path.join("assets", "fonts")),
+    # Pinned wheel manifest for the on-demand translation runtime --
+    # translate_runtime.py resolves it beside its own module (repo root
+    # from source, _internal/ frozen).
+    (os.path.join(PROJECT_ROOT, "translate_runtime_lock.json"), "."),
 ]
 
 # ── Hidden imports ───────────────────────────────────────────────────
 # Modules that PyInstaller can't detect from static analysis.
-hiddenimports = [
+
+# The ENTIRE Python stdlib must ship in the bundle: the translation
+# runtime (translate_runtime.py) makes pip-style wheels importable at
+# app-runtime, and those packages import stdlib modules the analyzed app
+# graph never references (the ML stack is deliberately invisible to
+# analysis -- see excludes below). The first builds of this architecture
+# broke exactly this way: torch -> `timeit`, then requests ->
+# `http.cookies` -- so stdlib PACKAGES need collect_submodules (a bare
+# package hiddenimport does NOT pull its submodules). Skip only
+# POSIX-only modules and heavyweight/pointless corners.
+import importlib.util
+
+from PyInstaller.utils.hooks import collect_submodules
+
+_STDLIB_SKIP = {
+    # not on Windows
+    "curses", "fcntl", "grp", "posix", "pty", "pwd", "readline",
+    "resource", "syslog", "termios", "tty",
+    # heavyweight or senseless to bundle
+    "antigravity", "ensurepip", "idlelib", "lib2to3", "test", "this",
+    "tkinter", "turtle", "turtledemo", "venv",
+}
+_stdlib_imports = []
+for _m in sorted(sys.stdlib_module_names):
+    if _m.startswith("_") or _m in _STDLIB_SKIP:
+        continue
+    try:
+        _spec = importlib.util.find_spec(_m)
+    except Exception:
+        continue
+    if _spec is None:
+        continue
+    if _spec.submodule_search_locations:  # a package: pull every submodule
+        _stdlib_imports += collect_submodules(_m)
+    else:
+        _stdlib_imports.append(_m)
+
+hiddenimports = _stdlib_imports + [
     # Qt / PySide6
     "PySide6.QtWebEngineWidgets",
     "PySide6.QtWebEngineCore",
@@ -74,6 +115,8 @@ hiddenimports = [
     "engine",
     "pdf_ops",
     "epdf_crypto",
+    "pdf_translate",
+    "translate_runtime",
     "ui",
     "ui.web_shell",
     "ui.bridge",
@@ -84,10 +127,39 @@ hiddenimports = [
 # ── Excludes ─────────────────────────────────────────────────────────
 excludes = [
     "tkinter",
-    "unittest",
+    # NOTE: unittest is NOT excluded (it was, pre-runtime-provisioning):
+    # torch and friends import stdlib test helpers at runtime, and the
+    # runtime-provisioned ML stack must find the full stdlib in the
+    # bundle (see the stdlib hiddenimports above).
     "test",
     "tests",
     "pytest",
+    # The entire translation ML stack is deliberately NOT bundled. Two
+    # reasons: (1) frozen PyTorch aborts natively at import on this stack
+    # (c10 AbortHandler inside torch_python.dll, Python 3.14 + PyInstaller
+    # 6.21) -- import argostranslate -> sbd -> stanza -> torch fires it;
+    # (2) it's ~1 GB of the bundle for one tool of 22. The Translate tool
+    # provisions these at runtime instead, into a user-writable dir via
+    # translate_runtime.py (pinned wheels, one-time explicit download) --
+    # where torch imports from a real directory layout exactly like a
+    # source checkout and works. pdf_translate.py only ever imports the
+    # stack lazily, so freezing without it is safe for the other tools;
+    # these excludes stop PyInstaller's static analysis from collecting
+    # the venv copies.
+    "argostranslate",
+    "torch",
+    "torchgen",
+    "functorch",
+    "stanza",
+    "spacy",
+    "thinc",
+    "ctranslate2",
+    "onnxruntime",
+    "sentencepiece",
+    "sacremoses",
+    "minisbd",
+    "langdetect",
+    "pytesseract",
 ]
 
 # ── Analysis ─────────────────────────────────────────────────────────
