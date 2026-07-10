@@ -42,6 +42,30 @@ The original vanilla-JS frontend has been fully retired now that the React app i
 
 ---
 
+## Building the Windows installer
+
+Two steps, wrapped in one script:
+
+```bat
+build_installer.bat
+```
+
+That runs the PyInstaller one-dir build (`dist\PDFToolkit\`) and then compiles
+[installer.iss](installer.iss) into `dist\PDFToolkit-Setup-<version>.exe` — an
+all-users installer (Program Files, Start Menu + optional Desktop shortcut,
+automatic uninstaller). Requirements:
+
+- `pip install pyinstaller`
+- [Inno Setup 6.3+](https://jrsoftware.org/isinfo.php) (free) — `iscc.exe` is
+  found on PATH or at the default `C:\Program Files (x86)\Inno Setup 6\`
+
+To build just the app without the installer, use `build.bat` (or
+`python -m PyInstaller pdf_toolkit.spec --noconfirm`). Uninstalling removes the
+program files only; per-user data (settings/logs, the on-demand translation
+runtime, Argos language packs) is left in place so upgrades keep your setup.
+
+---
+
 ## Development
 
 Tests and linting run in CI on a matrix of Linux + Windows, Python 3.10 and 3.12:
@@ -242,7 +266,7 @@ Text and vector graphics are never modified.
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Application entry point and icon generation |
+| `app.py` | Application entry point (window icon, logging, Qt bootstrap) |
 | `engine.py` | Compression engine (shared by GUI and CLI) |
 | `compress_paths.py` | Pure compression output-path resolution (Qt-free; unit-tested by `tests/test_bridge.py`) |
 | `pdf_ops.py` | PDF operations (merge, split, protect, watermark, etc.) |
@@ -254,6 +278,11 @@ Text and vector graphics are never modified.
 | `setup_translation.py` | CLI provisioning of offline translation/OCR models (source checkouts) |
 | `compress_pdf.py` | Command-line interface for compression |
 | `compress_pdf.bat` | Windows launcher (no console window) |
+| `pdf_toolkit.ico` | Application icon (16–256 px) — embedded in the .exe, window icon, installer/shortcuts |
+| `pdf_toolkit.spec` | PyInstaller build configuration (one-dir frozen app) |
+| `build.bat` | PyInstaller build script |
+| `installer.iss` | Inno Setup script — Windows installer (see *Building the Windows installer*) |
+| `build_installer.bat` | PyInstaller build + Inno Setup compile in one step |
 | `ui/` | GUI package — web shell, bridge, theme |
 | `ui/web_shell.py` | Main window (QWebEngineView + QWebChannel) |
 | `ui/bridge.py` | Python-to-JavaScript communication bridge |

@@ -56,9 +56,9 @@ same change**, not "later":
     `gh auth refresh -s project` themselves (browser approval, can't be
     scripted). Read-only lookups (`gh project item-list`) only need
     `read:project`.
-- **Version string** lives in four places — keep them in sync (they have drifted
+- **Version string** lives in five places — keep them in sync (they have drifted
   before): `app.py` `VERSION`, `pyproject.toml` `version`, the `README.md` badge,
-  and the top `CHANGELOG.md` heading.
+  the top `CHANGELOG.md` heading, and `installer.iss` `MyAppVersion`.
 
 A reader should be able to learn the current state of the project from the docs
 alone. If a change makes a doc wrong, fixing the doc is part of that change.

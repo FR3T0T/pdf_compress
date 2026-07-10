@@ -34,6 +34,10 @@ datas = [
     # translate_runtime.py resolves it beside its own module (repo root
     # from source, _internal/ frozen).
     (os.path.join(PROJECT_ROOT, "translate_runtime_lock.json"), "."),
+    # Window icon -- app.py's _app_icon() resolves it beside app.py
+    # (= _internal/ when frozen). The EXE() below embeds the same file
+    # for Explorer/taskbar.
+    (os.path.join(PROJECT_ROOT, "pdf_toolkit.ico"), "."),
 ]
 
 # ── Hidden imports ───────────────────────────────────────────────────
@@ -199,6 +203,7 @@ exe = EXE(
     upx=False,
     console=False,           # GUI app, no console window
     disable_windowed_traceback=False,
+    icon=os.path.join(PROJECT_ROOT, "pdf_toolkit.ico"),
 )
 
 # ── COLLECT (one-dir bundle) ─────────────────────────────────────────

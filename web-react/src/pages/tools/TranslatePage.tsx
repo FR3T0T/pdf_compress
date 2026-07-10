@@ -79,6 +79,15 @@ function isPdf(path: string) {
   return ext(path) === 'pdf';
 }
 
+// Default the "To" language to the first INSTALLED non-English pack:
+// with "From" defaulting to auto-detect (usually English content), the
+// old To=English default produced an English→English no-op that read as
+// broken. Falls back to 'en' only when no packs are installed yet — the
+// setup flow is showing in that state anyway.
+function defaultTarget(langs: Language[]): string {
+  return langs.find((l) => l.code !== 'en' && l.translateTo)?.code ?? 'en';
+}
+
 /**
  * React port of web/js/pages/translate.js. Both flows are now async,
  * off the UI thread, through the same useOperation('translate') flow:
@@ -165,8 +174,7 @@ export function TranslatePage() {
     if (statusOp.status === 'done' && statusOp.result?.results) {
       const res = statusOp.result.results;
       setStatus(res);
-      const en = res.languages?.find((l) => l.code === 'en');
-      if (en) setTarget('en');
+      setTarget(defaultTarget(res.languages ?? []));
     } else if (statusOp.status === 'error') {
       toast.error(statusOp.error || 'Could not check translation setup.');
     }
@@ -175,7 +183,14 @@ export function TranslatePage() {
   useEffect(() => {
     if (setupOp.status === 'done' && setupOp.result?.results) {
       const res = setupOp.result.results;
-      if (res.status) setStatus(res.status);
+      if (res.status) {
+        setStatus(res.status);
+        // If the target still sits on the degenerate 'en' default, move
+        // it onto one of the packs that setup just installed; never stomp
+        // a language the user already picked deliberately.
+        const langs = res.status.languages ?? [];
+        setTarget((cur) => (cur === 'en' ? defaultTarget(langs) : cur));
+      }
       const n = res.installed ?? 0;
       toast.success(
         res.runtimeInstalled

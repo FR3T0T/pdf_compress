@@ -1,7 +1,37 @@
 # Changelog
 ## Unreleased
 
+### Added
+- **Windows installer + real app icon.** New `installer.iss` (Inno Setup
+  6.3+, documented in the README) packages the PyInstaller one-dir build
+  into `dist/PDFToolkit-Setup-<version>.exe`: all-users install to
+  `Program Files\PDF Toolkit` (admin), Start Menu + optional Desktop
+  shortcut, automatic uninstaller (per-user data — settings/logs, the
+  on-demand translation runtime, Argos language packs — is deliberately
+  left in place for upgrades), lzma2/max compression. New
+  `build_installer.bat` chains the PyInstaller build and the Inno compile
+  (finds `iscc.exe` on PATH or at the default install location). The
+  finished `pdf_toolkit.ico` (16–256 px) is now wired everywhere: embedded
+  in the built .exe (`pdf_toolkit.spec` `EXE(icon=...)`, for
+  Explorer/taskbar/Alt-Tab), bundled as a data file and loaded as the
+  window icon at runtime in both source and frozen modes (`app.py`
+  `_app_icon()`, replacing the old programmatically-painted placeholder
+  icon), and used by the installer for its setup icon and shortcuts. The
+  version string now also lives in `installer.iss` (see CLAUDE.md's
+  version-bump list, now five places).
+
 ### Changed
+- **UI polish: branded sidebar mark + sane Translate default.** The
+  sidebar's placeholder "P" chip is now the same file-lock motif as the
+  app's window/taskbar icon (lucide-react's `FileLock`, tree-shaken into
+  the bundle — new frontend dependency, still fully offline), accent-
+  colored on the existing tinted chip. The Translate tool's "To" language
+  no longer defaults to English (which, with "From" on auto-detect,
+  produced an English→English no-op that read as broken) — it now
+  defaults to the first installed non-English language, both on page load
+  and right after first-time setup installs packs, and never overrides a
+  target the user picked deliberately. Frontend rebuilt
+  (`web-react/dist/`).
 - **Frozen build: translation is now provisioned on demand instead of
   bundled — fixes the native PyTorch crash and shrinks the installer from
   1.26 GB to ~670 MB.** The packaged app crashed with a native c10 abort

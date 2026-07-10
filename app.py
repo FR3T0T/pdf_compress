@@ -8,18 +8,8 @@ import logging
 import os
 import sys
 
-from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import (
-    QBrush,
-    QColor,
-    QFont,
-    QIcon,
-    QLinearGradient,
-    QPainter,
-    QPainterPath,
-    QPen,
-    QPixmap,
-)
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication
 
 from engine import setup_file_logging
@@ -31,61 +21,19 @@ log = logging.getLogger(__name__)
 VERSION = "4.23"
 
 
-def _generate_app_icon() -> QIcon:
-    """Generate a modern PDF icon programmatically."""
-    sizes = [16, 32, 48, 64, 128, 256]
-    icon = QIcon()
-    for size in sizes:
-        pixmap = QPixmap(size, size)
-        pixmap.fill(QColor(0, 0, 0, 0))
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
+def _app_icon() -> QIcon:
+    """Load the application icon (pdf_toolkit.ico, beside this file).
 
-        margin = size * 0.06
-        rect = QRectF(margin, margin, size - 2 * margin, size - 2 * margin)
-
-        # Modern indigo gradient background
-        gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        gradient.setColorAt(0.0, QColor("#6366f1"))
-        gradient.setColorAt(1.0, QColor("#4338ca"))
-        painter.setBrush(QBrush(gradient))
-        painter.setPen(Qt.NoPen)
-        radius = size * 0.18
-        painter.drawRoundedRect(rect, radius, radius)
-
-        # Document shape with folded corner
-        doc_margin = size * 0.22
-        doc_rect = QRectF(doc_margin, doc_margin * 0.9,
-                          size - 2 * doc_margin, size - 2 * doc_margin * 0.85)
-        fold = size * 0.15
-        doc_path = QPainterPath()
-        doc_path.moveTo(doc_rect.left(), doc_rect.top() + 3)
-        doc_path.lineTo(doc_rect.right() - fold, doc_rect.top())
-        doc_path.lineTo(doc_rect.right(), doc_rect.top() + fold)
-        doc_path.lineTo(doc_rect.right(), doc_rect.bottom() - 3)
-        doc_path.quadTo(doc_rect.right(), doc_rect.bottom(),
-                        doc_rect.right() - 3, doc_rect.bottom())
-        doc_path.lineTo(doc_rect.left() + 3, doc_rect.bottom())
-        doc_path.quadTo(doc_rect.left(), doc_rect.bottom(),
-                        doc_rect.left(), doc_rect.bottom() - 3)
-        doc_path.closeSubpath()
-
-        painter.setBrush(QBrush(QColor(255, 255, 255, 50)))
-        painter.setPen(QPen(QColor(255, 255, 255, 80), max(1, size * 0.02)))
-        painter.drawPath(doc_path)
-
-        # "PDF" text
-        font_size = max(1, int(size * 0.24))
-        font = QFont("Segoe UI", font_size, QFont.Bold)
-        painter.setFont(font)
-        painter.setPen(QPen(QColor(255, 255, 255, 240)))
-        text_rect = QRectF(doc_rect.left(), doc_rect.top() + doc_rect.height() * 0.25,
-                           doc_rect.width(), doc_rect.height() * 0.5)
-        painter.drawText(text_rect, Qt.AlignCenter, "PDF")
-
-        painter.end()
-        icon.addPixmap(pixmap)
-    return icon
+    Resolves in both run modes: from source this directory is the repo
+    root; in the frozen build PyInstaller places __file__ under
+    sys._MEIPASS (the _internal dir), where pdf_toolkit.spec bundles the
+    .ico as a data file. The built .exe additionally embeds the same
+    icon (spec: EXE(icon=...)) for Explorer/taskbar/Alt-Tab.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_toolkit.ico")
+    if not os.path.isfile(path):
+        log.warning("App icon not found at %s", path)
+    return QIcon(path)
 
 
 def main():
@@ -104,7 +52,7 @@ def main():
     app.setApplicationName("PDF Toolkit")
     app.setOrganizationName("PDFCompress")
 
-    app.setWindowIcon(_generate_app_icon())
+    app.setWindowIcon(_app_icon())
 
     initial = [f for f in sys.argv[1:]
                if f.lower().endswith(".pdf") and os.path.isfile(f)]
