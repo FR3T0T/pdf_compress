@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
+import { FileLock } from 'lucide-react';
 import { Icon, type IconName } from '../components/shared/Icon';
 import { bridgeApi } from '../bridge/bridgeApi';
 import { useRouter } from '../router/Router';
@@ -98,10 +99,10 @@ export function Sidebar() {
           flex: '0 0 auto',
         }}
       >
-        {/* Placeholder mark (rebrand pending — don't invest in this):
-            a quiet accent-tinted chip instead of a heavy solid block. */}
+        {/* Brand mark: the same file-lock motif as the app's window/
+            taskbar icon (pdf_toolkit.ico), in the accent color on the
+            quiet tinted chip. */}
         <div
-          className="mono"
           style={{
             width: 24,
             height: 24,
@@ -111,12 +112,10 @@ export function Sidebar() {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            fontWeight: 700,
-            fontSize: 13,
             flex: '0 0 auto',
           }}
         >
-          P
+          <FileLock size={14} aria-hidden="true" />
         </div>
         {!collapsed && (
           <span style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)', whiteSpace: 'nowrap' }}>
