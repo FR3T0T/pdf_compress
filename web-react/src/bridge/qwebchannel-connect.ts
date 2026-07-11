@@ -68,6 +68,7 @@ interface RawBridge {
   copyFile(srcPath: string, destPath: string): Promise<string>;
   openFolder(path: string): void;
   openFile(path: string): void;
+  revealFile(path: string): void;
   saveSetting(key: string, value: string): void;
   loadSetting(key: string): Promise<string>;
   getToolRegistry(): Promise<string>;
@@ -295,6 +296,9 @@ export function connectQWebChannel(): Promise<void> {
         },
         openFilePath(path) {
           raw.openFile(path);
+        },
+        revealFilePath(path) {
+          raw.revealFile(path);
         },
         saveSetting(key, value) {
           raw.saveSetting(key, value);

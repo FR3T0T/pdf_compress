@@ -253,6 +253,24 @@ def _progress_payload(
     }, ensure_ascii=False)
 
 
+def _result_output_dir(output_dir: str, file_results: list, files: list) -> str:
+    """Best 'Open folder' target for a protect/unlock batch result.
+
+    Prefer the explicit output_dir; otherwise the folder of the first file
+    actually produced (covers both the Save-As explicit-path case and the
+    same-folder-as-input default uniformly); otherwise the first input's
+    folder. Keeps the returned dir pointing at where outputs really landed,
+    not where the inputs came from.
+    """
+    if output_dir:
+        return output_dir
+    for fr in file_results:
+        out = fr.get("outputPath")
+        if out:
+            return os.path.dirname(out)
+    return os.path.dirname(files[0]) if files else ""
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Bridge
 # ═══════════════════════════════════════════════════════════════════
@@ -898,6 +916,33 @@ class Bridge(QObject):
         except Exception:
             log.exception("Failed to open file: %s", path)
 
+    @Slot(str)
+    def revealFile(self, path: str):
+        """Reveal a file in the OS file manager with the file itself selected.
+
+        Unlike openFile (which launches the file's default application —
+        useless for an .epdf, which has no association), this opens the
+        containing folder and highlights the file, so a just-produced output
+        is immediately visible and actionable. Same abs+exists guard as
+        openFile/openFolder.
+        """
+        path = os.path.normpath(path)
+        if not (os.path.isabs(path) and os.path.exists(path)):
+            log.warning("Refusing to reveal non-local or nonexistent path: %s", path)
+            return
+        try:
+            if platform.system() == "Windows":
+                # `explorer /select,<path>` highlights the file. explorer exits
+                # non-zero even on success, so Popen-and-forget (no check).
+                subprocess.Popen(["explorer", f"/select,{path}"])
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", "-R", path])
+            else:
+                # No portable "select the file" on Linux — open the folder.
+                subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        except Exception:
+            log.exception("Failed to reveal file: %s", path)
+
     # ── Workspace (persistent working document) ────────────────────
     # Backs the frontend's WorkspaceContext: a single working document
     # whose successive transform outputs replace each other in place
@@ -1106,6 +1151,12 @@ class Bridge(QObject):
 
         mode = p.get("mode", "standard")
         output_dir = p.get("outputDir") or p.get("output_dir", "")
+        # Explicit single-file destination from a Save-As dialog. When set (and
+        # exactly one input), the encrypted file is written to precisely this
+        # path — bypassing the output_dir + naming template — so the user knows
+        # exactly where it landed. The extension is still forced to match the
+        # chosen format (.epdf/.pdf) so a mistyped name can't corrupt the type.
+        explicit_output = p.get("outputPath") or ""
         naming = p.get("naming", "{name}_protected")
         user_pw = p.get("userPassword") or p.get("user_password", "")
         owner_pw = p.get("ownerPassword") or p.get("owner_password", "")
@@ -1143,17 +1194,20 @@ class Bridge(QObject):
                         cipher_label = encryption.lower()
                         ext = ".pdf"
 
-                    try:
-                        out_name = naming.format(
-                            name=name_no_ext,
-                            cipher=cipher_label,
-                            mode=mode,
-                        )
-                    except (KeyError, IndexError):
-                        out_name = f"{name_no_ext}_protected"
+                    if explicit_output and len(files) == 1:
+                        out_path = os.path.splitext(explicit_output)[0] + ext
+                    else:
+                        try:
+                            out_name = naming.format(
+                                name=name_no_ext,
+                                cipher=cipher_label,
+                                mode=mode,
+                            )
+                        except (KeyError, IndexError):
+                            out_name = f"{name_no_ext}_protected"
 
-                    out_folder = output_dir or os.path.dirname(fpath)
-                    out_path = contained_output_path(out_folder, out_name + ext)
+                        out_folder = output_dir or os.path.dirname(fpath)
+                        out_path = contained_output_path(out_folder, out_name + ext)
 
                     if mode == "enhanced":
                         epdf_encrypt(
@@ -1187,8 +1241,7 @@ class Bridge(QObject):
             return {
                 "files": file_results,
                 "elapsed": round(elapsed, 2),
-                "output_dir": output_dir or (
-                    os.path.dirname(files[0]) if files else ""),
+                "output_dir": _result_output_dir(output_dir, file_results, files),
             }
 
         self._run_in_thread(tool_key, _work)
@@ -1208,6 +1261,10 @@ class Bridge(QObject):
 
         password = p.get("password", "")
         output_dir = p.get("outputDir") or p.get("output_dir", "")
+        # Explicit single-file destination from a Save-As dialog (see the same
+        # note in startProtect). Always a .pdf here — unlock's output is a
+        # plain PDF regardless of whether the input was .epdf or a locked PDF.
+        explicit_output = p.get("outputPath") or ""
         naming = p.get("naming", "{name}_unlocked")
 
         def _work():
@@ -1227,13 +1284,16 @@ class Bridge(QObject):
                 )
 
                 try:
-                    try:
-                        out_name = naming.format(name=name_no_ext)
-                    except (KeyError, IndexError):
-                        out_name = f"{name_no_ext}_unlocked"
+                    if explicit_output and len(files) == 1:
+                        out_path = os.path.splitext(explicit_output)[0] + ".pdf"
+                    else:
+                        try:
+                            out_name = naming.format(name=name_no_ext)
+                        except (KeyError, IndexError):
+                            out_name = f"{name_no_ext}_unlocked"
 
-                    out_folder = output_dir or os.path.dirname(fpath)
-                    out_path = contained_output_path(out_folder, out_name + ".pdf")
+                        out_folder = output_dir or os.path.dirname(fpath)
+                        out_path = contained_output_path(out_folder, out_name + ".pdf")
 
                     if is_epdf(fpath):
                         epdf_decrypt(fpath, out_path, password)
@@ -1270,8 +1330,7 @@ class Bridge(QObject):
             return {
                 "files": file_results,
                 "elapsed": round(elapsed, 2),
-                "output_dir": output_dir or (
-                    os.path.dirname(files[0]) if files else ""),
+                "output_dir": _result_output_dir(output_dir, file_results, files),
             }
 
         self._run_in_thread(tool_key, _work)

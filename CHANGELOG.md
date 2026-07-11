@@ -129,6 +129,39 @@
   sliders, preset selection, tabs, and the progress fill. Frontend rebuilt
   (`web-react/dist/`).
 
+### Fixed
+- **Protect/Unlock: fix the "where did my file go?" flow — Save-As
+  destination + reveal-in-folder, and no more workspace temp-file round-trip.**
+  Two problems, one fix. (1) When a workspace document was loaded, Protect and
+  Unlock wrote their result into the workspace temp dir and made it the new
+  "working document" via `applyResult` — but encryption produces a *terminal
+  artifact* (an `.epdf`, or a password-locked PDF) that the workspace's Preview
+  (`getPageImages`/`fitz.open`), background scan, and Export then tried to open
+  as a plain PDF (Preview failed; Export wrote `.epdf` bytes to a `.pdf`-named
+  file). (2) In the ordinary flow the encrypted file was written silently
+  (next to the input, or — worse — into the hidden workspace temp dir) with no
+  indication of where it landed and no reliable way to open it. Now:
+    - For a **single input** (the workspace document, or one dropped file) the
+      Output section shows the destination — defaulting to the **same folder as
+      the input file** (`<name>_protected.<ext>` / `<name>_unlocked.pdf`) — with
+      a **"Choose location…"** button to pick a different file up-front, before
+      protecting. The bridge's `startProtect`/`startUnlock` accept an explicit
+      `outputPath` for the chosen case (extension still forced to match the
+      chosen format, so a mistyped name can't corrupt the type). Multiple
+      dropped files keep the folder + naming-template batch flow.
+    - On success nothing is auto-opened; instead the results panel shows each
+      output's **full path** with a **"Show in folder"** button that reveals the
+      file in the OS file manager with it selected (new `revealFile` bridge
+      slot — `explorer /select,` on Windows, `open -R` on macOS) plus the
+      existing "Open folder". This addresses the original report — open the
+      *crypto version* of the file, on demand, not a temp copy.
+    - Protect/Unlock no longer touch the workspace working document (they join
+      the established **terminal-tool** pattern). The atomic-write temp files
+      inside `epdf_crypto.py` were never the issue — those are written and
+      immediately `os.replace`d into the real output.
+
+  Frontend rebuilt (`web-react/dist/`).
+
 ## v4.23
 
 ### Added

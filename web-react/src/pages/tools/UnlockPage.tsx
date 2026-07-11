@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
@@ -44,13 +44,19 @@ export function UnlockPage() {
   const [password, setPassword] = useState('');
   const [outputDir, setOutputDir] = useState('');
   const [naming, setNaming] = useState('{name}_unlocked');
+  // Explicit single-file output path chosen up-front via "Choose location…".
+  // Empty ⇒ default to the same folder as the input file.
+  const [outputPath, setOutputPath] = useState('');
   const [epdfFiles, setEpdfFiles] = useState<EpdfInfo[]>([]);
   const op = useOperation<UnlockResult>('unlock');
 
   // -- Workspace (persistent working document) -----------------------------
-  // See WatermarkPage.tsx for the reference pattern this mirrors.
+  // Terminal tool: Unlock reads the workspace document as input when loaded,
+  // but decryption is kept out of the running-result chain for symmetry with
+  // Protect (crypto tools don't feed back into the workspace) — the unlocked
+  // output is a normal side download to a real folder and the workspace
+  // pointer is never advanced (see the Step B spec's terminal-tool list).
   const workspace = useWorkspace();
-  const workspaceRunRef = useRef(false);
 
   usePageBusy(op.status === 'running');
   useWorkspaceBusy(op.status === 'running' && !!workspace.path);
@@ -58,24 +64,14 @@ export function UnlockPage() {
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
       const res = op.result.results;
-      if (workspaceRunRef.current) {
-        workspaceRunRef.current = false;
-        const fr = res.files[0];
-        if (fr?.status === 'ok' && fr.outputPath) {
-          workspace.applyResult(fr.outputPath, 'Unlock');
-          toast.success('Unlocked the working document.');
-        } else {
-          toast.error(fr?.details || 'Unlock failed — working document unchanged.');
-        }
-        return;
-      }
       const nOk = res.files.filter((f) => f.status === 'ok').length;
+      // Don't auto-open anything on completion — the results panel below shows
+      // the output path with "Show in folder" / "Open folder" for opening it.
       if (nOk > 0) toast.success(`${nOk} file${nOk === 1 ? '' : 's'} unlocked successfully!`);
       res.files
         .filter((f) => f.status === 'error')
         .forEach((f) => toast.error(`${f.file}: ${f.details}`));
     } else if (op.status === 'error') {
-      workspaceRunRef.current = false;
       toast.error(op.error || 'Unlock failed.');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -104,9 +100,31 @@ export function UnlockPage() {
 
   const canRun = (workspace.path ? true : files.length > 0) && password.length > 0 && op.status !== 'running';
 
+  // The single input this run will operate on, and the destination used if the
+  // user doesn't pick one: the same folder as that file, "<name>_unlocked.pdf".
+  const singleSrc = workspace.path ?? (files.length === 1 ? files[0].path : null);
+  const defaultOutName = singleSrc
+    ? `${bridgeApi.basename(singleSrc).replace(/\.(pdf|epdf)$/i, '')}_unlocked.pdf`
+    : '';
+  const defaultOutPath = singleSrc ? `${bridgeApi.dirname(singleSrc)}\\${defaultOutName}` : '';
+
+  // A picked output path is only meaningful for the current input, so drop it
+  // whenever the input file changes.
+  useEffect(() => {
+    setOutputPath('');
+  }, [workspace.path, files]);
+
   const pickOutputDir = async () => {
     const dir = await bridgeApi.openFolder();
     if (dir) setOutputDir(dir);
+  };
+
+  // Let the user choose the exact output file up-front (before Unlock). If they
+  // don't, `run` falls back to defaultOutPath (same folder as the input).
+  const pickOutputFile = async () => {
+    if (!singleSrc) return;
+    const dest = await bridgeApi.saveFile('PDF Files (*.pdf)', defaultOutName);
+    if (dest) setOutputPath(dest);
   };
 
   const run = () => {
@@ -115,29 +133,32 @@ export function UnlockPage() {
       return;
     }
 
-    if (workspace.path) {
-      const wsPath = workspace.path;
-      const opIndex = workspace.ops.length + 1;
-      workspaceRunRef.current = true;
-      op.run(async () => {
-        const wsDir = await bridgeApi.getWorkspaceDir();
-        bridgeApi.startUnlock({
-          files: [wsPath],
-          password,
-          output_dir: wsDir,
-          naming: `{name}_ws${opIndex}`,
-        });
-      });
-      return;
-    }
-
-    if (files.length === 0) {
+    const inputPaths = workspace.path ? [workspace.path] : files.map((f) => f.path);
+    if (inputPaths.length === 0) {
       toast.warning('Please add at least one file.');
       return;
     }
+
+    // Single input: write to the location the user picked via "Choose
+    // location…", or — if they didn't — default to the same folder as the
+    // input file (passed explicitly so a workspace temp-file input doesn't
+    // land its output in the hidden temp dir).
+    if (inputPaths.length === 1) {
+      const src = inputPaths[0];
+      op.run(() =>
+        bridgeApi.startUnlock(
+          outputPath
+            ? { files: [src], password, outputPath }
+            : { files: [src], password, output_dir: bridgeApi.dirname(src), naming: naming.trim() || '{name}_unlocked' }
+        )
+      );
+      return;
+    }
+
+    // Multiple files → output folder + naming template, as before.
     op.run(() =>
       bridgeApi.startUnlock({
-        files: files.map((f) => f.path),
+        files: inputPaths,
         password,
         output_dir: outputDir,
         naming: naming.trim() || '{name}_unlocked',
@@ -145,13 +166,14 @@ export function UnlockPage() {
     );
   };
 
-  const r = op.status === 'done' && !workspace.path ? op.result?.results : null;
+  const r = op.status === 'done' ? op.result?.results : null;
   const results = r
     ? {
         files: r.files.map((fr) => ({
           name: fr.file,
           status: fr.status === 'ok' ? ('done' as const) : ('error' as const),
           error: fr.status === 'error' ? fr.details : undefined,
+          outputPath: fr.status === 'ok' ? fr.outputPath : undefined,
         })),
         totalTime: r.elapsed,
         outputDir: r.output_dir,
@@ -165,8 +187,9 @@ export function UnlockPage() {
       {workspace.path ? (
         <Card>
           <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
-            Operating on the workspace document ({workspace.originalName}) — see the bar above to
-            Preview, Export, or Clear it.
+            Operating on the workspace document ({workspace.originalName}) — this reads from it without
+            changing it; the unlocked copy is saved next to it by default, or pick a location in the
+            Output section below. See the bar above to Preview, Export, or Clear the working document.
           </div>
         </Card>
       ) : (
@@ -220,10 +243,59 @@ export function UnlockPage() {
         </Card>
       </div>
 
-      {!workspace.path && (
+      {/* Single input: destination defaults to the same folder as the file;
+          "Choose location…" lets the user override it before unlocking. */}
+      {singleSrc && (
         <div style={{ marginTop: 'var(--space-3)' }}>
           <Card>
-            <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)', marginBottom: 6 }}>Output folder</div>
+            <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)', marginBottom: 6 }}>Output file</div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <span
+                className="mono"
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  color: 'var(--text-2)',
+                  fontSize: 'var(--font-size-sm)',
+                  padding: '7px 10px',
+                  background: 'var(--panel-bg-elevated)',
+                  border: '1px solid var(--border-strong)',
+                  borderRadius: 'var(--radius-panel-sm)',
+                  wordBreak: 'break-all',
+                }}
+              >
+                {outputPath || defaultOutPath}
+              </span>
+              <button onClick={pickOutputFile} disabled={op.status === 'running'} className="btn-ghost" style={{ flexShrink: 0 }}>
+                Choose location…
+              </button>
+            </div>
+            <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginTop: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>
+                {outputPath
+                  ? 'Custom output location.'
+                  : 'Defaults to the same folder as the input file — choose a location to change it.'}
+              </span>
+              {outputPath && (
+                <button
+                  onClick={() => setOutputPath('')}
+                  disabled={op.status === 'running'}
+                  className="btn-ghost"
+                  style={{ padding: '2px 6px', fontSize: 'var(--font-size-xs)', flexShrink: 0 }}
+                >
+                  Reset
+                </button>
+              )}
+            </div>
+          </Card>
+        </div>
+      )}
+
+      {/* Multiple dropped files use an output folder + naming template. */}
+      {!workspace.path && files.length > 1 && (
+        <div style={{ marginTop: 'var(--space-3)' }}>
+          <Card>
+            <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)', marginBottom: 6 }}>Output folder (batch)</div>
             <div style={{ display: 'flex', gap: 8 }}>
               <span
                 className="mono"
@@ -275,7 +347,7 @@ export function UnlockPage() {
 
       {results && (
         <div style={{ marginTop: 'var(--space-4)' }}>
-          <ResultsPanel results={results} />
+          <ResultsPanel results={results} onRevealFile={(path) => bridgeApi.revealFile(path)} />
         </div>
       )}
     </div>

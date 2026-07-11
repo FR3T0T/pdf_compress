@@ -23,7 +23,15 @@ export interface ResultsData {
  * Phase 3 pages map their specific result shape into this one before
  * rendering.
  */
-export function ResultsPanel({ results }: { results: ResultsData }) {
+export function ResultsPanel({
+  results,
+  onRevealFile,
+}: {
+  results: ResultsData;
+  /** When provided, each file that carries an `outputPath` shows its full
+   *  path plus a "Show in folder" button that calls this with that path. */
+  onRevealFile?: (path: string) => void;
+}) {
   const { files, totalTime, totalSaved, outputDir } = results;
 
   return (
@@ -63,16 +71,35 @@ export function ResultsPanel({ results }: { results: ResultsData }) {
                 padding: '8px 12px',
               }}
             >
-              <span className="mono" style={{ flex: 1, fontSize: 'var(--font-size-sm)', wordBreak: 'break-word' }}>
-                {f.name}
-              </span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <span className="mono" style={{ fontSize: 'var(--font-size-sm)', wordBreak: 'break-word' }}>
+                  {f.name}
+                </span>
+                {f.outputPath && (
+                  <div
+                    className="mono"
+                    style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', wordBreak: 'break-all', marginTop: 2 }}
+                  >
+                    → {f.outputPath}
+                  </div>
+                )}
+              </div>
               {typeof f.originalSize === 'number' && typeof f.resultSize === 'number' && (
-                <span className="mono" style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-xs)' }}>
+                <span className="mono" style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-xs)', flexShrink: 0 }}>
                   {bridgeApi.formatSize(f.originalSize)} → {bridgeApi.formatSize(f.resultSize)}
                 </span>
               )}
               {f.status === 'error' && f.error && (
                 <span style={{ color: 'var(--sev-high-text)', fontSize: 'var(--font-size-xs)' }}>{f.error}</span>
+              )}
+              {onRevealFile && f.outputPath && (
+                <button
+                  onClick={() => onRevealFile(f.outputPath!)}
+                  className="btn-ghost"
+                  style={{ fontSize: 'var(--font-size-xs)', padding: '4px 8px', flexShrink: 0, whiteSpace: 'nowrap' }}
+                >
+                  Show in folder
+                </button>
               )}
             </div>
           );

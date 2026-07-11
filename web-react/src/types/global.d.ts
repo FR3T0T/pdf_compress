@@ -124,6 +124,7 @@ export interface RealBridgeAPI {
   // -- Shell helpers -----------------------------------------------------
   openFolderPath(path: string): void;
   openFilePath(path: string): void;
+  revealFilePath(path: string): void;
 
   // -- Settings persistence -----------------------------------------------
   saveSetting(key: string, value: string): void;

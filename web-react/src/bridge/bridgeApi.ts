@@ -486,14 +486,16 @@ export const bridgeApi = {
     if (window.BridgeAPI) window.BridgeAPI.startProtect(params);
     else {
       const mockFiles = mockFilesFromParams(params);
-      const outputDir = String(params.output_dir ?? params.outputDir ?? 'C:\\Users\\demo\\Documents');
+      const explicit = params.outputPath ? String(params.outputPath) : '';
+      const single = explicit && mockFiles.length === 1;
+      const outputDir = single ? dirnameOf(explicit) : String(params.output_dir ?? params.outputDir ?? 'C:\\Users\\demo\\Documents');
       const mode = String(params.mode ?? 'standard');
       simulateOperation(TOOL_KEYS.protect, mockFiles, () => ({
         files: mockFiles.map((f) => ({
           file: f.name,
           status: 'ok',
           details: mode === 'enhanced' ? String(params.cipher ?? 'chacha20-poly1305') : String(params.encryption ?? 'AES-256'),
-          outputPath: `${outputDir}\\${f.name}`,
+          outputPath: single ? explicit : `${outputDir}\\${f.name}`,
         })),
         elapsed: 0.8,
         output_dir: outputDir,
@@ -504,9 +506,11 @@ export const bridgeApi = {
     if (window.BridgeAPI) window.BridgeAPI.startUnlock(params);
     else {
       const mockFiles = mockFilesFromParams(params);
-      const outputDir = String(params.output_dir ?? params.outputDir ?? 'C:\\Users\\demo\\Documents');
+      const explicit = params.outputPath ? String(params.outputPath) : '';
+      const single = explicit && mockFiles.length === 1;
+      const outputDir = single ? dirnameOf(explicit) : String(params.output_dir ?? params.outputDir ?? 'C:\\Users\\demo\\Documents');
       simulateOperation(TOOL_KEYS.unlock, mockFiles, () => ({
-        files: mockFiles.map((f) => ({ file: f.name, status: 'ok', details: 'PDF unlocked', outputPath: `${outputDir}\\${f.name}` })),
+        files: mockFiles.map((f) => ({ file: f.name, status: 'ok', details: 'PDF unlocked', outputPath: single ? explicit : `${outputDir}\\${f.name}` })),
         elapsed: 0.6,
         output_dir: outputDir,
       }));
@@ -687,6 +691,12 @@ export const bridgeApi = {
   },
   openFilePath(path: string): void {
     window.BridgeAPI?.openFilePath(path);
+  },
+  /** Reveal a file in the OS file manager with the file itself selected. No-op
+   *  in plain-browser dev (no bridge). Preferred over openFilePath for tool
+   *  outputs like .epdf that have no default-app association. */
+  revealFile(path: string): void {
+    window.BridgeAPI?.revealFilePath(path);
   },
 
   // -- Settings persistence -------------------------------------------------

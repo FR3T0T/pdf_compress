@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { PageHeader } from '../../components/shared/PageHeader';
 import { Card } from '../../components/shared/Card';
@@ -79,12 +79,19 @@ export function ProtectPage() {
   const [ownerPassword, setOwnerPassword] = useState('');
   const [outputDir, setOutputDir] = useState('');
   const [naming, setNaming] = useState('{name}_protected');
+  // Explicit single-file output path chosen up-front via "Choose location…".
+  // Empty ⇒ default to the same folder as the input file.
+  const [outputPath, setOutputPath] = useState('');
   const op = useOperation<ProtectResult>('protect');
 
   // -- Workspace (persistent working document) -----------------------------
-  // See WatermarkPage.tsx for the reference pattern this mirrors.
+  // Terminal tool: Protect reads the workspace document as input when loaded,
+  // but encryption produces a terminal artifact (an .epdf, or a password-
+  // locked PDF) that no downstream workspace tool can preview, scan, or
+  // transform — so the output is a normal side download to a real folder and
+  // the workspace pointer is never advanced (see the Step B spec's
+  // terminal-tool list).
   const workspace = useWorkspace();
-  const workspaceRunRef = useRef(false);
 
   usePageBusy(op.status === 'running');
   useWorkspaceBusy(op.status === 'running' && !!workspace.path);
@@ -105,23 +112,13 @@ export function ProtectPage() {
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
       const res = op.result.results;
-      if (workspaceRunRef.current) {
-        workspaceRunRef.current = false;
-        const fr = res.files[0];
-        if (fr?.status === 'ok' && fr.outputPath) {
-          workspace.applyResult(fr.outputPath, `Protect (${mode})`);
-          toast.success('Protected the working document.');
-        } else {
-          toast.error(fr?.details || 'Protection failed — working document unchanged.');
-        }
-        return;
-      }
       const nOk = res.files.filter((f) => f.status === 'ok').length;
       const nErr = res.files.length - nOk;
+      // Don't auto-open anything on completion — the results panel below shows
+      // the output path with "Show in folder" / "Open folder" for opening it.
       if (nOk > 0) toast.success(`${nOk} file${nOk === 1 ? '' : 's'} protected successfully!`);
       if (nErr > 0 && nOk === 0) toast.error('Protection failed for all files.');
     } else if (op.status === 'error') {
-      workspaceRunRef.current = false;
       toast.error(op.error || 'Protection failed.');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -129,9 +126,34 @@ export function ProtectPage() {
 
   const canRun = (workspace.path ? true : files.length > 0) && userPassword.length > 0 && op.status !== 'running';
 
+  // The single input this run will operate on (the workspace doc, or the one
+  // dropped file), and the destination that will be used if the user doesn't
+  // pick one: the same folder as that file, named "<name>_protected.<ext>".
+  const singleSrc = workspace.path ?? (files.length === 1 ? files[0].path : null);
+  const outExt = mode === 'enhanced' ? '.epdf' : '.pdf';
+  const defaultOutName = singleSrc
+    ? `${bridgeApi.basename(singleSrc).replace(/\.(pdf|epdf)$/i, '')}_protected${outExt}`
+    : '';
+  const defaultOutPath = singleSrc ? `${bridgeApi.dirname(singleSrc)}\\${defaultOutName}` : '';
+
+  // A picked output path is only meaningful for the current input/format, so
+  // drop it whenever the input file or the encryption format changes.
+  useEffect(() => {
+    setOutputPath('');
+  }, [workspace.path, files, mode]);
+
   const pickOutputDir = async () => {
     const dir = await bridgeApi.openFolder();
     if (dir) setOutputDir(dir);
+  };
+
+  // Let the user choose the exact output file up-front (before Protect). If
+  // they don't, `run` falls back to defaultOutPath (same folder as the input).
+  const pickOutputFile = async () => {
+    if (!singleSrc) return;
+    const filter = mode === 'enhanced' ? 'Encrypted PDF (*.epdf)' : 'PDF Files (*.pdf)';
+    const dest = await bridgeApi.saveFile(filter, defaultOutName);
+    if (dest) setOutputPath(dest);
   };
 
   const buildParams = (filePaths: string[], outDir: string, namingTemplate: string): Record<string, unknown> => {
@@ -164,23 +186,13 @@ export function ProtectPage() {
       return;
     }
 
-    if (workspace.path) {
-      const wsPath = workspace.path;
-      const opIndex = workspace.ops.length + 1;
-      workspaceRunRef.current = true;
-      op.run(async () => {
-        const wsDir = await bridgeApi.getWorkspaceDir();
-        bridgeApi.startProtect(buildParams([wsPath], wsDir, `{name}_ws${opIndex}`));
-      });
-      return;
-    }
-
-    if (files.length === 0) {
+    const inputPaths = workspace.path ? [workspace.path] : files.map((f) => f.path);
+    if (inputPaths.length === 0) {
       toast.warning('Please add at least one PDF file.');
       return;
     }
-    const trimmedNaming = naming.trim() || '{name}_protected';
 
+    const trimmedNaming = naming.trim() || '{name}_protected';
     bridgeApi.saveSetting('protect/mode', mode);
     bridgeApi.saveSetting('protect/naming', trimmedNaming);
     if (mode === 'enhanced') {
@@ -188,16 +200,32 @@ export function ProtectPage() {
       bridgeApi.saveSetting('protect/kdf', kdf);
     }
 
-    op.run(() => bridgeApi.startProtect(buildParams(files.map((f) => f.path), outputDir, trimmedNaming)));
+    // Single input (the workspace document, or one dropped file): write to the
+    // location the user picked via "Choose location…", or — if they didn't —
+    // default to the same folder as the input file. Passing output_dir
+    // explicitly (rather than leaving it empty) keeps a workspace temp-file
+    // input from landing its output in the hidden temp dir.
+    if (inputPaths.length === 1) {
+      const src = inputPaths[0];
+      const params = outputPath
+        ? { ...buildParams([src], '', trimmedNaming), outputPath }
+        : buildParams([src], bridgeApi.dirname(src), trimmedNaming);
+      op.run(() => bridgeApi.startProtect(params));
+      return;
+    }
+
+    // Multiple files → output folder + naming template.
+    op.run(() => bridgeApi.startProtect(buildParams(inputPaths, outputDir, trimmedNaming)));
   };
 
-  const r = op.status === 'done' && !workspace.path ? op.result?.results : null;
+  const r = op.status === 'done' ? op.result?.results : null;
   const results = r
     ? {
         files: r.files.map((fr) => ({
           name: fr.file,
           status: fr.status === 'ok' ? ('done' as const) : ('error' as const),
           error: fr.status === 'error' ? fr.details : undefined,
+          outputPath: fr.status === 'ok' ? fr.outputPath : undefined,
         })),
         totalTime: r.elapsed,
         outputDir: r.output_dir,
@@ -214,8 +242,9 @@ export function ProtectPage() {
       {workspace.path ? (
         <Card>
           <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
-            Operating on the workspace document ({workspace.originalName}) — see the bar above to
-            Preview, Export, or Clear it.
+            Operating on the workspace document ({workspace.originalName}) — this reads from it without
+            changing it; the protected copy is saved next to it by default, or pick a location in the
+            Output section below. See the bar above to Preview, Export, or Clear the working document.
           </div>
         </Card>
       ) : (
@@ -317,10 +346,61 @@ export function ProtectPage() {
         </Card>
       </div>
 
-      {!workspace.path && (
+      {/* Single input: destination defaults to the same folder as the file;
+          "Choose location…" lets the user override it before protecting. */}
+      {singleSrc && (
         <div style={{ marginTop: 'var(--space-3)' }}>
           <Card>
             <SectionLabel>Output</SectionLabel>
+            <Field label="Output file">
+              <div style={{ display: 'flex', gap: 8 }}>
+                <span
+                  className="mono"
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    color: 'var(--text-2)',
+                    fontSize: 'var(--font-size-sm)',
+                    padding: '7px 10px',
+                    background: 'var(--panel-bg-elevated)',
+                    border: '1px solid var(--border-strong)',
+                    borderRadius: 'var(--radius-panel-sm)',
+                    wordBreak: 'break-all',
+                  }}
+                >
+                  {outputPath || defaultOutPath}
+                </span>
+                <button onClick={pickOutputFile} disabled={op.status === 'running'} className="btn-ghost" style={{ flexShrink: 0 }}>
+                  Choose location…
+                </button>
+              </div>
+            </Field>
+            <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginTop: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>
+                {outputPath
+                  ? 'Custom output location.'
+                  : 'Defaults to the same folder as the input file — choose a location to change it.'}
+              </span>
+              {outputPath && (
+                <button
+                  onClick={() => setOutputPath('')}
+                  disabled={op.status === 'running'}
+                  className="btn-ghost"
+                  style={{ padding: '2px 6px', fontSize: 'var(--font-size-xs)', flexShrink: 0 }}
+                >
+                  Reset
+                </button>
+              )}
+            </div>
+          </Card>
+        </div>
+      )}
+
+      {/* Multiple dropped files use an output folder + naming template. */}
+      {!workspace.path && files.length > 1 && (
+        <div style={{ marginTop: 'var(--space-3)' }}>
+          <Card>
+            <SectionLabel>Output (batch)</SectionLabel>
             <Field label="Output folder">
               <div style={{ display: 'flex', gap: 8 }}>
                 <span
@@ -375,7 +455,7 @@ export function ProtectPage() {
 
       {results && (
         <div style={{ marginTop: 'var(--space-4)' }}>
-          <ResultsPanel results={results} />
+          <ResultsPanel results={results} onRevealFile={(path) => bridgeApi.revealFile(path)} />
         </div>
       )}
     </div>
