@@ -2,6 +2,43 @@
 ## Unreleased
 
 ### Added
+- **Fail-closed true redaction (#99).** Redaction now proves its own output
+  is clean or refuses to save it. After the real `apply_redactions` pass,
+  `redact_pdf` (`pdf_ops.py`) widens the scrub to every document-level
+  surface `apply_redactions` never touches — docinfo (all `/Info` keys,
+  including custom ones like `/Company`; stripped wholesale), the XMP packet
+  (wholesale), bookmark titles, annotation text (`/Contents`,`/T`,`/Subj`,
+  all subtypes), form-field values, link URIs, and embedded-file names — each
+  removed **whole-value** (a term in "John's Q3 Report" removes the entire
+  title, never a broken fragment). A term that lived only in a document-level
+  surface (e.g. the `/Title`) now counts as a redaction hit instead of
+  raising "no matching content"; the per-surface breakdown is reported in the
+  new `RedactResult.surface_counts`. It then re-opens the saved output and
+  runs `verify_redaction`; if any target is still extractable it **deletes
+  the output and raises `RedactionVerificationError`** (never returns success
+  with a leak, never leaves a half-verified file on disk). The error carries
+  structured detail (the report, the flatten-eligible pages, whether the
+  residual is document-level). **D1 hybrid recovery:** when the only residual
+  is page content, the UI offers "Force removal: flatten affected page(s) to
+  image" — a second call with `flatten_pages` rasterizes *only* those pages
+  (150 DPI, others kept faithfully with selectable text) and re-verifies; a
+  document-level residual is a hard refusal with no offer (flatten can't fix
+  it). The bridge (`ui/bridge.py`) carries the verification report through on
+  success and the structured failure payload (`verification`,
+  `flattenablePages`, `documentLevel`) on refusal; `RedactPage.tsx` shows a
+  "Verified — 0 occurrences remain" proof line on success and the residual
+  detail + flatten offer on refusal (frontend rebuilt, `web-react/dist/`).
+  RED-01 (scanned-page image pixel redaction) and the atomic-write pattern
+  are unchanged. New coverage in `tests/test_pdf_ops.py` (per-surface scrub
+  round-trips, title-only success, fail-closed monkeypatch, the flatten path,
+  and error-tail parity: password/cancel/zero-match/out-of-range/empty-terms/
+  save-failure) and `tests/test_pdf_verify.py` (D1 flatten targeting).
+
+### Changed
+- **`pdf_analyze._page_content_blobs` promoted to public
+  `page_content_blobs`.** It is now part of the module's public surface
+  (consumed by `pdf_verify`'s redaction verifier); behaviour is unchanged and
+  both internal call sites were updated.
 - **`pdf_verify.py` — the verification loop behind provable removal (#110).**
   New top-level, Qt-free module that re-opens a redacted or sanitized OUTPUT
   file and independently proves the targeted content is gone, instead of

@@ -10,6 +10,7 @@ from PIL import Image
 from pdf_ops import (
     MergeResult,
     PageOpResult,
+    RedactionVerificationError,
     RedactResult,
     SplitResult,
     _parse_ranges,
@@ -31,6 +32,7 @@ from pdf_ops import (
     unlock_pdf,
     write_metadata,
 )
+from pdf_verify import verify_redaction
 
 try:
     import fitz  # noqa: F401  (PyMuPDF — required by redact_pdf below)
@@ -661,6 +663,296 @@ class TestRedactPdf:
         # …and the rest of the scan is intact (still red), not blanked.
         assert outside[0] > 200 and outside[1] < 60 and outside[2] < 60, \
             f"outside rect not preserved: {outside}"
+
+    @pytest.mark.integration
+    def test_result_carries_verification_report(self, tmp_path):
+        src = _text_pdf(tmp_path / "v.pdf", "the SECRET_TERM is here")
+        out = str(tmp_path / "v_out.pdf")
+        res = redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        assert res.verification is not None
+        assert res.verification["verified"] is True
+        assert res.verification["tool"] == "redaction"
+        assert res.surface_counts.get("page_content", 0) >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  #99 — widened scrub, fail-closed verification, flatten fallback
+# ═══════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestRedactWidenedScrub:
+    """Each document-level surface apply_redactions never touches must be
+    scrubbed whole-value and re-verify clean (#99). Independent-channel
+    assertion: re-run verify_redaction on the output."""
+
+    TERM = "ACME99Z"
+
+    def _run_and_verify(self, src, out):
+        res = redact_pdf(src, out, search_terms=[self.TERM])
+        assert res.verification["verified"] is True
+        assert verify_redaction(out, [self.TERM]).verified is True
+        return res
+
+    def test_docinfo_standard_key(self, tmp_path):
+        p = str(tmp_path / "info.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), f"body {self.TERM}")
+        doc.set_metadata({"title": f"{self.TERM} lease", "author": self.TERM})
+        doc.save(p)
+        doc.close()
+        res = self._run_and_verify(p, str(tmp_path / "o.pdf"))
+        assert res.surface_counts.get("docinfo", 0) >= 1
+
+    def test_docinfo_custom_key(self, tmp_path):
+        # A custom /Info key fitz.metadata can't see — must still be scrubbed.
+        base = str(tmp_path / "base.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), f"body {self.TERM}")
+        doc.save(base)
+        doc.close()
+        p = str(tmp_path / "custom.pdf")
+        with pikepdf.open(base) as pdf:
+            pdf.trailer["/Info"] = pdf.make_indirect(pikepdf.Dictionary(
+                Company=pikepdf.String(f"unit {self.TERM}")))
+            pdf.save(p)
+        self._run_and_verify(p, str(tmp_path / "o.pdf"))
+
+    def test_xmp(self, tmp_path):
+        base = str(tmp_path / "base.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), f"body {self.TERM}")
+        doc.save(base)
+        doc.close()
+        p = str(tmp_path / "xmp.pdf")
+        with pikepdf.open(base) as pdf:
+            with pdf.open_metadata(set_pikepdf_as_editor=False) as m:
+                m["dc:description"] = f"about {self.TERM}"
+            pdf.save(p)
+        res = self._run_and_verify(p, str(tmp_path / "o.pdf"))
+        assert res.surface_counts.get("xmp", 0) >= 1
+
+    def test_bookmark_title_whole_value_removed(self, tmp_path):
+        p = str(tmp_path / "toc.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), f"body {self.TERM}")
+        doc.set_toc([[1, f"{self.TERM}'s Q3 Report", 1]])
+        doc.save(p)
+        doc.close()
+        out = str(tmp_path / "o.pdf")
+        self._run_and_verify(p, out)
+        # D2: the whole title is gone, not spliced to "'s Q3 Report".
+        with fitz.open(out) as d:
+            for entry in d.get_toc(simple=True):
+                assert "Q3 Report" not in entry[1]
+
+    def test_annotation_contents(self, tmp_path):
+        p = str(tmp_path / "annot.pdf")
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 200), f"body {self.TERM}")
+        page.add_freetext_annot(fitz.Rect(72, 72, 300, 120), f"note {self.TERM}")
+        doc.save(p)
+        doc.close()
+        self._run_and_verify(p, str(tmp_path / "o.pdf"))
+
+    def test_link_uri(self, tmp_path):
+        p = str(tmp_path / "link.pdf")
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 200), f"body {self.TERM}")
+        page.insert_link({"kind": fitz.LINK_URI,
+                          "from": fitz.Rect(72, 72, 200, 90),
+                          "uri": f"https://x.com/?u={self.TERM}"})
+        doc.save(p)
+        doc.close()
+        res = self._run_and_verify(p, str(tmp_path / "o.pdf"))
+        assert res.surface_counts.get("links", 0) >= 1
+
+    def test_embedded_file_name(self, tmp_path):
+        p = str(tmp_path / "emb.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), f"body {self.TERM}")
+        doc.embfile_add(f"{self.TERM}.txt", b"payload")
+        doc.save(p)
+        doc.close()
+        self._run_and_verify(p, str(tmp_path / "o.pdf"))
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestRedactHitCount:
+    """§3: a term present only in a document-level surface still counts as a
+    hit — the run succeeds and reports the surface, instead of raising the
+    zero-match error."""
+
+    def test_title_only_succeeds_and_reports_docinfo(self, tmp_path):
+        p = str(tmp_path / "t.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), "nothing sensitive on this page")
+        doc.set_metadata({"title": "ACME99Z confidential"})
+        doc.save(p)
+        doc.close()
+        out = str(tmp_path / "o.pdf")
+        res = redact_pdf(p, out, search_terms=["ACME99Z"])
+        assert res.redaction_count == 0            # no page hit
+        assert res.surface_counts.get("docinfo", 0) >= 1
+        assert res.verification["verified"] is True
+
+    def test_genuinely_absent_term_still_raises_zero_match(self, tmp_path):
+        p = _text_pdf(tmp_path / "clean.pdf", "a totally clean document")
+        out = str(tmp_path / "o.pdf")
+        with pytest.raises(ValueError, match="No matching content"):
+            redact_pdf(p, out, search_terms=["ABSENT_TERM_XYZ"])
+        assert not os.path.exists(out)
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestRedactFailClosed:
+    """The core #99 guarantee: a redaction that cannot be proven clean must
+    raise and leave no output on disk."""
+
+    def test_no_op_apply_redactions_raises_and_deletes_output(
+            self, tmp_path, monkeypatch):
+        src = _text_pdf(tmp_path / "s.pdf", "leak SECRET_TERM leak")
+        out = str(tmp_path / "s_out.pdf")
+        monkeypatch.setattr(fitz.Page, "apply_redactions",
+                            lambda self, **k: None)
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        # Page-content residual → flatten offered on the right page (1-based).
+        assert ei.value.flatten_pages == [1]
+        assert ei.value.document_level is False
+        assert ei.value.report is not None
+        assert not os.path.exists(out)            # no half-verified file left
+
+    def test_document_level_residual_hard_raises_no_flatten(
+            self, tmp_path, monkeypatch):
+        # Scrub the doc-level surface into a no-op so a title term survives;
+        # page content is clean → the only residual is document-level, which
+        # flatten cannot fix, so no offer.
+        src = str(tmp_path / "d.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), "clean page body")
+        doc.set_metadata({"title": "SECRET_TERM report"})
+        doc.save(src)
+        doc.close()
+        monkeypatch.setattr("pdf_ops._scrub_document_surfaces",
+                            lambda *a, **k: {"docinfo": 1})   # claims a hit, removes nothing
+        out = str(tmp_path / "d_out.pdf")
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        assert ei.value.document_level is True
+        assert ei.value.flatten_pages is None
+        assert not os.path.exists(out)
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestRedactFlatten:
+    """D1 phase two: the flatten fallback rasterizes only the named pages,
+    leaves the others' text selectable, and re-verifies clean."""
+
+    def test_flatten_named_page_only(self, tmp_path, monkeypatch):
+        src = str(tmp_path / "m.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), "SECRET_TERM on page one")
+        doc.new_page().insert_text((72, 72), "ordinary text on page two")
+        doc.save(src)
+        doc.close()
+        out = str(tmp_path / "m_out.pdf")
+
+        # Force page-content to survive so the first call offers flatten.
+        monkeypatch.setattr(fitz.Page, "apply_redactions",
+                            lambda self, **k: None)
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        assert ei.value.flatten_pages == [1]
+
+        # Retry with flatten: page 1 rasterized, page 2 text intact, verifies.
+        res = redact_pdf(src, out, search_terms=["SECRET_TERM"],
+                         flatten_pages=ei.value.flatten_pages)
+        assert res.flattened_pages == [1]
+        assert res.verification["verified"] is True
+        with fitz.open(out) as d:
+            assert d[0].get_text().strip() == ""            # page 1 flattened
+            assert "ordinary text" in d[1].get_text()       # page 2 preserved
+
+    def test_flatten_still_failing_hard_raises_no_second_offer(
+            self, tmp_path, monkeypatch):
+        src = _text_pdf(tmp_path / "f.pdf", "SECRET_TERM leaks")
+        out = str(tmp_path / "f_out.pdf")
+        monkeypatch.setattr(fitz.Page, "apply_redactions",
+                            lambda self, **k: None)
+        # Flatten is also a no-op → the leak survives the retry too.
+        monkeypatch.setattr("pdf_ops._flatten_pages_to_image",
+                            lambda s, d, p, **k: __import__("shutil").copyfile(s, d))
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, out, search_terms=["SECRET_TERM"], flatten_pages=[1])
+        assert ei.value.flatten_pages is None       # no third fallback offered
+        assert not os.path.exists(out)
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestRedactErrorTail:
+    """Error-tail parity with sanitize (previously untested in redact)."""
+
+    def test_password_protected_input(self, tmp_path):
+        plain = _text_pdf(tmp_path / "p.pdf", "SECRET here")
+        enc = str(tmp_path / "enc.pdf")
+        with pikepdf.open(plain) as pdf:
+            pdf.save(enc, encryption=pikepdf.Encryption(owner="o", user="u"))
+        out = str(tmp_path / "o.pdf")
+        # Wrong/no password → clear ValueError, no output.
+        with pytest.raises(ValueError):
+            redact_pdf(enc, out, search_terms=["SECRET"])
+        assert not os.path.exists(out)
+        # Correct password → succeeds and verifies.
+        res = redact_pdf(enc, out, search_terms=["SECRET"], password="u")
+        assert res.verification["verified"] is True
+
+    def test_cancellation(self, tmp_path):
+        import threading
+        src = _text_pdf(tmp_path / "c.pdf", "SECRET_TERM here")
+        out = str(tmp_path / "c_out.pdf")
+        evt = threading.Event()
+        evt.set()
+        with pytest.raises(ValueError, match="Cancelled"):
+            redact_pdf(src, out, search_terms=["SECRET_TERM"], cancel=evt)
+        assert not os.path.exists(out)
+
+    def test_out_of_range_pages_ignored(self, tmp_path):
+        src = _text_pdf(tmp_path / "r.pdf", "SECRET_TERM here")
+        out = str(tmp_path / "r_out.pdf")
+        # Page index 9 doesn't exist → no page hit; term isn't anywhere else
+        # either → zero-match raise, no output.
+        with pytest.raises(ValueError, match="No matching content"):
+            redact_pdf(src, out, search_terms=["SECRET_TERM"], pages=[9])
+        assert not os.path.exists(out)
+
+    def test_empty_terms_raise_before_open(self, tmp_path):
+        with pytest.raises(ValueError):
+            redact_pdf(str(tmp_path / "x.pdf"), str(tmp_path / "y.pdf"),
+                       search_terms=["", "   "])
+
+    def test_save_failure_leaves_no_output(self, tmp_path, monkeypatch):
+        src = _text_pdf(tmp_path / "s.pdf", "SECRET_TERM here")
+        out = str(tmp_path / "s_out.pdf")
+
+        def _boom(self, *a, **k):
+            raise RuntimeError("simulated save failure")
+
+        monkeypatch.setattr(fitz.Document, "save", _boom)
+        with pytest.raises(RuntimeError):
+            redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        assert not os.path.exists(out)
+        # No stray temp .pdf left beside the output either.
+        strays = [f for f in os.listdir(tmp_path) if f.endswith(".pdf")
+                  and f not in ("s.pdf",)]
+        assert strays == []
 
 
 class TestProtectPdf:
