@@ -2,6 +2,50 @@
 ## Unreleased
 
 ### Added
+- **`pdf_verify.py` — the verification loop behind provable removal (#110).**
+  New top-level, Qt-free module that re-opens a redacted or sanitized OUTPUT
+  file and independently proves the targeted content is gone, instead of
+  trusting the transform library. `verify_redaction` searches every
+  extractable surface for each redacted term — page text (including
+  invisible render-mode-3 text, with whitespace/dehyphenation-normalized
+  views so an exact-case term wrapped across a line break is still caught in
+  case-sensitive mode), raw decompressed content streams, annotation
+  text/titles, form-field values, link URIs, docinfo, XMP, bookmark titles,
+  and embedded-file names — and verifies user-drawn redaction rectangles via
+  clipped extraction (an invalid/inverted/empty rect is a FAILED check, not
+  a silent skip, since those are exactly the rects redaction itself skips).
+  Surfaces are read through two independent libraries where possible: the
+  PyMuPDF walk plus a pikepdf pass over the raw object graph that also
+  covers what PyMuPDF cannot see — custom `/Info` keys, every `/V` field
+  value anywhere in the file (values no page widget exposes), and
+  annotations whose subtype `page.annots()` skips. `verify_sanitization`
+  re-runs the `pdf_analyze` audit and asserts absent exactly the finding
+  categories the enabled sanitize options promised to remove; anything else
+  still flagged (e.g. EXIF GPS inside an embedded photo, which sanitize has
+  no removal path for yet) is reported honestly as a residual finding, not a
+  failure. Fail-closed throughout: an output that cannot be opened,
+  decrypted, or re-scanned is a FAILED check — and so is any single
+  surface, page, stream, or cross-check that cannot be read — never a pass.
+  Every failure's evidence names its surface and page (or "document-level")
+  — the page-attribution the upcoming fail-closed redaction UX needs to
+  offer targeted flatten-to-image. Pure addition: nothing calls it yet
+  (wiring into `redact_pdf`/`sanitize_pdf` is #99/#101). Covered by
+  `tests/test_pdf_verify.py` (37 tests: one per surface, rect mode,
+  locked/corrupt outputs, sanitize round-trips, and fail-closed regressions
+  from an adversarial review — cross-line case-sensitive terms, multi-page
+  attribution, multi-term aggregation, non-stream `/Contents`, unsupported
+  annotation subtypes, custom docinfo keys).
+
+### Removed
+- **Dead legacy text-extraction helpers in `pdf_ops.py`.** Deleted
+  `_page_text`, `_extract_text_from_stream`, and `_extract_text_pymupdf`
+  (~70 lines) — leftovers from the pre-PyMuPDF regex-era redaction/compare
+  code with no remaining callers.
+
+### Fixed
+- **Pillow 14 deprecation in the test suite.** The images-to-PDF lossless
+  round-trip test compared pixels via `Image.getdata()` (removed in
+  Pillow 14, 2027); it now compares `tobytes()` — equivalent and faster.
 - **Windows installer + real app icon.** New `installer.iss` (Inno Setup
   6.3+, documented in the README) packages the PyInstaller one-dir build
   into `dist/PDFToolkit-Setup-<version>.exe`: all-users install to

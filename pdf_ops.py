@@ -757,62 +757,6 @@ def pdf_to_word(input_path, output_path, on_progress=None, cancel=None):
     return PdfToWordResult(input_path, output_path, num_pages)
 
 
-def _extract_text_from_stream(raw_bytes):
-    """Legacy text extraction from PDF content stream bytes (fallback only)."""
-    text_parts = []
-    try:
-        data = raw_bytes.decode("latin-1")
-    except Exception:
-        return ""
-
-    i = 0
-    while i < len(data):
-        if data[i] == "(":
-            depth = 1
-            start = i + 1
-            i += 1
-            while i < len(data) and depth > 0:
-                if data[i] == "\\":
-                    i += 1
-                elif data[i] == "(":
-                    depth += 1
-                elif data[i] == ")":
-                    depth -= 1
-                i += 1
-            if depth == 0:
-                fragment = data[start:i - 1]
-                fragment = fragment.replace("\\n", "\n").replace("\\r", "\r")
-                fragment = fragment.replace("\\t", "\t")
-                fragment = fragment.replace("\\(", "(").replace("\\)", ")")
-                fragment = fragment.replace("\\\\", "\\")
-                text_parts.append(fragment)
-        else:
-            i += 1
-
-    return " ".join(text_parts)
-
-
-def _extract_text_pymupdf(input_path, page_indices=None):
-    """Extract text from PDF pages using PyMuPDF (high quality).
-
-    Returns a list of (page_number, text) tuples.
-    """
-    import fitz  # PyMuPDF
-
-    doc = fitz.open(input_path)
-    results = []
-    indices = page_indices if page_indices is not None else list(range(len(doc)))
-
-    for page_idx in indices:
-        if 0 <= page_idx < len(doc):
-            page = doc[page_idx]
-            text = page.get_text("text")
-            results.append((page_idx, text))
-
-    doc.close()
-    return results
-
-
 # ═══════════════════════════════════════════════════════════════════
 #  Watermark
 # ═══════════════════════════════════════════════════════════════════
@@ -1720,20 +1664,3 @@ def redact_pdf(
         redaction_count=hit_count,
         pages_affected=len(pages_touched),
     )
-
-
-def _page_text(page):
-    """Extract text from a single pikepdf page for comparison (legacy fallback)."""
-    try:
-        if "/Contents" not in page:
-            return ""
-        contents = page["/Contents"]
-        if isinstance(contents, pikepdf.Array):
-            raw = b""
-            for stream in contents:
-                raw += stream.read_bytes()
-        else:
-            raw = contents.read_bytes()
-        return _extract_text_from_stream(raw)
-    except Exception:
-        return ""

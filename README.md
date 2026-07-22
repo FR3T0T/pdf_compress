@@ -272,6 +272,7 @@ Text and vector graphics are never modified.
 | `pdf_ops.py` | PDF operations (merge, split, protect, watermark, etc.) |
 | `epdf_crypto.py` | Enhanced encryption engine (.epdf format — ChaCha20, AES-256, Camellia; header-authenticated v2) |
 | `pdf_analyze.py` | Offline privacy/security audit + sanitizer engine |
+| `pdf_verify.py` | Post-operation verification loop — independently re-checks redacted/sanitized output and reports proof of removal (Qt-free) |
 | `pdf_translate.py` | Offline translation + OCR engine (Argos + Tesseract) |
 | `translate_runtime.py` | On-demand provisioning of the translation ML runtime (frozen builds exclude torch & friends; this downloads pinned wheels into a user dir once) |
 | `translate_runtime_lock.json` | Pinned wheel manifest for that runtime (regenerate: `python translate_runtime.py --make-lockfile`) |
