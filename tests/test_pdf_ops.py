@@ -783,7 +783,7 @@ class TestImagesToPdf:
             xobj = pdf.pages[0]["/Resources"]["/XObject"]["/Img0"]
             assert str(xobj.get("/Filter")) == "/FlateDecode"
             decoded = pikepdf.PdfImage(xobj).as_pil_image()
-            assert list(decoded.getdata()) == list(img.getdata())
+            assert decoded.tobytes() == img.tobytes()
 
     def test_jpeg_source_still_jpeg_encoded(self, tmp_path):
         img = self._make_noisy_image()
