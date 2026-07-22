@@ -14,11 +14,41 @@ import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext
 import { workspaceOutputPath } from '../../workspace/workspaceOutputPath';
 import type { PickedFile } from '../../types/bridge';
 
+interface VerificationCheck {
+  id: string;
+  description: string;
+  passed: boolean;
+  evidence: string[];
+  pages: number[];
+  isDocumentLevel: boolean;
+}
+
+interface VerificationReport {
+  verified: boolean;
+  checks: VerificationCheck[];
+  flattenTargetPages: number[] | null;
+}
+
 interface RedactResult {
   input_path: string;
   output_path: string;
   redaction_count: number;
   pages_affected: number;
+  // #99: per-surface removal breakdown, the proof-of-removal report, and any
+  // pages the flatten fallback rasterized on this run.
+  surface_counts?: Record<string, number>;
+  verification?: VerificationReport;
+  flattened_pages?: number[];
+}
+
+/** Extra top-level fields the bridge attaches to a FAILED redaction payload
+ *  when verify_redaction refused the output (#99, RedactionVerificationError):
+ *  the report, the flatten-eligible pages (null when flatten can't help), and
+ *  whether the residual was document-level. */
+interface RedactFailure {
+  verification?: VerificationReport;
+  flattenablePages?: number[] | null;
+  documentLevel?: boolean;
 }
 
 interface PageImage {
@@ -179,7 +209,11 @@ export function RedactPage() {
 
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
-      const { redaction_count, pages_affected } = op.result.results;
+      const { redaction_count, pages_affected, verification } = op.result.results;
+      // #99: the operation only reaches 'done' when verify_redaction proved
+      // the output clean, so success always means verified.
+      const proof = verification?.verified ? ' Verified clean.' : '';
+      const msg = `Redaction complete: ${redaction_count} matches redacted across ${pages_affected} page(s).${proof}`;
       if (workspaceRunRef.current) {
         workspaceRunRef.current = false;
         // Advance the workspace with the path THIS page computed, not the one
@@ -189,13 +223,13 @@ export function RedactPage() {
         workspaceOutPathRef.current = null;
         if (trustedOut) {
           workspace.applyResult(trustedOut, `Redact (${mode})`);
-          toast.success(`Redaction complete: ${redaction_count} matches redacted across ${pages_affected} page(s).`);
+          toast.success(msg);
         } else {
           toast.error('Redaction succeeded but the working document could not be updated.');
         }
         return;
       }
-      toast.success(`Redaction complete: ${redaction_count} matches redacted across ${pages_affected} page(s).`);
+      toast.success(msg);
     } else if (op.status === 'error') {
       workspaceRunRef.current = false;
       workspaceOutPathRef.current = null;
@@ -242,8 +276,17 @@ export function RedactPage() {
     setConfirming(true);
   };
 
-  const confirmRedact = () => {
-    setConfirming(false);
+  // Builds the startRedact params for the current mode, optionally adding
+  // the D1 flatten retry pages (#99).
+  const buildParams = (path: string, out: string, flattenPages?: number[]) => ({
+    ...(mode === 'terms'
+      ? { file: path, output_path: out, search_terms: searchTerms, case_sensitive: caseSensitive }
+      : { file: path, output_path: out, rects: boxesToRects(boxes) }),
+    ...(flattenPages && flattenPages.length ? { flatten_pages: flattenPages } : {}),
+  });
+
+  // Single dispatch path used by both the confirm step and the flatten retry.
+  const startRun = (flattenPages?: number[]) => {
     if (!effectivePath) return;
 
     if (workspace.path) {
@@ -255,33 +298,28 @@ export function RedactPage() {
         const outPath = workspaceOutputPath(wsDir, wsPath, opIndex);
         // Stash the known-good path for the done handler (FE-03).
         workspaceOutPathRef.current = outPath;
-        bridgeApi.startRedact(
-          mode === 'terms'
-            ? { file: wsPath, output_path: outPath, search_terms: searchTerms, case_sensitive: caseSensitive }
-            : { file: wsPath, output_path: outPath, rects: boxesToRects(boxes) }
-        );
+        bridgeApi.startRedact(buildParams(wsPath, outPath, flattenPages));
       });
       return;
     }
 
     if (!outputPath) return;
-    op.run(() =>
-      bridgeApi.startRedact(
-        mode === 'terms'
-          ? {
-              file: effectivePath,
-              output_path: outputPath,
-              search_terms: searchTerms,
-              case_sensitive: caseSensitive,
-            }
-          : {
-              file: effectivePath,
-              output_path: outputPath,
-              rects: boxesToRects(boxes),
-            }
-      )
-    );
+    op.run(() => bridgeApi.startRedact(buildParams(effectivePath, outputPath, flattenPages)));
   };
+
+  const confirmRedact = () => {
+    setConfirming(false);
+    startRun();
+  };
+
+  // The fail-closed failure detail (#99): present only when verify_redaction
+  // refused the output. op.result carries the structured extras even on error.
+  const failure =
+    op.status === 'error' ? ((op.result as unknown as RedactFailure) ?? null) : null;
+  const flattenablePages =
+    failure?.flattenablePages && failure.flattenablePages.length
+      ? failure.flattenablePages
+      : null;
 
   const addBox = (box: Omit<RedactBox, 'id'>) => {
     setBoxes((prev) => [...prev, { ...box, id: crypto.randomUUID() }]);
@@ -486,8 +524,109 @@ export function RedactPage() {
               {r.redaction_count} matches redacted across {r.pages_affected} page(s)
             </div>
           )}
+          {r?.verification?.verified && (
+            <div
+              style={{
+                marginTop: 8,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                color: 'var(--sev-info)',
+                fontSize: 'var(--font-size-sm)',
+                fontWeight: 700,
+              }}
+            >
+              <span aria-hidden>✓</span>
+              <span>
+                Verified — every target term is confirmed unextractable from the output.
+                0 occurrences remain.
+                {r.flattened_pages && r.flattened_pages.length > 0
+                  ? ` Page(s) ${r.flattened_pages.join(', ')} were flattened to image to force removal.`
+                  : ''}
+              </span>
+            </div>
+          )}
         </div>
       )}
+
+      {failure?.verification && (
+        <VerificationFailurePanel
+          failure={failure}
+          flattenablePages={flattenablePages}
+          onFlatten={() => flattenablePages && startRun(flattenablePages)}
+          busy={op.status === 'running'}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Fail-closed redaction result (#99): verify_redaction refused the output
+ *  (it was deleted). Shows what survived and where, and — only when every
+ *  residual is page-content — offers the D1 flatten-to-image retry. A
+ *  document-level residual can't be flattened, so no offer is shown. */
+function VerificationFailurePanel({
+  failure,
+  flattenablePages,
+  onFlatten,
+  busy,
+}: {
+  failure: RedactFailure;
+  flattenablePages: number[] | null;
+  onFlatten: () => void;
+  busy: boolean;
+}) {
+  const failed = (failure.verification?.checks ?? []).filter((c) => !c.passed);
+  return (
+    <div style={{ marginTop: 'var(--space-4)' }}>
+      <Card>
+        <div style={{ borderLeft: '3px solid var(--sev-high)', paddingLeft: 'var(--space-3)' }}>
+          <strong style={{ fontSize: 'var(--font-size-sm)', color: 'var(--sev-high)' }}>
+            Redaction refused — the output could not be proven clean.
+          </strong>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)', marginTop: 4 }}>
+            Nothing was written. Sensitive content was still detectable after redaction, so the
+            file was discarded rather than saved with a leak.
+          </div>
+
+          {failed.length > 0 && (
+            <ul
+              style={{
+                margin: '10px 0 0',
+                paddingLeft: 18,
+                color: 'var(--text-2)',
+                fontSize: 'var(--font-size-xs)',
+              }}
+            >
+              {failed.flatMap((c) =>
+                (c.evidence.length ? c.evidence : [c.description]).map((e, i) => (
+                  <li key={`${c.id}-${i}`} style={{ marginBottom: 2 }}>
+                    {e}
+                  </li>
+                ))
+              )}
+            </ul>
+          )}
+
+          {flattenablePages ? (
+            <div style={{ marginTop: 'var(--space-3)' }}>
+              <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-xs)', marginBottom: 6 }}>
+                The remaining content is on the page itself. You can force its removal by flattening
+                page(s) {flattenablePages.join(', ')} to a plain image — this permanently rasterizes
+                those pages (their text becomes unselectable) and re-verifies.
+              </div>
+              <button onClick={onFlatten} disabled={busy} className="btn-primary">
+                {busy ? 'Working…' : `Force removal: flatten page(s) ${flattenablePages.join(', ')}`}
+              </button>
+            </div>
+          ) : (
+            <div style={{ marginTop: 'var(--space-3)', color: 'var(--text-3)', fontSize: 'var(--font-size-xs)' }}>
+              This residual is in document-level data (metadata, bookmarks, or attachments) that
+              flattening cannot fix. Please report this file — the scrubber should have removed it.
+            </div>
+          )}
+        </div>
+      </Card>
     </div>
   );
 }

@@ -589,7 +589,7 @@ def _scan_optional_content(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
 _TR3_RE = re.compile(rb"(?:^|[\s])3\s+Tr\b")
 
 
-def _page_content_blobs(doc, page) -> list:
+def page_content_blobs(doc, page) -> list:
     """Decoded bytes of every content stream on *page*, plus the streams of
     any form XObjects it references.
 
@@ -597,6 +597,11 @@ def _page_content_blobs(doc, page) -> list:
     incremental edits, or inside a form XObject — the old code read only
     ``page.get_contents()[0]`` and saw neither (ANL-03). Image XObjects are
     skipped (their streams are pixel data, not operators).
+
+    Public (used by pdf_verify's redaction verifier); a decoded stream that
+    is not readable is silently skipped here — callers that must fail closed
+    on an unreadable stream should compare the blob count to the returned
+    list length themselves (pdf_verify does).
     """
     blobs = []
     try:
@@ -635,7 +640,8 @@ def _scan_invisible_text(path: str, res: AnalysisResult) -> None:
         for page in doc:
             # Join streams with whitespace so a `3 Tr` at the start of a later
             # stream still sits on a token boundary for _TR3_RE.
-            content = b"\n".join(_page_content_blobs(doc, page))
+            content = b"\n".join(b for b in page_content_blobs(doc, page)
+                                 if isinstance(b, (bytes, bytearray)))
             if _TR3_RE.search(content):
                 pages_with_invisible += 1
         doc.close()

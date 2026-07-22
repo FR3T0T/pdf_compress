@@ -104,3 +104,33 @@ React build (`web-react/dist/`) and the `PDF_TOOLKIT_UI=legacy` escape hatch
 is gone; the PyInstaller spec bundles `web-react/dist/` instead of `web/`.
 Only the backend confirmation item above (`startCompress` output path)
 remains, and it lives in `ui/bridge.py`, not the frontend.
+
+## Post-migration bridge changes
+
+Changes to the Python↔JS contract made after the migration record above.
+
+### #99 — Redact is now fail-closed with a verification report (2026-07-22)
+
+Redaction verifies its own output and refuses to save a file it can't prove
+clean. This reshapes the `startRedact` contract on both ends:
+
+- **Success payload** (`RedactResult`) gains `surface_counts` (per-surface
+  removal breakdown), `verification` (the `verify_redaction` report:
+  `{verified, checks[], flattenTargetPages}`), and `flattened_pages`. The
+  React page shows a **"Verified — 0 occurrences remain"** proof line and, in
+  the toast, "Verified clean."
+- **Failure payload.** When `verify_redaction` refuses the output,
+  `ui/bridge.py`'s worker catches `RedactionVerificationError` and emits a
+  `success:false` `operationDone` carrying three **new top-level fields**:
+  `verification` (the report), `flattenablePages` (`number[] | null`), and
+  `documentLevel` (`bool`). The old contract sent only a `message` string,
+  which would have destroyed the page list the flatten offer needs.
+- **New request param.** `startRedact` accepts `flatten_pages` (1-based page
+  numbers) for the **D1 flatten-to-image retry** — sent only on the
+  user-confirmed second attempt after a page-content residual.
+- **`RedactPage.tsx`** renders the failure detail (what survived, per page)
+  and, only when every residual is page-content, a **"Force removal: flatten
+  page(s) N"** button that re-dispatches with `flatten_pages`. A
+  document-level residual shows no offer (flatten cannot fix it). Browser-dev
+  mock (`bridgeApi.ts`) returns a `verified:true` report so the page is
+  reviewable in `vite dev`.

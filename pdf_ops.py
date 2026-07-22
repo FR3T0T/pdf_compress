@@ -14,6 +14,8 @@ from typing import Callable
 import fitz  # PyMuPDF
 import pikepdf
 
+from pdf_verify import verify_redaction
+
 log = logging.getLogger(__name__)
 
 
@@ -1521,8 +1523,296 @@ def compare_pdfs(path_a, path_b):
 class RedactResult:
     input_path: str
     output_path: str
-    redaction_count: int
+    redaction_count: int          # page-content redactions (unchanged meaning)
     pages_affected: int
+    #: per-surface removal breakdown, e.g. {"page_content": 12, "docinfo": 1,
+    #: "bookmarks": 2}. page_content mirrors redaction_count; the rest are the
+    #: document-level scrubs apply_redactions never touches (#99).
+    surface_counts: dict = field(default_factory=dict)
+    #: verify_redaction(output).to_dict() — the proof-of-removal artifact.
+    verification: dict | None = None
+    #: pages rasterized by the flatten fallback on this run, if any (D1).
+    flattened_pages: list = field(default_factory=list)
+
+
+class RedactionVerificationError(Exception):
+    """Redaction saved an output that verify_redaction could not prove clean.
+
+    Raised instead of returning success (fail-closed, #99). Carries the
+    structured detail the UI needs to apply D1: the verification report, the
+    pages a flatten-to-image retry would target (``flatten_pages`` — None
+    when flatten is not offerable), and whether any residual is
+    document-level (``document_level`` — flatten physically cannot fix
+    those, so no offer). The output file has already been deleted.
+    """
+
+    def __init__(self, message: str, *, report: dict | None = None,
+                 flatten_pages: list | None = None,
+                 document_level: bool = False):
+        super().__init__(message)
+        self.report = report
+        self.flatten_pages = flatten_pages
+        self.document_level = document_level
+
+
+# Whole-value redaction marker (D2): a matched title/annotation value is
+# replaced wholesale, never spliced — a fragment like "'s Q3 Report" both
+# looks broken and leaks context.
+_REDACTED_MARKER = "[redacted]"
+
+
+def _make_term_matcher(terms: list[str], case_sensitive: bool):
+    """Return match(value) -> bool for whole-value (D2) surface scrubbing."""
+    if case_sensitive:
+        needles = [t for t in terms if t]
+        def match(value: str) -> bool:
+            return any(n in value for n in needles)
+    else:
+        folded = [t.casefold() for t in terms if t]
+        def match(value: str) -> bool:
+            v = value.casefold()
+            return any(n in v for n in folded)
+    return match
+
+
+def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
+                             password: str | None = None) -> dict[str, int]:
+    """Whole-value removal of *terms* from every non-page-content surface, in
+    place on *path* via pikepdf — the surfaces verify_redaction checks but
+    apply_redactions never touches (#99). Returns a surface->count dict.
+
+    D2: matched values are removed wholesale, never spliced. D3: docinfo and
+    XMP are stripped wholesale (not surgically RDF-edited) the moment any
+    term appears in them — losing metadata during redaction is expected.
+    Mirrors pdf_verify._pikepdf_scan's surface set so the scrub cleans
+    exactly where verification looks.
+    """
+    if not terms:
+        return {}
+    match = _make_term_matcher(terms, case_sensitive)
+    counts: dict[str, int] = {}
+
+    def bump(key: str, n: int = 1):
+        if n:
+            counts[key] = counts.get(key, 0) + n
+
+    kwargs = {"password": password} if password else {}
+    with pikepdf.open(path, allow_overwriting_input=True, **kwargs) as pdf:
+        # -- docinfo (D3 wholesale) ------------------------------------
+        try:
+            info = pdf.trailer.get("/Info")
+            if info is not None:
+                hit = sum(1 for k in info.keys()
+                          if match(str(info[k])))
+                if hit:
+                    del pdf.trailer["/Info"]
+                    bump("docinfo", hit)
+        except Exception:
+            pass
+
+        # -- XMP (D3 wholesale) ----------------------------------------
+        try:
+            with pdf.open_metadata(set_pikepdf_as_editor=False) as m:
+                xmp_text = str(m)
+                if xmp_text and match(xmp_text):
+                    m.clear()
+                    bump("xmp")
+        except Exception:
+            pass
+
+        # -- bookmarks / outline titles (D2 whole value) ---------------
+        try:
+            with pdf.open_outline() as outline:
+                bump("bookmarks", _scrub_outline_items(outline.root, match))
+        except Exception:
+            pass
+
+        # -- annotations + form values + links + embedded files --------
+        try:
+            bump_map = _scrub_objects(pdf, match)
+            for k, v in bump_map.items():
+                bump(k, v)
+        except Exception:
+            pass
+
+        out_dir = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=out_dir)
+        os.close(fd)
+        try:
+            pdf.save(tmp)
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    return counts
+
+
+def _scrub_outline_items(items, match, depth: int = 0) -> int:
+    """Recursively replace any outline title matching *match* with the whole-
+    value redaction marker (D2). Returns the number of titles replaced."""
+    if depth > 50:
+        return 0
+    n = 0
+    for it in items:
+        try:
+            if it.title and match(str(it.title)):
+                it.title = _REDACTED_MARKER
+                n += 1
+        except Exception:
+            pass
+        try:
+            n += _scrub_outline_items(it.children, match, depth + 1)
+        except Exception:
+            pass
+    return n
+
+
+def _scrub_objects(pdf, match) -> dict[str, int]:
+    """Whole-value scrub (D2) of annotation text (/Contents,/T,/Subj — all
+    subtypes) and link URIs via a page→/Annots walk (reaching the inline /A
+    action dicts pdf.objects never yields), plus form-field values (/V) and
+    embedded-file names via an object-graph walk (reaching inherited /V on
+    parent fields and name-tree filespecs). Mirrors what verify_redaction
+    reads on each surface."""
+    counts: dict[str, int] = {}
+
+    def bump(key: str, n: int = 1):
+        if n:
+            counts[key] = counts.get(key, 0) + n
+
+    # -- pages -> annotations: text keys + /A (link) actions -----------
+    try:
+        pages = pdf.pages
+    except Exception:
+        pages = []
+    for pg in pages:
+        try:
+            annots = pg.get("/Annots")
+        except Exception:
+            annots = None
+        if annots is None:
+            continue
+        for annot in annots:
+            try:
+                if not isinstance(annot, pikepdf.Dictionary):
+                    continue
+            except Exception:
+                continue
+            for key in ("/Contents", "/T", "/Subj"):
+                try:
+                    if key in annot and match(str(annot[key])):
+                        del annot[key]
+                        bump("annotations")
+                except Exception:
+                    pass
+            try:
+                if "/A" in annot:
+                    bump("links", _scrub_action_uri(annot["/A"], match))
+            except Exception:
+                pass
+
+    # -- object graph: form-field /V + embedded filespec names ---------
+    for obj in pdf.objects:
+        try:
+            if not isinstance(obj, pikepdf.Dictionary):
+                continue
+        except Exception:
+            continue
+        try:
+            if "/V" in obj and match(str(obj["/V"])):
+                obj["/V"] = pikepdf.String("")
+                if "/AP" in obj:
+                    del obj["/AP"]      # drop stale appearance stream
+                bump("form_fields")
+        except Exception:
+            pass
+    return counts
+
+
+def _scrub_action_uri(action, match, depth: int = 0) -> int:
+    """Remove a matched /URI (or /F) from an action dict, following /Next.
+    Returns the number of targets removed (D2 whole-value)."""
+    if depth > 32:
+        return 0
+    try:
+        if not isinstance(action, pikepdf.Dictionary):
+            return 0
+    except Exception:
+        return 0
+    n = 0
+    for key in ("/URI", "/F"):
+        try:
+            if key in action and match(str(action[key])):
+                del action[key]
+                n += 1
+        except Exception:
+            pass
+    try:
+        nxt = action.get("/Next")
+        if isinstance(nxt, pikepdf.Array):
+            for sub in nxt:
+                n += _scrub_action_uri(sub, match, depth + 1)
+        elif nxt is not None:
+            n += _scrub_action_uri(nxt, match, depth + 1)
+    except Exception:
+        pass
+    return n
+
+
+def _scrub_embedded_file_names(doc, terms: list[str], case_sensitive: bool) -> int:
+    """Delete embedded files whose name matches a term (D2 whole-value),
+    using PyMuPDF's embfile API — the exact names verify_redaction reads via
+    doc.embfile_names(). Returns the number removed. Runs on the open fitz
+    doc before save (fitz owns embedded-file structures cleanly)."""
+    if not terms:
+        return 0
+    match = _make_term_matcher(terms, case_sensitive)
+    removed = 0
+    try:
+        names = list(doc.embfile_names())
+    except Exception:
+        return 0
+    for name in names:
+        try:
+            if match(str(name)):
+                doc.embfile_del(name)
+                removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+def _flatten_pages_to_image(src_path: str, dst_path: str,
+                            page_indices: list[int], dpi: int = 150) -> None:
+    """Write *dst_path* as a copy of *src_path* with only *page_indices*
+    (0-based) rasterized to a full-page image (D1 flatten fallback).
+
+    Non-flagged pages are copied faithfully (insert_pdf preserves their text,
+    annotations, and links); flagged pages become a single image at *dpi*
+    (matching pdf_to_images), losing any extractable text layer while
+    keeping page size and orientation. Only the named pages are touched —
+    never the whole document. (Callers hold 1-based page numbers from the
+    verification report; convert before calling.)
+    """
+    flag = set(page_indices)
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    src = fitz.open(src_path)
+    out = fitz.open()
+    try:
+        for i in range(len(src)):
+            if i in flag:
+                p = src[i]
+                pix = p.get_pixmap(matrix=mat, alpha=False)
+                np_ = out.new_page(width=p.rect.width, height=p.rect.height)
+                np_.insert_image(np_.rect, pixmap=pix)
+            else:
+                out.insert_pdf(src, from_page=i, to_page=i)
+        out.save(dst_path, garbage=4, deflate=True, clean=True)
+    finally:
+        out.close()
+        src.close()
 
 
 def redact_pdf(
@@ -1534,10 +1824,11 @@ def redact_pdf(
     case_sensitive: bool = False,
     pages: list[int] | None = None,
     password: str | None = None,
+    flatten_pages: list[int] | None = None,   # 1-based page numbers (D1 retry)
     on_progress: Callable[[int, int], None] | None = None,
     cancel: threading.Event | None = None,
 ) -> RedactResult:
-    """Redact a PDF using PyMuPDF's real redaction API.
+    """Redact a PDF, then PROVE the targets are gone or refuse (fail-closed).
 
     True redaction: add_redact_annot()/apply_redactions() physically strips
     the text and image data under each area from the page content -- it
@@ -1556,11 +1847,29 @@ def redact_pdf(
         redaction UI (Part 2); unused by the current search-term-only
         frontend but wired through end-to-end.
 
-    Returns a RedactResult with redaction_count (total redacted areas
-    across the document) and pages_affected (count of pages with at least
-    one redaction) -- the same fields the UI already reads.
+    Beyond the page content apply_redactions() reaches, search_terms are also
+    scrubbed WHOLE-VALUE from every document-level surface verification checks
+    -- docinfo, XMP, bookmark titles, annotation text, form-field values,
+    link URIs, embedded-file names (#99) -- so a term surviving only in the
+    /Title (never on any page) is still removed and still counts as a hit.
+
+    After the atomic save, verify_redaction() re-opens the output and proves
+    every target is unextractable. If it cannot:
+      * every residual is page-content (text/annotation on a page) and the
+        caller passed flatten_pages covering them -> those pages are
+        rasterized to image and re-verified;
+      * otherwise the output is DELETED and RedactionVerificationError is
+        raised, carrying the report, the flatten-eligible pages (or None for
+        a document-level residual, which flatten cannot fix), and whether the
+        residual was document-level. Never returns success with a target
+        still findable; never leaves a half-verified file on disk (D1).
+
+    Returns a RedactResult with redaction_count (page-content redactions --
+    unchanged meaning), pages_affected, a per-surface surface_counts
+    breakdown, the verification report dict, and any flattened_pages.
     """
-    if not search_terms and not rects:
+    scrub_terms = [t for t in (search_terms or []) if t and t.strip()]
+    if not scrub_terms and not rects:
         raise ValueError("Provide search_terms and/or rects to redact.")
 
     doc = fitz.open(input_path)
@@ -1640,27 +1949,96 @@ def redact_pdf(
             hit_count += added
             pages_touched.add(pno)
 
-    if hit_count == 0:
-        doc.close()
-        raise ValueError("No matching content found to redact.")
+    # The page-content redaction is done; now widen the scrub and write the
+    # output atomically. Saved even when hit_count == 0 -- a term can live
+    # only in a document-level surface (e.g. the /Title), which still counts
+    # as something to remove (#99, §3).
+    out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    temps: list[str] = []
+    surface_counts: dict[str, int] = {}
+    flattened: list[int] = []
 
-    tmp_fd, tmp_path = tempfile.mkstemp(
-        suffix=".pdf", dir=os.path.dirname(os.path.abspath(output_path)) or "."
-    )
-    os.close(tmp_fd)
+    def _mktmp() -> str:
+        fd, t = tempfile.mkstemp(suffix=".pdf", dir=out_dir)
+        os.close(fd)
+        temps.append(t)
+        return t
+
+    def _cleanup_temps():
+        for t in temps:
+            if os.path.exists(t):
+                try: os.unlink(t)
+                except Exception: pass
+
     try:
-        doc.save(tmp_path, garbage=4, deflate=True, clean=True)
+        # Embedded files are scrubbed on the open fitz doc (its embfile API
+        # matches exactly what verify_redaction reads); every other
+        # document-level surface is scrubbed via pikepdf on the saved temp.
+        emb_hits = _scrub_embedded_file_names(doc, scrub_terms, case_sensitive)
+        work = _mktmp()
+        doc.save(work, garbage=4, deflate=True, clean=True)
         doc.close()
-        os.replace(tmp_path, output_path)
+
+        if hit_count:
+            surface_counts["page_content"] = hit_count
+        if emb_hits:
+            surface_counts["embedded_files"] = emb_hits
+        # The temp is fitz-saved from the authenticated doc — always
+        # plaintext, so the scrub (and verify below) need no password.
+        doc_scrub = _scrub_document_surfaces(work, scrub_terms, case_sensitive)
+        for k, v in doc_scrub.items():
+            surface_counts[k] = surface_counts.get(k, 0) + v
+
+        if hit_count == 0 and emb_hits == 0 and sum(doc_scrub.values()) == 0:
+            raise ValueError("No matching content found to redact.")
+
+        final_src = work
+        if flatten_pages:
+            flat = _mktmp()
+            # flatten_pages are 1-based (as the verification report and UI
+            # count pages); _flatten_pages_to_image takes 0-based indices.
+            _flatten_pages_to_image(work, flat, [int(p) - 1 for p in flatten_pages])
+            final_src = flat
+            flattened = sorted(set(int(p) for p in flatten_pages))
+
+        os.replace(final_src, output_path)
     except Exception:
-        doc.close()
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        try: doc.close()
+        except Exception: pass
         raise
+    finally:
+        _cleanup_temps()
+
+    # Fail-closed verification (#99): prove every target is gone or refuse.
+    report = verify_redaction(
+        output_path,
+        terms=scrub_terms or None,
+        rects=rects,
+        case_sensitive=case_sensitive,
+        input_path=input_path,
+    )
+    if not report.verified:
+        try: os.unlink(output_path)
+        except Exception: pass
+        doc_level = any(c.is_document_level for c in report.failed_checks())
+        # D1: offer flatten only on the first attempt (flatten_pages is None)
+        # and only for a purely page-content residual. Once we've already
+        # flattened, there is no further fallback.
+        offer = None if flatten_pages else report.flatten_target_pages()
+        raise RedactionVerificationError(
+            "Redaction could not be verified: sensitive content is still "
+            "present in the output.",
+            report=report.to_dict(),
+            flatten_pages=offer,
+            document_level=doc_level,
+        )
 
     return RedactResult(
         input_path=input_path,
         output_path=output_path,
         redaction_count=hit_count,
         pages_affected=len(pages_touched),
+        surface_counts=surface_counts,
+        verification=report.to_dict(),
+        flattened_pages=flattened,
     )

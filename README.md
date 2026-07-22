@@ -120,7 +120,7 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 ### Security
 - **Protect PDF** — add password and set permissions (AES-256)
 - **Unlock PDF** — remove password protection
-- **Redact PDF** — permanently remove sensitive text via search terms or a visual box-drawing mode; true content destruction (including form-field values), not a cosmetic overlay
+- **Redact PDF** — permanently remove sensitive text via search terms or a visual box-drawing mode; true content destruction (including form-field values, metadata, bookmarks, annotations, link URLs, and attachment names), not a cosmetic overlay. **Fail-closed:** every redaction is re-verified against the saved output and *refused* if any target is still extractable — a page-content leak can be force-removed by flattening the affected page(s) to image; nothing is ever saved with a residual
 - **Enhanced encryption** — custom `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 and Argon2id key derivation
 
 ### Page Operations

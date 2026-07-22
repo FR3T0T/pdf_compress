@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -51,7 +52,7 @@ from typing import Optional
 import fitz  # PyMuPDF
 import pikepdf
 
-from pdf_analyze import DEFAULT_SANITIZE, _page_content_blobs, analyze_document
+from pdf_analyze import DEFAULT_SANITIZE, analyze_document, page_content_blobs
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +61,14 @@ log = logging.getLogger(__name__)
 #  Result types
 # ════════════════════════════════════════════════════════════════════
 
+#: Extracts the page number from a page-attributed evidence line. Only
+#: matches the "on page N" form the module's own surface checks emit; the
+#: bookmark surface's "targeting page N (document-level)" is deliberately
+#: NOT this form, so a document-level residual never looks page-attributed
+#: (which would wrongly make it flatten-eligible under D1).
+_ON_PAGE_RE = re.compile(r"\bon page (\d+)\b")
+
+
 @dataclass
 class VerificationCheck:
     """One asserted expectation about the output file."""
@@ -67,6 +76,34 @@ class VerificationCheck:
     description: str
     passed: bool
     evidence: list[str] = field(default_factory=list)  # each line names surface + page
+    #: Explicit page numbers (1-based) this check failed on, derived from
+    #: the page-attributed evidence lines. Empty for a passing check or a
+    #: purely document-level residual. Structured so callers (the #99
+    #: fail-closed flatten targeting) never parse evidence strings.
+    pages: list[int] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.pages:
+            self.pages = self._derive_pages(self.evidence)
+
+    @staticmethod
+    def _derive_pages(evidence: list[str]) -> list[int]:
+        pages: list[int] = []
+        for line in evidence:
+            if "(document-level)" in line:
+                continue          # doc-level residual — no page, no flatten
+            m = _ON_PAGE_RE.search(line)
+            if m:
+                p = int(m.group(1))
+                if p not in pages:
+                    pages.append(p)
+        return sorted(pages)
+
+    @property
+    def is_document_level(self) -> bool:
+        """True if any failure evidence is a document-level residual — the
+        D1 signal that flatten-to-image cannot fix this check."""
+        return any("(document-level)" in e for e in self.evidence)
 
 
 @dataclass
@@ -87,6 +124,32 @@ class VerificationReport:
         """
         return bool(self.checks) and all(c.passed for c in self.checks)
 
+    def failed_checks(self) -> list[VerificationCheck]:
+        return [c for c in self.checks if not c.passed]
+
+    def flatten_target_pages(self) -> Optional[list[int]]:
+        """The pages a flatten-to-image retry should rasterize, or None when
+        flatten is not offerable (D1).
+
+        Returns None if there are no failures, or if ANY failed check is
+        document-level (docinfo/XMP/bookmark/embedded-name/orphan-/V or an
+        unreadable-surface gate) — flatten physically cannot fix those, so
+        the caller must hard-raise instead of offering it. Otherwise every
+        failure is page-attributed and the union of their pages is the
+        rasterization target.
+        """
+        failed = self.failed_checks()
+        if not failed:
+            return None
+        if any(c.is_document_level for c in failed):
+            return None
+        pages: set[int] = set()
+        for c in failed:
+            if not c.pages:
+                return None       # a page-content failure we can't localize
+            pages.update(c.pages)
+        return sorted(pages)
+
     def to_dict(self) -> dict:
         """JSON-ready dict, camelCase keys — mirrors AnalysisResult.to_dict()."""
         return {
@@ -96,11 +159,14 @@ class VerificationReport:
             "timestamp": self.timestamp,
             "checks": [
                 {"id": c.id, "description": c.description,
-                 "passed": c.passed, "evidence": list(c.evidence)}
+                 "passed": c.passed, "evidence": list(c.evidence),
+                 "pages": list(c.pages),
+                 "isDocumentLevel": c.is_document_level}
                 for c in self.checks
             ],
             "residualFindings": self.residual_findings,
             "verified": self.verified,
+            "flattenTargetPages": self.flatten_target_pages(),
         }
 
 
@@ -308,7 +374,7 @@ def _term_surface_checks(doc, output_path: str, terms: list[str],
             text = ""
             page_text_ev.append(f"page text on page {pno} could not be read "
                                 f"for verification: {exc}")
-        blobs = _page_content_blobs(doc, page)
+        blobs = page_content_blobs(doc, page)
         good = [bytes(b) for b in blobs if isinstance(b, (bytes, bytearray))]
         if len(good) != len(blobs):
             # xref_stream() returns None (no exception) for a non-stream

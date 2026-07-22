@@ -53,6 +53,7 @@ from epdf_crypto import (
 )
 from pdf_analyze import DEFAULT_SANITIZE, analyze_file, strip_file
 from pdf_ops import (
+    RedactionVerificationError,
     add_page_numbers,
     add_watermark,
     apply_page_operations,
@@ -112,6 +113,18 @@ class _Worker(QThread):
             result = self._func(*self._args, **self._kwargs)
             self.finished.emit(json.dumps(
                 _done_payload(self.tool_key, True, result=result),
+                ensure_ascii=False,
+            ))
+        except RedactionVerificationError as exc:
+            # Fail-closed redaction (#99): the output was refused and deleted.
+            # Carry the structured proof-of-removal detail so the UI can show
+            # what survived and, when eligible, offer the flatten retry (D1).
+            self.finished.emit(json.dumps(
+                _done_payload(self.tool_key, False, message=str(exc), extra={
+                    "verification": exc.report,
+                    "flattenablePages": exc.flatten_pages,
+                    "documentLevel": exc.document_level,
+                }),
                 ensure_ascii=False,
             ))
         except (CancelledError, InterruptedError):
@@ -212,13 +225,21 @@ def _done_payload(
     *,
     message: str = "",
     result: Any = None,
+    extra: dict | None = None,
 ) -> dict:
-    """Build the JSON payload for operationDone."""
+    """Build the JSON payload for operationDone.
+
+    *extra* merges additional top-level keys into the payload — used by the
+    fail-closed redaction path to carry its structured verification report
+    and flatten eligibility alongside the error message (#99).
+    """
     payload: dict[str, Any] = {
         "toolKey": tool_key,
         "success": success,
         "message": message,
     }
+    if extra:
+        payload.update(extra)
     if result is not None:
         serialized = _serialize(result)
         # For compress results, add human-readable sizes
@@ -1721,6 +1742,9 @@ class Bridge(QObject):
                 case_sensitive=p.get("caseSensitive", False),
                 pages=p.get("pages"),
                 password=p.get("password"),
+                # 1-based page numbers for the D1 flatten-to-image retry
+                # (#99): sent only on the user-confirmed second attempt.
+                flatten_pages=p.get("flattenPages"),
                 on_progress=progress_cb,
                 cancel=cancel,
             )

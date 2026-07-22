@@ -622,11 +622,16 @@ export const bridgeApi = {
     else {
       const outputPath = String(params.output_path ?? params.outputPath ?? '');
       const termCount = Array.isArray(params.search_terms) ? params.search_terms.length : 1;
+      const flattened = Array.isArray(params.flatten_pages) ? (params.flatten_pages as number[]) : [];
       simulateOperation(TOOL_KEYS.redact, mockFilesFromParams(params), () => ({
         input_path: String(params.file ?? ''),
         output_path: outputPath,
         redaction_count: termCount * 3,
         pages_affected: Math.min(termCount * 2, 5),
+        surface_counts: { page_content: termCount * 3 },
+        // Browser-dev mock always "verifies" (no real backend to refuse).
+        verification: { verified: true, checks: [], flattenTargetPages: null },
+        flattened_pages: flattened,
       }));
     }
   },

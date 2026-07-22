@@ -349,11 +349,14 @@ class TestVerifyRedactionOutcomes:
         src = _clean_pdf(tmp_path / "d.pdf")
         d = verify_redaction(src, [TERM], input_path="in.pdf").to_dict()
         assert set(d) == {"inputPath", "outputPath", "tool", "timestamp",
-                          "checks", "residualFindings", "verified"}
+                          "checks", "residualFindings", "verified",
+                          "flattenTargetPages"}
         assert d["tool"] == "redaction"
         assert d["inputPath"] == "in.pdf"
         assert d["verified"] is True
-        assert all(set(c) == {"id", "description", "passed", "evidence"}
+        assert d["flattenTargetPages"] is None       # nothing failed
+        assert all(set(c) == {"id", "description", "passed", "evidence",
+                              "pages", "isDocumentLevel"}
                    for c in d["checks"])
 
 
@@ -498,6 +501,56 @@ class TestVerifyRedactionFailClosed:
         assert c.passed is False
         assert any(TERM in e for e in c.evidence)
         assert not any("ABSENTQZ99" in e for e in c.evidence)
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestFlattenTargeting:
+    """D1: page-content residual → flatten offered on the right pages;
+    any document-level residual → flatten not offerable."""
+
+    def test_page_content_residual_targets_its_pages(self, tmp_path):
+        p = str(tmp_path / "multi.pdf")
+        doc = fitz.open()
+        doc.new_page()                                   # page 1: clean
+        doc.new_page().insert_text((72, 72), TERM)       # page 2: leak
+        doc.new_page()                                   # page 3: clean
+        doc.save(p)
+        doc.close()
+
+        report = verify_redaction(p, [TERM])
+        assert report.flatten_target_pages() == [2]
+        c = _check(report, "redaction.page_text")
+        assert c.pages == [2] and c.is_document_level is False
+
+    def test_document_level_residual_blocks_flatten(self, tmp_path):
+        p = str(tmp_path / "toc.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), TERM)       # page-content leak…
+        doc.set_toc([[1, f"Chapter {TERM}", 1]])         # …plus a doc-level one
+        doc.save(p)
+        doc.close()
+
+        report = verify_redaction(p, [TERM])
+        # A document-level residual is present → no flatten offer at all.
+        assert report.flatten_target_pages() is None
+        assert _check(report, "redaction.bookmarks").is_document_level is True
+
+    def test_bookmark_targeting_page_is_not_flattenable(self, tmp_path):
+        # Guard the parsing subtlety: bookmark evidence reads
+        # "targeting page N (document-level)" — the page number there must
+        # NOT make the check look page-attributed/flattenable.
+        p = str(tmp_path / "b.pdf")
+        doc = fitz.open()
+        doc.new_page()
+        doc.set_toc([[1, f"Chapter {TERM}", 1]])
+        doc.save(p)
+        doc.close()
+
+        report = verify_redaction(p, [TERM])
+        c = _check(report, "redaction.bookmarks")
+        assert c.pages == []
+        assert report.flatten_target_pages() is None
 
 
 # ── verify_sanitization ──────────────────────────────────────────────────
