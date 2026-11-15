@@ -120,7 +120,7 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 ### Security
 - **Protect PDF** — add password and set permissions (AES-256)
 - **Unlock PDF** — remove password protection
-- **Redact PDF** — permanently remove sensitive text via search terms or a visual box-drawing mode; true content destruction (including form-field values, metadata, bookmarks, annotations, link URLs, and attachment names), not a cosmetic overlay. **Fail-closed:** every redaction is re-verified against the saved output and *refused* if any target is still extractable — a page-content leak can be force-removed by flattening the affected page(s) to image; nothing is ever saved with a residual
+- **Redact PDF** — permanently remove sensitive text via search terms or a visual box-drawing mode; true content destruction (including form-field values, metadata, bookmarks, annotations, link URLs, and attachment names), not a cosmetic overlay. **Fail-closed:** every redaction is verified *before* it is saved and *refused* if any target is still extractable — a page-content leak can be force-removed by flattening the affected page(s) to image; nothing is ever saved with a residual, and a refused run leaves the destination untouched (including the original, when redacting in place). The output gets a new content-derived file identifier, so it cannot be matched to its source through the PDF `/ID`
 - **Enhanced encryption** — custom `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 and Argon2id key derivation
 
 ### Page Operations
@@ -253,6 +253,8 @@ Text and vector graphics are never modified.
 - **Enhanced encryption** — `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 ciphers; Argon2id key derivation; AEAD authentication. The `.epdf` header (cipher, KDF parameters, salt, nonce) is bound as Associated Data, so tampering or downgrade attacks on the header are detected on decrypt (format v2; v1 files still readable)
 - **Encrypted PDF handling** — password-protected files prompt for credentials; passwords are cleared from memory after use
 - **Atomic file I/O** — temp file + `os.replace()`; original file is never corrupted on failure
+- **Verify, then commit (Redact)** — the redacted candidate is written to a temp file beside the destination, verified there, and renamed into place only if verification passes. A refused redaction never creates, replaces, or deletes the destination
+- **No identifier carry-over (Redact)** — PDF libraries preserve the trailer `/ID` across saves so revisions of a document can be recognised; for a redacted copy that is a link back to the original. Redact drops it and writes a new one derived from the output's own content as its last step, and verification refuses an output that still shares an identifier with its source. The verification report records the SHA-256 of both files
 - **Backup system** — optional `.backup` copy with rotation before overwriting originals
 - **Thread-safe cancellation** — cancel at any point without leaving partial output files
 - **Diagnostic logging** — rotating file logs (5 MB, 3 backups) to platform-appropriate directories

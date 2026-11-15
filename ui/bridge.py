@@ -116,7 +116,8 @@ class _Worker(QThread):
                 ensure_ascii=False,
             ))
         except RedactionVerificationError as exc:
-            # Fail-closed redaction (#99): the output was refused and deleted.
+            # Fail-closed redaction (#99): the candidate was refused before it
+            # reached the destination, so nothing was written there.
             # Carry the structured proof-of-removal detail so the UI can show
             # what survived and, when eligible, offer the flatten retry (D1).
             self.finished.emit(json.dumps(

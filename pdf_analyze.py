@@ -28,6 +28,7 @@ imported lazily inside the functions that need them.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
@@ -1151,6 +1152,74 @@ def analyze_file(path: str, password: Optional[str] = None) -> dict:
     if head.startswith(_JPEG_MAGIC) or head.startswith(_PNG_MAGIC):
         return analyze_image(path)
     raise ValueError("Unsupported file type (expected PDF, JPEG, or PNG)")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  File identity — shared by the transforms and their verifier
+# ════════════════════════════════════════════════════════════════════
+#
+#  The trailer /ID exists so that revisions of one document can be recognised
+#  as the same document, and both qpdf and MuPDF honour that: /ID[0] is
+#  carried from input to output. For a sanitized or redacted copy that is a
+#  link back to the original -- two files sharing an /ID element are the same
+#  lineage, whatever else was removed. These helpers live here, at the bottom
+#  of the import graph (pdf_ops -> pdf_verify -> pdf_analyze), so the code
+#  that writes an identifier and the code that checks it read it one way.
+
+def id_elements(tid) -> list[str]:
+    """The elements of a trailer /ID value as lowercase hex ([] for None).
+
+    A well-formed /ID is an array of two byte strings, but whatever a file
+    has there is carried along by the libraries all the same, so every shape
+    is read and none is rejected: a value that is not an array is one
+    element (MuPDF carries a bare string through a save untouched), and an
+    element that is not a string is taken by its PDF serialization, so it
+    still compares equal to a copy of itself.
+    """
+    if tid is None:
+        return []
+    return [_id_element(x) for x in (tid if isinstance(tid, pikepdf.Array) else [tid])]
+
+
+def _id_element(x) -> str:
+    if isinstance(x, pikepdf.String):
+        return bytes(x).hex()
+    try:
+        # pikepdf hands numbers and booleans back as plain Python values.
+        raw = x.unparse(resolved=True) if isinstance(x, pikepdf.Object) else str(x).encode()
+    except Exception:
+        raw = repr(x).encode()
+    return raw.hex()
+
+
+def trailer_ids(pdf: pikepdf.Pdf) -> list[str]:
+    """Each element of *pdf*'s trailer /ID as lowercase hex ([] if none)."""
+    return id_elements(pdf.trailer.get("/ID"))
+
+
+def file_sha256(path: str) -> str:
+    """Hex SHA-256 of the file's bytes."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def save_with_content_id(pdf: pikepdf.Pdf, path: str, **save_kwargs) -> None:
+    """Save *pdf* to *path* with an identifier that owes nothing to its source.
+
+    This must be the LAST write of an output: anything saved afterwards by
+    another library puts its own /ID back. The trailer /ID is dropped first
+    because qpdf keeps an existing /ID[0] even when asked for a deterministic
+    one; deleting it alone is not enough either, since qpdf would then mint
+    one from the clock and the same input would never produce the same file
+    twice. With both, the two elements are a digest of the output's own
+    content. *save_kwargs* pass through to ``Pdf.save``.
+    """
+    if "/ID" in pdf.trailer:
+        del pdf.trailer["/ID"]
+    pdf.save(path, deterministic_id=True, **save_kwargs)
 
 
 # ════════════════════════════════════════════════════════════════════

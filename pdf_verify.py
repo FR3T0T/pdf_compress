@@ -2,10 +2,13 @@
 pdf_verify — Post-operation verification: prove removal instead of trusting it.
 
 The verification loop behind the toolkit's "provable sanitization" promise.
-After a destructive transform (``redact_pdf``, ``sanitize_pdf``) saves its
+After a destructive transform (``redact_pdf``, ``sanitize_pdf``) writes its
 output, these functions re-open the OUTPUT file and independently confirm
 the targeted content is actually gone, emitting a structured
-:class:`VerificationReport` rather than trusting the transform library:
+:class:`VerificationReport` rather than trusting the transform library.
+``redact_pdf`` verifies before it commits: the file it hands over is a temp
+candidate beside the destination, renamed into place only if it passes
+(:meth:`VerificationReport.retarget` then names the real destination):
 
   - :func:`verify_redaction` — searches every extractable surface of the
     output (page text, raw content streams, annotations, form-field values,
@@ -15,7 +18,10 @@ the targeted content is actually gone, emitting a structured
     possible: PyMuPDF (the renderer's view) plus a pikepdf pass over the raw
     object graph (all /Info keys, every /V field value, every annotation's
     /Contents//T//Subj — including annotation subtypes PyMuPDF skips), so a
-    leak invisible to one library is still caught by the other.
+    leak invisible to one library is still caught by the other. When the
+    caller supplies the source's trailer /ID elements it also asserts the
+    output carries none of them (``redaction.file_id``): a cleaned copy that
+    keeps its source's identifier is still linkable to it.
   - :func:`verify_sanitization` — re-runs the ``pdf_analyze`` audit on the
     output and asserts absent exactly the finding categories the enabled
     sanitize options promised to remove (expectations-based — anything else
@@ -52,7 +58,13 @@ from typing import Optional
 import fitz  # PyMuPDF
 import pikepdf
 
-from pdf_analyze import DEFAULT_SANITIZE, analyze_document, page_content_blobs
+from pdf_analyze import (
+    DEFAULT_SANITIZE,
+    analyze_document,
+    file_sha256,
+    page_content_blobs,
+    trailer_ids,
+)
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +126,11 @@ class VerificationReport:
     timestamp: str         # ISO 8601
     checks: list[VerificationCheck] = field(default_factory=list)
     residual_findings: list[dict] = field(default_factory=list)
+    #: SHA-256 of the source file, as supplied by the caller (None when the
+    #: caller supplied none — the verifier never opens the input to find out).
+    source_sha256: Optional[str] = None
+    #: SHA-256 of the file the checks ran on (None if it could not be read).
+    output_sha256: Optional[str] = None
 
     @property
     def verified(self) -> bool:
@@ -150,6 +167,22 @@ class VerificationReport:
             pages.update(c.pages)
         return sorted(pages)
 
+    def retarget(self, real_path: str) -> None:
+        """Name *real_path* as the output instead of the temp the checks ran on.
+
+        Verify-then-commit verifies a candidate beside the destination and
+        renames it into place only if it passed, so the path this report was
+        built with is a temp that is gone either way. Evidence text is
+        rewritten too — library error messages quote the path they were
+        given. Only the basename is swapped: the candidate sits in the
+        destination's own directory, so that covers every spelling of it.
+        """
+        old, new = os.path.basename(self.output_path), os.path.basename(real_path)
+        if old and old != new:
+            for c in self.checks:
+                c.evidence = [e.replace(old, new) for e in c.evidence]
+        self.output_path = real_path
+
     def to_dict(self) -> dict:
         """JSON-ready dict, camelCase keys — mirrors AnalysisResult.to_dict()."""
         return {
@@ -167,6 +200,8 @@ class VerificationReport:
             "residualFindings": self.residual_findings,
             "verified": self.verified,
             "flattenTargetPages": self.flatten_target_pages(),
+            "sourceSha256": self.source_sha256,
+            "outputSha256": self.output_sha256,
         }
 
 
@@ -181,6 +216,49 @@ def _dedupe(seq: list[str]) -> list[str]:
             seen.add(s)
             out.append(s)
     return out
+
+
+def _output_sha256(path: str) -> Optional[str]:
+    try:
+        return file_sha256(path)
+    except OSError:
+        return None
+
+
+def _file_id_check(cid: str, output_path: str, source_ids,
+                   source_sha256: Optional[str], output_sha256: Optional[str],
+                   password: Optional[str] = None) -> VerificationCheck:
+    """The output must not carry any of its source's trailer /ID elements.
+
+    A shared element links the cleaned copy back to the original no matter
+    what else was removed. *source_ids* are hex strings the CALLER captured
+    while it had the input open: the verifier is handed values, never a path
+    to read, so it needs neither the input nor the input's password and has
+    no "input could not be read" case.
+
+    One exemption: an output whose SHA-256 equals the source's IS the source
+    (cleaning an already-clean file changes no byte), not a second file that
+    can be linked to it.
+
+    Always document-level — a trailer entry is on no page, so flatten is
+    never offered for this failure (D1).
+    """
+    desc = "Output does not carry the source file's identifier (/ID)"
+    kwargs = {"password": password} if password else {}
+    try:
+        with pikepdf.open(output_path, **kwargs) as pdf:
+            out_ids = trailer_ids(pdf)
+    except Exception as exc:
+        return VerificationCheck(id=cid, description=desc, passed=False, evidence=[
+            f"the output's file identifier could not be read for "
+            f"verification: {exc} (document-level)"])
+    ev: list[str] = []
+    if not (source_sha256 and output_sha256 == source_sha256):
+        src = {str(s).lower() for s in source_ids if s}
+        ev = [f"the output's trailer /ID still carries the source file's "
+              f"identifier {i}, which links it to the original (document-level)"
+              for i in _dedupe(out_ids) if i and i in src]
+    return VerificationCheck(id=cid, description=desc, passed=not ev, evidence=ev)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -571,7 +649,9 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                      rects: Optional[list[dict]] = None,
                      case_sensitive: bool = False,
                      password: Optional[str] = None,
-                     input_path: str = "") -> VerificationReport:
+                     input_path: str = "",
+                     source_ids: Optional[list[str]] = None,
+                     source_sha256: Optional[str] = None) -> VerificationReport:
     """Independently confirm a redacted output no longer carries its targets.
 
     Mirrors redact_pdf's selection model: *terms* (search-term redactions)
@@ -580,6 +660,13 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
     verifies via clipped extraction so rect-only redactions aren't a blind
     spot. *input_path* is carried into the report verbatim for the caller
     (#99) — verification itself never reads the input file.
+
+    *source_ids* (the source's trailer /ID elements, hex) and
+    *source_sha256* are plain values the caller captured while it had the
+    input open. When *source_ids* is given — an empty list means "the source
+    had no /ID", None means "not supplied" — a ``redaction.file_id`` check
+    asserts the output shares none of them (see :func:`_file_id_check`).
+    Both hashes are recorded on the report.
 
     Never returns a false pass: an output that cannot be opened or
     decrypted yields a report with a failed ``redaction.readable`` check
@@ -591,10 +678,12 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
         raise ValueError("Provide terms and/or rects to verify.")
 
     report = VerificationReport(input_path=input_path, output_path=output_path,
-                                tool="redaction", timestamp=_now_iso())
+                                tool="redaction", timestamp=_now_iso(),
+                                source_sha256=source_sha256)
 
     if not os.path.isfile(output_path):
         raise FileNotFoundError(output_path)
+    report.output_sha256 = _output_sha256(output_path)
 
     readable = VerificationCheck(
         id="redaction.readable",
@@ -623,6 +712,10 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
             report.checks.append(_rect_region_check(doc, rects))
     finally:
         doc.close()
+    if source_ids is not None:
+        report.checks.append(_file_id_check(
+            "redaction.file_id", output_path, source_ids, source_sha256,
+            report.output_sha256, password))
     return report
 
 

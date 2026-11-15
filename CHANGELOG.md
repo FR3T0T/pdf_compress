@@ -35,6 +35,17 @@
   save-failure) and `tests/test_pdf_verify.py` (D1 flatten targeting).
 
 ### Changed
+- **Search-term redaction no longer rewrites metadata it was not asked to
+  remove (#101).** A consequence of the XMP scrub fix below. Inspecting the
+  XMP used to enter pikepdf's metadata editing context, which wrote an empty
+  XMP packet into files that had none and re-synchronised docinfo from XMP —
+  on a file without XMP that deleted `/Title`, `/Author` and the other
+  standard `/Info` keys even though no term appeared in them (box-only
+  redaction never did this). Docinfo and XMP are now removed only when a
+  term appears in them, as documented, and are otherwise left exactly as
+  found. **If you relied on search-term redaction stripping author/title
+  metadata as a side effect, it no longer does** — use Sanitize's metadata
+  option or the Metadata tool.
 - **`pdf_analyze._page_content_blobs` promoted to public
   `page_content_blobs`.** It is now part of the module's public surface
   (consumed by `pdf_verify`'s redaction verifier); behaviour is unchanged and
@@ -80,6 +91,53 @@
   code with no remaining callers.
 
 ### Fixed
+- **A refused redaction no longer destroys the destination (#116).**
+  `redact_pdf` renamed its output onto `output_path`, verified it there, and
+  deleted it on refusal. Redacting in place (`output_path == input_path`) and
+  being refused therefore deleted the user's only copy, and a refusal with a
+  separate destination destroyed whatever file was already at that path. It
+  now verifies, then commits: the candidate is written to a temp file in the
+  destination's directory, verified there, and `os.replace`d onto the
+  destination only if verification passes. A refused run never creates,
+  replaces, or deletes `output_path`. The report names the real destination,
+  never the temp (`VerificationReport.retarget`, which also rewrites the temp
+  name in evidence text). The flatten offer (D1) is unchanged. Tests:
+  `TestRedactVerifyThenCommit` in `tests/test_pdf_ops.py`, `TestReportRetarget`
+  in `tests/test_pdf_verify.py`.
+- **Redacted output no longer carries its source's file identifier (#117).**
+  PyMuPDF and qpdf both preserve the trailer `/ID[0]` across a save, so a
+  redacted copy could be matched to its original by identifier on the
+  search-term and box-only paths (for an encrypted source, both elements
+  survived). Every path — search terms, boxes only, flatten — now ends with
+  one shared write, `pdf_analyze.save_with_content_id`, which drops the
+  trailer `/ID` and has qpdf derive a new one from the output's own content
+  (`deterministic_id`; available at the existing `pikepdf>=8.0.0` floor).
+  Deleting `/ID` alone would not do: qpdf then mints one from the clock. New
+  `redaction.file_id` check: `redact_pdf` captures the source's `/ID`
+  elements and SHA-256 while it has the input open and hands them to
+  `verify_redaction` as plain values (`source_ids`, `source_sha256`) — the
+  verifier still never opens the input and never needs its password. An
+  output sharing any element with its source is refused as a document-level
+  failure (so flatten is never offered for it), unless it is byte-identical
+  to the source. Every shape of `/ID` is captured and none is refused: a
+  bare string instead of an array (which MuPDF carries through a save as it
+  is) counts as one element, and an element that is not a string is compared
+  by its PDF serialization (`pdf_analyze.id_elements`, used on both sides).
+  The report's `to_dict()` gains `sourceSha256` and
+  `outputSha256`. Sanitize gets the same treatment with #101. Tests:
+  `TestRedactFileId` and `TestSourceFileIds` in `tests/test_pdf_ops.py`,
+  `TestRedactionFileId` in `tests/test_pdf_verify.py`.
+- **The redaction scrub deletes a matching XMP packet instead of clearing and
+  re-saving it (#101).** The scrub cleared pikepdf's parsed view of the
+  packet and let pikepdf write it back. pikepdf's recovering parser accepts
+  malformed XML it cannot then edit, so for a malformed packet the recovered
+  tree was re-emitted with the term still in it and the redaction ended in a
+  refusal; for a packet that is not XML at all the parsed view was empty, and
+  a term living only there was reported as "No matching content found". The
+  scrub now reads the stream itself (as UTF-8, as UTF-16, and through
+  pikepdf's parsed view — all read-only) and deletes the `/Metadata` stream
+  outright on a match. Tests: `TestRedactXmpRemoval` in
+  `tests/test_pdf_ops.py`.
 - **Pillow 14 deprecation in the test suite.** The images-to-PDF lossless
   round-trip test compared pixels via `Image.getdata()` (removed in
   Pillow 14, 2027); it now compares `tobytes()` — equivalent and faster.

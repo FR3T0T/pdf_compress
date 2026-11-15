@@ -134,3 +134,24 @@ clean. This reshapes the `startRedact` contract on both ends:
   document-level residual shows no offer (flatten cannot fix it). Browser-dev
   mock (`bridgeApi.ts`) returns a `verified:true` report so the page is
   reviewable in `vite dev`.
+
+### #116, #117 — Redact verifies before it commits; the report gains file identity (2026-11-15)
+
+The shape of the `startRedact` contract is unchanged; what the payloads mean
+and carry is not:
+
+- **Refusal no longer touches `outputPath`.** The candidate is verified in a
+  temp file and renamed into place only on success, so a `success:false`
+  refusal means nothing was written (previously: written, then deleted — which
+  destroyed the original when `outputPath` was the input).
+- **`verification` gains two fields**, on both the success and the failure
+  payload: `sourceSha256` (`string | null`) and `outputSha256`
+  (`string | null`). Its `outputPath` always names the real destination.
+- **New check id in `verification.checks[]`: `redaction.file_id`** — the
+  output must not carry any of the source's trailer `/ID` elements. It is
+  always document-level, so a refusal on it never comes with
+  `flattenablePages`. When it is the only failed check the `message` reads
+  "…the output would still carry the source file's identifier."
+- **No frontend change.** `RedactPage.tsx` renders failed checks generically
+  from `evidence`, and its local `VerificationReport` type ignores the extra
+  fields; `web-react/dist/` was not rebuilt.

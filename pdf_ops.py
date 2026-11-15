@@ -14,6 +14,7 @@ from typing import Callable
 import fitz  # PyMuPDF
 import pikepdf
 
+from pdf_analyze import file_sha256, id_elements, save_with_content_id, trailer_ids
 from pdf_verify import verify_redaction
 
 log = logging.getLogger(__name__)
@@ -1536,14 +1537,17 @@ class RedactResult:
 
 
 class RedactionVerificationError(Exception):
-    """Redaction saved an output that verify_redaction could not prove clean.
+    """Redaction produced a candidate that verify_redaction could not prove clean.
 
     Raised instead of returning success (fail-closed, #99). Carries the
     structured detail the UI needs to apply D1: the verification report, the
     pages a flatten-to-image retry would target (``flatten_pages`` — None
     when flatten is not offerable), and whether any residual is
     document-level (``document_level`` — flatten physically cannot fix
-    those, so no offer). The output file has already been deleted.
+    those, so no offer). Nothing was written to the destination: the
+    candidate lived in a temp file, now deleted, and whatever was at
+    output_path before — the input itself, when redacting in place — is
+    untouched.
     """
 
     def __init__(self, message: str, *, report: dict | None = None,
@@ -1584,8 +1588,9 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
     D2: matched values are removed wholesale, never spliced. D3: docinfo and
     XMP are stripped wholesale (not surgically RDF-edited) the moment any
     term appears in them — losing metadata during redaction is expected.
-    Mirrors pdf_verify._pikepdf_scan's surface set so the scrub cleans
-    exactly where verification looks.
+    Metadata that carries no term is left exactly as found. Mirrors
+    pdf_verify._pikepdf_scan's surface set so the scrub cleans exactly where
+    verification looks.
     """
     if not terms:
         return {}
@@ -1611,12 +1616,17 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
             pass
 
         # -- XMP (D3 wholesale) ----------------------------------------
+        # Delete the stream itself. Never clear a parsed view and let
+        # pikepdf write it back: its recovering parser accepts malformed
+        # packets it cannot edit, so clear()-then-save re-emits the
+        # recovered tree with the term still in it. Merely entering the
+        # metadata context is a write too — it invents a packet where the
+        # file had none and rewrites docinfo from it.
         try:
-            with pdf.open_metadata(set_pikepdf_as_editor=False) as m:
-                xmp_text = str(m)
-                if xmp_text and match(xmp_text):
-                    m.clear()
-                    bump("xmp")
+            md = pdf.Root.get("/Metadata")
+            if md is not None and any(match(v) for v in _xmp_text_views(pdf, md)):
+                del pdf.Root["/Metadata"]
+                bump("xmp")
         except Exception:
             pass
 
@@ -1639,13 +1649,43 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
         fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=out_dir)
         os.close(fd)
         try:
-            pdf.save(tmp)
+            # fix_metadata_version re-serializes any XMP packet on the way
+            # out; a packet that survived the scrub must survive untouched.
+            pdf.save(tmp, fix_metadata_version=False)
             os.replace(tmp, path)
         except Exception:
             if os.path.exists(tmp):
                 os.unlink(tmp)
             raise
     return counts
+
+
+def _xmp_text_views(pdf, stream) -> list[str]:
+    """Every reading of the catalog XMP packet a term could be found in.
+
+    The raw bytes as UTF-8 are what verify_redaction (and anyone dumping the
+    stream) sees, well-formed or not. XMP may also be UTF-16/32: decoding
+    that, and separately dropping the NUL padding, exposes it. pikepdf's
+    parsed view resolves character entities. All three are read-only — the
+    metadata object is never entered as a context, so nothing is written
+    back.
+    """
+    views: list[str] = []
+    try:
+        raw = stream.read_bytes()
+    except Exception:
+        try: raw = stream.read_raw_bytes()
+        except Exception: raw = b""
+    if raw:
+        views.append(raw.decode("utf-8", "replace"))
+        if b"\x00" in raw:
+            views.append(raw.decode("utf-16", "replace"))
+            views.append(raw.replace(b"\x00", b"").decode("utf-8", "replace"))
+    try:
+        views.append(str(pdf.open_metadata(set_pikepdf_as_editor=False)))
+    except Exception:
+        pass
+    return views
 
 
 def _scrub_outline_items(items, match, depth: int = 0) -> int:
@@ -1815,6 +1855,68 @@ def _flatten_pages_to_image(src_path: str, dst_path: str,
         src.close()
 
 
+def _source_file_ids(doc, input_path: str, password: str | None = None) -> list[str]:
+    """Trailer /ID elements (lowercase hex) of the already-open source *doc*.
+
+    Read through the handle redact_pdf holds anyway, so the ordinary case
+    needs no second open that could fail on an input fitz accepted. fitz
+    returns the value as PDF syntax — hex or escaped-literal strings — and
+    qpdf's own parser decodes it, so the result compares byte-for-byte with
+    what the verifier reads from the output (pdf_analyze.id_elements on both
+    sides).
+
+    No shape of /ID is refused. A bare string is one element; its syntax
+    comes from _trailer_with_only_id. Elements held as indirect references
+    are the one thing the handle cannot print resolved, so for those the
+    trailer is read from the file with pikepdf, exactly as the verifier reads
+    the output's.
+    """
+    kind, val = doc.xref_get_key(-1, "ID")          # xref -1 is the trailer
+    if kind == "null":
+        return []
+    try:
+        if kind == "string":
+            return id_elements(pikepdf.Object.parse(
+                _trailer_with_only_id(doc).encode("latin-1")).get("/ID"))
+        if kind == "xref":
+            val = doc.xref_object(int(val.split()[0]), compressed=True)
+        return id_elements(pikepdf.Object.parse(val.encode("latin-1")))
+    except Exception:
+        kwargs = {"password": password} if password else {}
+        with pikepdf.open(input_path, **kwargs) as pdf:
+            return trailer_ids(pdf)
+
+
+def _trailer_with_only_id(doc) -> str:
+    """PDF syntax of *doc*'s trailer dictionary reduced to its /ID entry.
+
+    For a /ID that is a bare string. fitz reports a string value as decoded
+    text, which is not its bytes (<FEFF0041> comes back as "A"). The
+    trailer's source has the real syntax, but also indirect references,
+    which parse only inside a document — so it is loaded into a scratch one,
+    every other key is nulled, and what is left is printed.
+    """
+    tmp = fitz.open()
+    try:
+        xref = tmp.get_new_xref()
+        tmp.update_object(xref, doc.xref_object(-1, compressed=True))
+        for key in tmp.xref_get_keys(xref):
+            if key != "ID":
+                tmp.xref_set_key(xref, key, "null")
+        return tmp.xref_object(xref, compressed=True)
+    finally:
+        tmp.close()
+
+
+def _refusal_message(failed) -> str:
+    """One-line reason for a refused redaction, from its failed checks."""
+    if failed and all(c.id == "redaction.file_id" for c in failed):
+        return ("Redaction could not be verified: the output would still "
+                "carry the source file's identifier.")
+    return ("Redaction could not be verified: sensitive content is still "
+            "present in the output.")
+
+
 def redact_pdf(
     input_path: str,
     output_path: str,
@@ -1853,16 +1955,21 @@ def redact_pdf(
     link URIs, embedded-file names (#99) -- so a term surviving only in the
     /Title (never on any page) is still removed and still counts as a hit.
 
-    After the atomic save, verify_redaction() re-opens the output and proves
-    every target is unextractable. If it cannot:
+    Verify, then commit. The redacted candidate is written to a temp file
+    beside output_path, given a fresh content-derived trailer /ID as its last
+    write (so it cannot be matched to the source by identifier), and handed
+    to verify_redaction(), which must prove every target unextractable. Only
+    a verified candidate is renamed onto output_path. If it cannot be
+    verified:
       * every residual is page-content (text/annotation on a page) and the
         caller passed flatten_pages covering them -> those pages are
         rasterized to image and re-verified;
-      * otherwise the output is DELETED and RedactionVerificationError is
-        raised, carrying the report, the flatten-eligible pages (or None for
-        a document-level residual, which flatten cannot fix), and whether the
-        residual was document-level. Never returns success with a target
-        still findable; never leaves a half-verified file on disk (D1).
+      * otherwise RedactionVerificationError is raised, carrying the report,
+        the flatten-eligible pages (or None for a document-level residual,
+        which flatten cannot fix), and whether the residual was
+        document-level. Never returns success with a target still findable.
+    A refused run never creates, replaces, or deletes output_path -- when it
+    is the input itself (redacting in place), the original is untouched (D1).
 
     Returns a RedactResult with redaction_count (page-content redactions --
     unchanged meaning), pages_affected, a per-surface surface_counts
@@ -1877,6 +1984,15 @@ def redact_pdf(
         if not doc.authenticate(password):
             doc.close()
             raise ValueError("Wrong password.")
+
+    # The source's identity, captured while it is open: the verifier is
+    # handed these as plain values and never opens the input itself.
+    try:
+        source_ids = _source_file_ids(doc, input_path, password)
+        source_sha = file_sha256(input_path)
+    except Exception as exc:
+        doc.close()
+        raise ValueError(f"Could not read the source file's identity: {exc}") from exc
 
     total = len(doc)
     rects_by_page: dict[int, list[dict]] = {}
@@ -2001,37 +2117,48 @@ def redact_pdf(
             final_src = flat
             flattened = sorted(set(int(p) for p in flatten_pages))
 
-        os.replace(final_src, output_path)
+        # The identifier is written last, on every path. fitz carries the
+        # source's /ID[0] through its save and the scrub's save keeps it
+        # (the rects-only path never reaches the scrub at all), so without
+        # this pass the output stays linkable to the original.
+        candidate = _mktmp()
+        with pikepdf.open(final_src) as pdf:
+            save_with_content_id(pdf, candidate, fix_metadata_version=False)
+
+        # Verify, then commit (fail-closed, #99): every target must be
+        # proven gone from the candidate before anything touches
+        # output_path. A refusal leaves the destination exactly as it was —
+        # which matters most when it is the input (redacting in place).
+        report = verify_redaction(
+            candidate,
+            terms=scrub_terms or None,
+            rects=rects,
+            case_sensitive=case_sensitive,
+            input_path=input_path,
+            source_ids=source_ids,
+            source_sha256=source_sha,
+        )
+        report.retarget(output_path)
+        if not report.verified:
+            failed = report.failed_checks()
+            doc_level = any(c.is_document_level for c in failed)
+            # D1: offer flatten only on the first attempt (flatten_pages is
+            # None) and only for a purely page-content residual. Once we've
+            # already flattened, there is no further fallback.
+            offer = None if flatten_pages else report.flatten_target_pages()
+            raise RedactionVerificationError(
+                _refusal_message(failed),
+                report=report.to_dict(),
+                flatten_pages=offer,
+                document_level=doc_level,
+            )
+        os.replace(candidate, output_path)
     except Exception:
         try: doc.close()
         except Exception: pass
         raise
     finally:
         _cleanup_temps()
-
-    # Fail-closed verification (#99): prove every target is gone or refuse.
-    report = verify_redaction(
-        output_path,
-        terms=scrub_terms or None,
-        rects=rects,
-        case_sensitive=case_sensitive,
-        input_path=input_path,
-    )
-    if not report.verified:
-        try: os.unlink(output_path)
-        except Exception: pass
-        doc_level = any(c.is_document_level for c in report.failed_checks())
-        # D1: offer flatten only on the first attempt (flatten_pages is None)
-        # and only for a purely page-content residual. Once we've already
-        # flattened, there is no further fallback.
-        offer = None if flatten_pages else report.flatten_target_pages()
-        raise RedactionVerificationError(
-            "Redaction could not be verified: sensitive content is still "
-            "present in the output.",
-            report=report.to_dict(),
-            flatten_pages=offer,
-            document_level=doc_level,
-        )
 
     return RedactResult(
         input_path=input_path,
