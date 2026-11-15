@@ -1,7 +1,10 @@
 """Tests for pdf_ops.py — merge, split, page operations, and more."""
 
+import hashlib
 import io
 import os
+import re
+import shutil
 
 import pikepdf
 import pytest
@@ -814,7 +817,7 @@ class TestRedactFailClosed:
     """The core #99 guarantee: a redaction that cannot be proven clean must
     raise and leave no output on disk."""
 
-    def test_no_op_apply_redactions_raises_and_deletes_output(
+    def test_no_op_apply_redactions_raises_and_writes_no_output(
             self, tmp_path, monkeypatch):
         src = _text_pdf(tmp_path / "s.pdf", "leak SECRET_TERM leak")
         out = str(tmp_path / "s_out.pdf")
@@ -953,6 +956,517 @@ class TestRedactErrorTail:
         strays = [f for f in os.listdir(tmp_path) if f.endswith(".pdf")
                   and f not in ("s.pdf",)]
         assert strays == []
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Redact hardening — verify-then-commit, file identifier, XMP removal
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _file_bytes(path) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _trailer_ids(path, password=None) -> list:
+    """Hex of each string in the trailer /ID ([] when there is none). A /ID
+    that is a bare string instead of an array counts as one element."""
+    kw = {"password": password} if password else {}
+    with pikepdf.open(path, **kw) as pdf:
+        tid = pdf.trailer.get("/ID")
+        if tid is None:
+            return []
+        return [bytes(x).hex() for x in (tid if isinstance(tid, pikepdf.Array) else [tid])
+                if isinstance(x, pikepdf.String)]
+
+
+_ID_ARRAY_RE = re.compile(rb"/ID\s*\[\s*<[0-9A-Fa-f]+>\s*<[0-9A-Fa-f]+>\s*\]")
+
+
+def _with_trailer_id(path, id_syntax: bytes, text="account SECRET_TERM 12345") -> str:
+    """A one-page PDF whose trailer reads ``/ID <id_syntax>`` — for the shapes
+    no library will write. fitz saves a classic xref table with the trailer
+    after it, so the entry can be swapped in the raw bytes without moving
+    anything an offset points at."""
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), text)
+    raw = doc.tobytes()
+    doc.close()
+    patched, n = _ID_ARRAY_RE.subn(lambda m: b"/ID " + id_syntax, raw)
+    assert n == 1, "expected exactly one trailer /ID array in the fitz output"
+    with open(path, "wb") as f:
+        f.write(patched)
+    return str(path)
+
+
+def _content_id_rewrite(path, dst) -> bytes:
+    """The write a redaction must end with, done independently of pdf_ops:
+    drop the trailer /ID and let qpdf derive a new one from the output's own
+    content. If redact_pdf wrote its identifier this way, and wrote it last,
+    doing it once more changes nothing."""
+    with pikepdf.open(path) as pdf:
+        if "/ID" in pdf.trailer:
+            del pdf.trailer["/ID"]
+        pdf.save(dst, deterministic_id=True)
+    return _file_bytes(dst)
+
+
+def _leak_page_content(monkeypatch):
+    """Turn the page-content redaction into a no-op so verification refuses."""
+    monkeypatch.setattr(fitz.Page, "apply_redactions", lambda self, **k: None)
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestRedactVerifyThenCommit:
+    """The candidate is verified in a temp beside the destination and only a
+    verified candidate is moved into place. A refused run never creates,
+    replaces, or deletes output_path."""
+
+    def test_in_place_refusal_leaves_original_byte_identical(
+            self, tmp_path, monkeypatch):
+        src = _text_pdf(tmp_path / "only_copy.pdf", "leak SECRET_TERM leak")
+        before = _file_bytes(src)
+        _leak_page_content(monkeypatch)
+        with pytest.raises(RedactionVerificationError):
+            redact_pdf(src, src, search_terms=["SECRET_TERM"])
+        assert os.path.exists(src), "the refusal deleted the user's only copy"
+        assert _file_bytes(src) == before
+        assert os.listdir(tmp_path) == ["only_copy.pdf"]      # no stray temp
+
+    def test_refusal_keeps_a_pre_existing_destination(self, tmp_path, monkeypatch):
+        src = _text_pdf(tmp_path / "s.pdf", "leak SECRET_TERM leak")
+        out = tmp_path / "earlier_export.pdf"
+        out.write_bytes(b"an earlier export the user still wants")
+        _leak_page_content(monkeypatch)
+        with pytest.raises(RedactionVerificationError):
+            redact_pdf(src, str(out), search_terms=["SECRET_TERM"])
+        assert out.read_bytes() == b"an earlier export the user still wants"
+        assert sorted(os.listdir(tmp_path)) == ["earlier_export.pdf", "s.pdf"]
+
+    def test_refusal_with_distinct_output_leaves_no_file(self, tmp_path, monkeypatch):
+        src = _text_pdf(tmp_path / "s.pdf", "leak SECRET_TERM leak")
+        out = str(tmp_path / "s_out.pdf")
+        _leak_page_content(monkeypatch)
+        with pytest.raises(RedactionVerificationError):
+            redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        assert os.listdir(tmp_path) == ["s.pdf"]              # no output, no temp
+
+    def test_destination_is_not_written_until_verified(self, tmp_path, monkeypatch):
+        src = _text_pdf(tmp_path / "s.pdf", "the SECRET_TERM is here")
+        out = str(tmp_path / "s_out.pdf")
+        seen = {}
+
+        def spy(path, *a, **k):
+            seen["path"], seen["dest_existed"] = path, os.path.exists(out)
+            return verify_redaction(path, *a, **k)
+
+        monkeypatch.setattr("pdf_ops.verify_redaction", spy)
+        res = redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        assert seen["dest_existed"] is False, \
+            "the output was committed before it was verified"
+        # Same directory as the destination, so the commit is one atomic rename.
+        assert os.path.dirname(seen["path"]) == str(tmp_path)
+        assert seen["path"] != out
+        assert sorted(os.listdir(tmp_path)) == ["s.pdf", "s_out.pdf"]
+        # The proof names the file the user actually has, not the temp.
+        assert res.output_path == out
+        assert res.verification["outputPath"] == out
+        assert res.verification["verified"] is True
+
+    def test_refusal_report_names_destination_never_the_temp(
+            self, tmp_path, monkeypatch):
+        from pdf_verify import VerificationCheck, VerificationReport
+        src = _text_pdf(tmp_path / "s.pdf", "the SECRET_TERM is here")
+        out = str(tmp_path / "s_out.pdf")
+        seen = {}
+
+        def unreadable(path, *a, **k):
+            # What verify_redaction reports for an output it cannot open: the
+            # library's error text routinely quotes the path it was given.
+            seen["path"] = path
+            rep = VerificationReport(input_path=src, output_path=path,
+                                     tool="redaction", timestamp="t")
+            rep.checks.append(VerificationCheck(
+                id="redaction.readable", description="opens", passed=False,
+                evidence=[f"output could not be opened: cannot open {path} "
+                          f"(document-level)"]))
+            return rep
+
+        monkeypatch.setattr("pdf_ops.verify_redaction", unreadable)
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        rep = ei.value.report
+        assert rep["outputPath"] == out
+        assert os.path.basename(seen["path"]) not in repr(rep)
+        assert os.listdir(tmp_path) == ["s.pdf"]
+
+    def test_in_place_success_replaces_the_original(self, tmp_path):
+        # The commit is a rename onto the input: every handle on both files
+        # must be closed by then, or Windows refuses it.
+        src = _text_pdf(tmp_path / "doc.pdf", "the SECRET_TERM is here")
+        res = redact_pdf(src, src, search_terms=["SECRET_TERM"])
+        assert res.verification["verified"] is True
+        assert "SECRET_TERM" not in _get_text(src)
+        assert os.listdir(tmp_path) == ["doc.pdf"]
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestRedactFileId:
+    """No redaction output may carry the source's trailer /ID — on any path —
+    and the identifier it does carry is derived from the output's content and
+    written last."""
+
+    RECT = {"page": 0, "x0": 60, "y0": 55, "x1": 420, "y1": 85}
+
+    def _two_pages(self, tmp_path) -> str:
+        p = str(tmp_path / "src.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), "account SECRET_TERM 12345")
+        doc.new_page().insert_text((72, 72), "ordinary text on page two")
+        doc.save(p)
+        doc.close()
+        return p
+
+    def _assert_unlinked(self, src, out, tmp_path, password=None):
+        src_ids, out_ids = _trailer_ids(src, password), _trailer_ids(out)
+        assert src_ids, "fixture must carry a trailer /ID"
+        assert out_ids and not set(out_ids) & set(src_ids), \
+            f"output is linkable to its source through /ID: {out_ids} vs {src_ids}"
+        produced = _file_bytes(out)
+        assert _content_id_rewrite(out, str(tmp_path / "again.pdf")) == produced, \
+            "the identifier is not content-derived, or was not the last write"
+
+    def test_terms_path(self, tmp_path):
+        src, out = self._two_pages(tmp_path), str(tmp_path / "out.pdf")
+        redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        self._assert_unlinked(src, out, tmp_path)
+
+    def test_rects_only_path(self, tmp_path):
+        src, out = self._two_pages(tmp_path), str(tmp_path / "out.pdf")
+        redact_pdf(src, out, rects=[self.RECT])
+        self._assert_unlinked(src, out, tmp_path)
+
+    def test_flatten_path(self, tmp_path):
+        src, out = self._two_pages(tmp_path), str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=["SECRET_TERM"], flatten_pages=[1])
+        assert res.flattened_pages == [1]
+        self._assert_unlinked(src, out, tmp_path)
+
+    def test_encrypted_source(self, tmp_path):
+        plain, enc = self._two_pages(tmp_path), str(tmp_path / "enc.pdf")
+        with pikepdf.open(plain) as pdf:
+            pdf.save(enc, encryption=pikepdf.Encryption(owner="o", user="u"))
+        out = str(tmp_path / "out.pdf")
+        redact_pdf(enc, out, search_terms=["SECRET_TERM"], password="u")
+        self._assert_unlinked(enc, out, tmp_path, password="u")
+
+    def test_report_carries_the_check_and_both_hashes(self, tmp_path):
+        src, out = self._two_pages(tmp_path), str(tmp_path / "out.pdf")
+        src_sha = hashlib.sha256(_file_bytes(src)).hexdigest()
+        res = redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        checks = {c["id"]: c for c in res.verification["checks"]}
+        assert checks["redaction.file_id"]["passed"] is True
+        assert res.verification["sourceSha256"] == src_sha
+        assert res.verification["outputSha256"] == \
+            hashlib.sha256(_file_bytes(out)).hexdigest()
+
+    def test_kept_source_id_is_a_document_level_refusal(self, tmp_path, monkeypatch):
+        # A final write that keeps the source identifier (plain qpdf save
+        # preserves /ID[0]) must be refused, and flatten must not be offered:
+        # rasterizing pages cannot change a trailer entry.
+        src, out = self._two_pages(tmp_path), str(tmp_path / "out.pdf")
+        monkeypatch.setattr("pdf_ops.save_with_content_id",
+                            lambda pdf, path, **kw: pdf.save(path))
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        failed = [c["id"] for c in ei.value.report["checks"] if not c["passed"]]
+        assert failed == ["redaction.file_id"]
+        assert "identifier" in str(ei.value)
+        assert ei.value.document_level is True
+        assert ei.value.flatten_pages is None
+        assert os.listdir(tmp_path) == ["src.pdf"]
+
+    def test_source_without_an_id(self, tmp_path):
+        src, out = str(tmp_path / "noid.pdf"), str(tmp_path / "out.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), "account SECRET_TERM 12345")
+        doc.save(src, no_new_id=True)
+        doc.close()
+        assert _trailer_ids(src) == []
+        res = redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        checks = {c["id"]: c for c in res.verification["checks"]}
+        assert checks["redaction.file_id"]["passed"] is True
+        assert _content_id_rewrite(out, str(tmp_path / "again.pdf")) == _file_bytes(out)
+
+    def test_unreadable_source_identity_refuses_before_writing(
+            self, tmp_path, monkeypatch):
+        # No /ID shape gets here (see TestSourceFileIds). This is the file
+        # itself failing to give up its identity — e.g. it cannot be hashed.
+        src, out = self._two_pages(tmp_path), str(tmp_path / "out.pdf")
+        before = _file_bytes(src)
+
+        def _boom(path):
+            raise OSError("simulated read failure")
+
+        monkeypatch.setattr("pdf_ops.file_sha256", _boom)
+        with pytest.raises(ValueError, match="identity"):
+            redact_pdf(src, out, search_terms=["SECRET_TERM"])
+        assert os.listdir(tmp_path) == ["src.pdf"]
+        assert _file_bytes(src) == before
+
+    @pytest.mark.parametrize("id_syntax", [
+        b"<0123456789ABCDEF0123456789ABCDEF>",      # hex
+        rb"(id\(1\)\\x\012\377~)",                   # literal, with escapes
+        b"<FEFF00410042>",                           # reads as the text "AB"
+    ], ids=["hex", "literal", "utf16-bom"])
+    @pytest.mark.parametrize("mode", ["terms", "rects"])
+    def test_bare_string_id_redacts_and_is_not_carried(self, tmp_path, id_syntax, mode):
+        # /ID as a bare string, not an array: MuPDF carries it through a save
+        # as is, so it is an identifier like any other.
+        src = _with_trailer_id(tmp_path / "bare.pdf", id_syntax)
+        with pikepdf.open(src) as pdf:
+            assert isinstance(pdf.trailer["/ID"], pikepdf.String)
+        (bare,) = _trailer_ids(src)
+        out = str(tmp_path / "out.pdf")
+        kw = ({"search_terms": ["SECRET_TERM"]} if mode == "terms"
+              else {"rects": [self.RECT]})
+        res = redact_pdf(src, out, **kw)
+        assert bare not in _trailer_ids(out), "the bare-string /ID was carried over"
+        with pikepdf.open(out) as pdf:
+            assert isinstance(pdf.trailer["/ID"], pikepdf.Array)
+        checks = {c["id"]: c for c in res.verification["checks"]}
+        assert checks["redaction.file_id"]["passed"] is True
+        assert _content_id_rewrite(out, str(tmp_path / "again.pdf")) == _file_bytes(out)
+
+    def test_carried_bare_string_id_is_refused(self, tmp_path, monkeypatch):
+        # Make the final write a plain copy of what fitz saved — which still
+        # has the bare string — to show it was captured as an element the
+        # check can match, not read as "no identifier".
+        src = _with_trailer_id(tmp_path / "bare.pdf", b"<0123456789ABCDEF>")
+        out = str(tmp_path / "out.pdf")
+        monkeypatch.setattr("pdf_ops.save_with_content_id",
+                            lambda pdf, path, **kw: shutil.copyfile(pdf.filename, path))
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, out, rects=[self.RECT])
+        failed = {c["id"]: c for c in ei.value.report["checks"] if not c["passed"]}
+        assert list(failed) == ["redaction.file_id"]
+        assert "0123456789abcdef" in " ".join(failed["redaction.file_id"]["evidence"])
+        assert ei.value.flatten_pages is None
+        assert os.listdir(tmp_path) == ["bare.pdf"]
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+class TestSourceFileIds:
+    """The source's /ID is read through the open fitz handle and must come
+    out as the same values pikepdf reads from the same file — that is what
+    the verifier compares the output against. No shape of /ID is refused."""
+
+    def _from_handle(self, path):
+        # The file path handed over does not exist, so the read-the-file
+        # fallback cannot be what produced the answer.
+        from pdf_ops import _source_file_ids
+        doc = fitz.open(path)
+        try: return _source_file_ids(doc, str(path) + ".absent")
+        finally: doc.close()
+
+    def _from_pikepdf(self, path):
+        from pdf_analyze import trailer_ids
+        with pikepdf.open(path) as pdf:
+            return trailer_ids(pdf)
+
+    @pytest.mark.parametrize("id_syntax, expected", [
+        (b"<0123456789ABCDEF>", ["0123456789abcdef"]),
+        (rb"(id\(1\)\\x\012\377~)", [b"id(1)\\x\n\xff~".hex()]),
+        (b"<FEFF00410042>", ["feff00410042"]),       # fitz reports this as "AB"
+        (b"[<AB12>]", ["ab12"]),
+        (b"[]", []),
+        (b"[/Foo 12 true]", None),
+        (b"/Foo", None),
+    ], ids=["bare-hex", "bare-literal", "bare-utf16-bom", "one-element",
+            "empty-array", "non-string-elements", "bare-name"])
+    def test_every_shape_is_captured_as_pikepdf_reads_it(
+            self, tmp_path, id_syntax, expected):
+        p = _with_trailer_id(tmp_path / "odd.pdf", id_syntax)
+        got = self._from_handle(p)
+        assert got == self._from_pikepdf(p)
+        if expected is not None:
+            assert got == expected
+        else:
+            # Malformed elements are kept (by their serialization), not
+            # dropped: a copy carrying the same ones must still match.
+            assert got and all(got)
+
+    def test_indirect_elements_are_read_from_the_file(self, tmp_path):
+        # The handle prints indirect elements unresolved ("5 0 R"), which
+        # cannot be decoded out of context; the file is read instead.
+        from pdf_ops import _source_file_ids
+        plain = _text_pdf(tmp_path / "plain.pdf", "x")
+        enc = str(tmp_path / "enc.pdf")
+        with pikepdf.open(plain) as pdf:
+            pdf.save(enc, encryption=pikepdf.Encryption(owner="o", user="u"))
+
+        class _Doc:
+            def xref_get_key(self, xref, key):
+                return ("array", "[5 0 R 6 0 R]")
+
+        assert _source_file_ids(_Doc(), plain) == _trailer_ids(plain) != []
+        assert _source_file_ids(_Doc(), enc, "u") == _trailer_ids(enc, "u") != []
+
+    def test_literal_string_ids_decode_like_pikepdf(self, tmp_path):
+        base = _text_pdf(tmp_path / "base.pdf", "x")
+        p = str(tmp_path / "literal.pdf")
+        with pikepdf.open(base) as pdf:
+            # Printable bytes make MuPDF print a literal string with escapes
+            # rather than hex: parens, a backslash, a newline, a high byte.
+            pdf.trailer["/ID"] = pikepdf.Array([
+                pikepdf.String(b"abc(d)e\\f\n\x00\xff~"), pikepdf.String(b"x")])
+            pdf.save(p)
+        expected = _trailer_ids(p)
+        assert expected[0] == b"abc(d)e\\f\n\x00\xff~".hex()
+        assert self._from_handle(p) == expected
+
+    def test_indirect_id_array_is_followed(self):
+        from pdf_ops import _source_file_ids
+
+        class _Doc:
+            def xref_get_key(self, xref, key):
+                assert (xref, key) == (-1, "ID")
+                return ("xref", "7 0 R")
+
+            def xref_object(self, xref, compressed=False):
+                assert xref == 7
+                return "[<AB12><cd34>]"
+
+        assert _source_file_ids(_Doc(), "unused.pdf") == ["ab12", "cd34"]
+
+    def test_missing_id_is_an_empty_list(self):
+        from pdf_ops import _source_file_ids
+
+        class _Doc:
+            def xref_get_key(self, xref, key):
+                return ("null", "null")
+
+        assert _source_file_ids(_Doc(), "unused.pdf") == []
+
+
+# Undeclared dc: prefix and a root element that is never closed: pikepdf's
+# recovering parser accepts it, but clearing the parsed view and re-saving
+# writes the recovered tree — name included — straight back.
+_MALFORMED_XMP = (
+    b'<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+    b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+    b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+    b'<rdf:Description rdf:about=""><dc:creator>ACME99Z Holdings</dc:creator>'
+    b'</rdf:Description></rdf:RDF>\n')
+
+
+def _with_catalog_xmp(path, body: str, packet: bytes) -> str:
+    """One page drawing *body*, with *packet* as the catalog /Metadata stream."""
+    base = str(path) + ".base"
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), body)
+    doc.save(base)
+    doc.close()
+    with pikepdf.open(base) as pdf:
+        st = pdf.make_stream(packet)
+        st["/Type"] = pikepdf.Name("/Metadata")
+        st["/Subtype"] = pikepdf.Name("/XML")
+        pdf.Root["/Metadata"] = st
+        # fix_metadata_version (on by default) would re-serialize the packet
+        # on the way out and the fixture would no longer be malformed.
+        pdf.save(str(path), fix_metadata_version=False)
+    os.unlink(base)
+    with pikepdf.open(str(path)) as pdf:
+        assert pdf.Root.Metadata.read_bytes() == packet
+    return str(path)
+
+
+def _stream_bytes(path) -> bytes:
+    """Every stream's decoded bytes, concatenated."""
+    out = []
+    with pikepdf.open(path) as pdf:
+        for obj in pdf.objects:
+            if isinstance(obj, pikepdf.Stream):
+                try: out.append(obj.read_bytes())
+                except Exception: out.append(obj.read_raw_bytes())
+    return b"\n".join(out)
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestRedactXmpRemoval:
+    """The scrub deletes a matching XMP stream outright. It never clears a
+    parsed view and re-saves it, and it leaves metadata that does not carry
+    a term exactly as it found it."""
+
+    TERM = "ACME99Z"
+
+    def test_term_in_malformed_xmp_is_deleted_and_redaction_succeeds(self, tmp_path):
+        src = _with_catalog_xmp(tmp_path / "bad.pdf", f"body {self.TERM}",
+                                _MALFORMED_XMP)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[self.TERM])
+        assert res.verification["verified"] is True
+        assert res.surface_counts.get("xmp") == 1
+        with pikepdf.open(out) as pdf:
+            assert "/Metadata" not in pdf.Root
+        assert b"ACME99Z" not in _stream_bytes(out)
+        assert verify_redaction(out, [self.TERM]).verified is True
+
+    def test_term_only_in_unparseable_xmp_counts_as_a_hit(self, tmp_path):
+        # Not XML at all: the parsed view is an empty packet, so a scrub that
+        # only reads the parsed view reports "no matching content" for a term
+        # that is sitting in the file.
+        src = _with_catalog_xmp(tmp_path / "junk.pdf", "nothing sensitive here",
+                                b"creator=ACME99Z Holdings <<< not xml")
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[self.TERM])
+        assert res.redaction_count == 0
+        assert res.surface_counts == {"xmp": 1}
+        with pikepdf.open(out) as pdf:
+            assert "/Metadata" not in pdf.Root
+        assert b"ACME99Z" not in _stream_bytes(out)
+
+    def test_term_in_utf16_xmp_is_deleted(self, tmp_path):
+        # XMP may be UTF-16; read as UTF-8 the term is interleaved with NULs.
+        packet = ("<x:xmpmeta xmlns:x='adobe:ns:meta/'><broken>"
+                  "ACME99Z Holdings").encode("utf-16")
+        src = _with_catalog_xmp(tmp_path / "u16.pdf", "nothing sensitive here",
+                                packet)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[self.TERM])
+        assert res.surface_counts == {"xmp": 1}
+        with pikepdf.open(out) as pdf:
+            assert "/Metadata" not in pdf.Root
+
+    def test_scrub_writes_no_xmp_stub(self, tmp_path):
+        src = _text_pdf(tmp_path / "plain.pdf", f"body {self.TERM}")
+        with pikepdf.open(src) as pdf:
+            assert "/Metadata" not in pdf.Root                # fixture has none
+        out = str(tmp_path / "out.pdf")
+        redact_pdf(src, out, search_terms=[self.TERM])
+        with pikepdf.open(out) as pdf:
+            assert "/Metadata" not in pdf.Root, \
+                "the scrub invented an XMP packet the source never had"
+
+    def test_metadata_without_a_term_is_left_as_found(self, tmp_path):
+        # Docinfo and XMP are stripped when a term appears in them (D3) —
+        # not rewritten from each other as a side effect of looking.
+        src = str(tmp_path / "meta.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), f"body {self.TERM}")
+        doc.set_metadata({"title": "Quarterly report", "author": "Bob Example"})
+        doc.save(src)
+        doc.close()
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[self.TERM])
+        assert "docinfo" not in res.surface_counts
+        with pikepdf.open(out) as pdf:
+            info = {str(k): str(v) for k, v in pdf.docinfo.items()}
+        assert info.get("/Title") == "Quarterly report"
+        assert info.get("/Author") == "Bob Example"
 
 
 class TestProtectPdf:

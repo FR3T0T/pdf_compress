@@ -14,6 +14,9 @@ the TST-01 redaction tests in test_pdf_ops.py: every "gone" claim is checked
 through an independent extraction path.
 """
 
+import hashlib
+import os
+
 import pikepdf
 import pytest
 from PIL import Image
@@ -350,7 +353,7 @@ class TestVerifyRedactionOutcomes:
         d = verify_redaction(src, [TERM], input_path="in.pdf").to_dict()
         assert set(d) == {"inputPath", "outputPath", "tool", "timestamp",
                           "checks", "residualFindings", "verified",
-                          "flattenTargetPages"}
+                          "flattenTargetPages", "sourceSha256", "outputSha256"}
         assert d["tool"] == "redaction"
         assert d["inputPath"] == "in.pdf"
         assert d["verified"] is True
@@ -551,6 +554,113 @@ class TestFlattenTargeting:
         c = _check(report, "redaction.bookmarks")
         assert c.pages == []
         assert report.flatten_target_pages() is None
+
+
+# ── File identifier (/ID) check ──────────────────────────────────────────
+
+
+def _ids(path) -> list:
+    with pikepdf.open(path) as pdf:
+        tid = pdf.trailer.get("/ID")
+        return [] if tid is None else [bytes(x).hex() for x in tid]
+
+
+def _sha(path) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+@pytest.mark.integration
+class TestRedactionFileId:
+    """An output that still carries one of its source's trailer /ID elements
+    is linkable to that source. The caller hands the verifier the source's
+    identifiers and hash as plain values; the verifier never opens the input."""
+
+    def _linked_copy(self, tmp_path):
+        src = _clean_pdf(tmp_path / "src.pdf")
+        out = str(tmp_path / "out.pdf")
+        with pikepdf.open(src) as pdf:
+            pdf.save(out)                     # a plain qpdf save keeps /ID[0]
+        assert set(_ids(out)) & set(_ids(src))
+        return src, out
+
+    def test_shared_id_fails_document_level_and_blocks_flatten(self, tmp_path):
+        src, out = self._linked_copy(tmp_path)
+        report = verify_redaction(out, [TERM], source_ids=_ids(src),
+                                  source_sha256=_sha(src))
+        c = _check(report, "redaction.file_id")
+        assert c.passed is False and c.is_document_level is True
+        assert _ids(src)[0] in " ".join(c.evidence)
+        assert report.verified is False
+        assert report.flatten_target_pages() is None
+
+    def test_content_derived_id_passes(self, tmp_path):
+        src = _clean_pdf(tmp_path / "src.pdf")
+        out = str(tmp_path / "out.pdf")
+        with pikepdf.open(src) as pdf:
+            del pdf.trailer["/ID"]
+            pdf.save(out, deterministic_id=True)
+        report = verify_redaction(out, [TERM], source_ids=_ids(src),
+                                  source_sha256=_sha(src))
+        assert _check(report, "redaction.file_id").passed is True
+        assert report.verified is True
+
+    def test_byte_identical_output_is_exempt(self, tmp_path):
+        # Same bytes is the same file, not a second file linkable to the
+        # first — the only case where sharing the identifier is not a leak.
+        src = _clean_pdf(tmp_path / "src.pdf")
+        report = verify_redaction(src, [TERM], source_ids=_ids(src),
+                                  source_sha256=_sha(src))
+        assert _check(report, "redaction.file_id").passed is True
+
+    def test_identifiers_compare_case_insensitively(self, tmp_path):
+        src, out = self._linked_copy(tmp_path)
+        report = verify_redaction(out, [TERM],
+                                  source_ids=[s.upper() for s in _ids(src)])
+        assert _check(report, "redaction.file_id").passed is False
+
+    def test_no_check_without_source_identifiers(self, tmp_path):
+        src, out = self._linked_copy(tmp_path)
+        report = verify_redaction(out, [TERM])
+        assert "redaction.file_id" not in {c.id for c in report.checks}
+
+    def test_verifier_never_needs_the_input_file(self, tmp_path):
+        src, out = self._linked_copy(tmp_path)
+        ids, sha = _ids(src), _sha(src)
+        os.unlink(src)                        # the input is gone; values remain
+        report = verify_redaction(out, [TERM], input_path=src,
+                                  source_ids=ids, source_sha256=sha)
+        assert _check(report, "redaction.file_id").passed is False
+
+    def test_report_carries_both_hashes(self, tmp_path):
+        src, out = self._linked_copy(tmp_path)
+        d = verify_redaction(out, [TERM], source_ids=_ids(src),
+                             source_sha256=_sha(src)).to_dict()
+        assert d["sourceSha256"] == _sha(src)
+        assert d["outputSha256"] == _sha(out)
+        # Without a caller-supplied source hash the field is null, not guessed.
+        assert verify_redaction(out, [TERM]).to_dict()["sourceSha256"] is None
+
+
+@pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+class TestReportRetarget:
+    """Verify-then-commit runs the checks on a temp candidate; the report the
+    caller keeps must name the real destination, evidence text included."""
+
+    def test_retarget_renames_output_and_evidence(self, tmp_path):
+        tmp = tmp_path / "tmpab12cd.pdf"
+        tmp.write_bytes(b"%PDF-not really\x00\xff")
+        report = verify_redaction(str(tmp), [TERM])
+        c = _check(report, "redaction.readable")
+        c.evidence.append(f"cannot open {tmp} (document-level)")
+        real = str(tmp_path / "report_out.pdf")
+        report.retarget(real)
+        assert report.output_path == real
+        assert report.to_dict()["outputPath"] == real
+        assert "tmpab12cd" not in repr(report.to_dict())
+        assert any("report_out.pdf" in e for e in c.evidence)
+        assert c.is_document_level is True     # markers survive the rename
 
 
 # ── verify_sanitization ──────────────────────────────────────────────────
