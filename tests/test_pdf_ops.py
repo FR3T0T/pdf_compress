@@ -3,7 +3,6 @@
 import hashlib
 import io
 import os
-import re
 import shutil
 
 import pikepdf
@@ -980,23 +979,68 @@ def _trailer_ids(path, password=None) -> list:
                 if isinstance(x, pikepdf.String)]
 
 
-_ID_ARRAY_RE = re.compile(rb"/ID\s*\[\s*<[0-9A-Fa-f]+>\s*<[0-9A-Fa-f]+>\s*\]")
+def _handmade_pdf(trailer_id=None, extra_objects=(),
+                  text="account SECRET_TERM 12345") -> bytes:
+    """A complete one-page PDF assembled byte by byte, drawing *text* at
+    (72, 72) from the top-left in Helvetica.
+
+    For the trailer /ID shapes no library will write: *trailer_id* is the
+    PDF syntax placed after ``/ID`` (None leaves the entry out), and
+    *extra_objects* become objects 6, 7, … for it to reference. No library
+    produces any of it and nothing in it is random, so the same arguments
+    always give the same bytes. (Patching a fitz-saved file instead is
+    flaky: MuPDF writes a fresh identifier as hex or as a literal string
+    depending on the random bytes it drew.)
+    """
+    content = b"BT /F1 12 Tf 72 720 Td (" + text.encode("ascii") + b") Tj ET"
+    bodies = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R"
+        b"/Resources<</Font<</F1 5 0 R>>>>>>",
+        b"<</Length %d>>\nstream\n%s\nendstream" % (len(content), content),
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+        *extra_objects,
+    ]
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for num, body in enumerate(bodies, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n%s\nendobj\n" % (num, body)
+    xref_at = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(bodies) + 1)
+    out += b"".join(b"%010d 00000 n \n" % off for off in offsets)
+    out += b"trailer\n<</Size %d/Root 1 0 R" % (len(bodies) + 1)
+    if trailer_id is not None:
+        out += b"/ID " + trailer_id
+    out += b">>\nstartxref\n%d\n%%%%EOF\n" % xref_at
+    return bytes(out)
 
 
-def _with_trailer_id(path, id_syntax: bytes, text="account SECRET_TERM 12345") -> str:
-    """A one-page PDF whose trailer reads ``/ID <id_syntax>`` — for the shapes
-    no library will write. fitz saves a classic xref table with the trailer
-    after it, so the entry can be swapped in the raw bytes without moving
-    anything an offset points at."""
-    doc = fitz.open()
-    doc.new_page().insert_text((72, 72), text)
-    raw = doc.tobytes()
-    doc.close()
-    patched, n = _ID_ARRAY_RE.subn(lambda m: b"/ID " + id_syntax, raw)
-    assert n == 1, "expected exactly one trailer /ID array in the fitz output"
+def _with_trailer_id(path, trailer_id, extra_objects=()) -> str:
+    """Write _handmade_pdf(trailer_id, extra_objects) to *path*."""
     with open(path, "wb") as f:
-        f.write(patched)
+        f.write(_handmade_pdf(trailer_id, extra_objects))
     return str(path)
+
+
+# label -> (syntax after /ID, extra objects, the elements it must read as).
+# None for the elements means "malformed, compared by serialization": only
+# agreement between the two readers is asserted, not a spelling.
+_ID_SHAPES = {
+    "two-strings": (b"[<0123456789ABCDEF><FEDCBA9876543210>]", (),
+                    ["0123456789abcdef", "fedcba9876543210"]),
+    "absent": (None, (), []),
+    "bare-hex": (b"<0123456789ABCDEF>", (), ["0123456789abcdef"]),
+    "bare-literal": (rb"(id\(1\)\\x\012\377~)", (), [b"id(1)\\x\n\xff~".hex()]),
+    "bare-utf16-bom": (b"<FEFF00410042>", (), ["feff00410042"]),  # fitz says "AB"
+    "one-element": (b"[<AB12>]", (), ["ab12"]),
+    "empty-array": (b"[]", (), []),
+    "non-string-elements": (b"[/Foo 12 true]", (), None),
+    "bare-name": (b"/Foo", (), None),
+    "indirect-array": (b"6 0 R", (b"[<AB12><CD34>]",), ["ab12", "cd34"]),
+    "indirect-bare-string": (b"6 0 R", (b"<AB12>",), ["ab12"]),
+    "indirect-elements": (b"[6 0 R 7 0 R]", (b"<AB12>", b"<CD34>"), ["ab12", "cd34"]),
+}
 
 
 def _content_id_rewrite(path, dst) -> bytes:
@@ -1256,6 +1300,55 @@ class TestRedactFileId:
         assert ei.value.flatten_pages is None
         assert os.listdir(tmp_path) == ["bare.pdf"]
 
+    @pytest.mark.parametrize("shape", list(_ID_SHAPES))
+    def test_no_id_shape_is_refused(self, tmp_path, shape):
+        # Boxes only: the path where fitz's save is the last one before the
+        # identifier is rewritten, so whatever sat in /ID is still there.
+        trailer_id, extra, _ = _ID_SHAPES[shape]
+        src = _with_trailer_id(tmp_path / "src.pdf", trailer_id, extra)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[self.RECT])
+        assert res.verification["verified"] is True
+        checks = {c["id"]: c for c in res.verification["checks"]}
+        assert checks["redaction.file_id"]["passed"] is True
+        out_ids = _trailer_ids(out)
+        assert len(out_ids) == 2 and not set(out_ids) & set(_trailer_ids(src))
+
+
+class TestHandmadeFixture:
+    """The /ID-shape fixture must be the same bytes every time. Its
+    predecessor patched a fitz-saved file and failed about one build in
+    fifty, whenever MuPDF happened to write the random identifier it was
+    looking for as a literal string instead of hex."""
+
+    @pytest.mark.parametrize("shape", list(_ID_SHAPES))
+    def test_same_arguments_same_bytes_every_time(self, shape):
+        trailer_id, extra, _ = _ID_SHAPES[shape]
+        builds = {_handmade_pdf(trailer_id, extra) for _ in range(300)}
+        assert len(builds) == 1
+        (raw,) = builds
+        # ...and the entry really is what was asked for, exactly once.
+        want = b"/Root 1 0 R" + (b"" if trailer_id is None else b"/ID " + trailer_id) + b">>"
+        assert raw.count(want) == 1 and raw.count(b"/ID") == (trailer_id is not None)
+
+    @pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
+    @pytest.mark.parametrize("shape", ["two-strings", "absent", "indirect-array",
+                                       "indirect-elements"])
+    def test_well_formed_shapes_need_no_repair(self, tmp_path, shape):
+        # The offsets are computed, not recovered: neither library has to
+        # repair the file, so tests on it exercise the ordinary read path.
+        trailer_id, extra, _ = _ID_SHAPES[shape]
+        p = _with_trailer_id(tmp_path / "f.pdf", trailer_id, extra)
+        with pikepdf.open(p) as pdf:
+            list(pdf.objects)
+            assert pdf.get_warnings() == []
+        doc = fitz.open(p)
+        try:
+            assert doc.is_repaired is False
+            assert doc[0].search_for("SECRET_TERM")       # the text is findable
+        finally:
+            doc.close()
+
 
 @pytest.mark.skipif(not _HAS_FITZ, reason="PyMuPDF (fitz) not installed")
 class TestSourceFileIds:
@@ -1276,19 +1369,11 @@ class TestSourceFileIds:
         with pikepdf.open(path) as pdf:
             return trailer_ids(pdf)
 
-    @pytest.mark.parametrize("id_syntax, expected", [
-        (b"<0123456789ABCDEF>", ["0123456789abcdef"]),
-        (rb"(id\(1\)\\x\012\377~)", [b"id(1)\\x\n\xff~".hex()]),
-        (b"<FEFF00410042>", ["feff00410042"]),       # fitz reports this as "AB"
-        (b"[<AB12>]", ["ab12"]),
-        (b"[]", []),
-        (b"[/Foo 12 true]", None),
-        (b"/Foo", None),
-    ], ids=["bare-hex", "bare-literal", "bare-utf16-bom", "one-element",
-            "empty-array", "non-string-elements", "bare-name"])
-    def test_every_shape_is_captured_as_pikepdf_reads_it(
-            self, tmp_path, id_syntax, expected):
-        p = _with_trailer_id(tmp_path / "odd.pdf", id_syntax)
+    @pytest.mark.parametrize(
+        "shape", [s for s in _ID_SHAPES if s != "indirect-elements"])
+    def test_every_shape_is_captured_as_pikepdf_reads_it(self, tmp_path, shape):
+        trailer_id, extra, expected = _ID_SHAPES[shape]
+        p = _with_trailer_id(tmp_path / "odd.pdf", trailer_id, extra)
         got = self._from_handle(p)
         assert got == self._from_pikepdf(p)
         if expected is not None:
@@ -1299,8 +1384,20 @@ class TestSourceFileIds:
             assert got and all(got)
 
     def test_indirect_elements_are_read_from_the_file(self, tmp_path):
-        # The handle prints indirect elements unresolved ("5 0 R"), which
+        # The handle prints indirect elements unresolved ("6 0 R"), which
         # cannot be decoded out of context; the file is read instead.
+        from pdf_ops import _source_file_ids
+        trailer_id, extra, expected = _ID_SHAPES["indirect-elements"]
+        p = _with_trailer_id(tmp_path / "odd.pdf", trailer_id, extra)
+        doc = fitz.open(p)
+        try:
+            assert _source_file_ids(doc, p) == expected == self._from_pikepdf(p)
+            with pytest.raises(FileNotFoundError):       # the one shape that needs it
+                _source_file_ids(doc, p + ".absent")
+        finally:
+            doc.close()
+
+    def test_file_read_uses_the_callers_password(self, tmp_path):
         from pdf_ops import _source_file_ids
         plain = _text_pdf(tmp_path / "plain.pdf", "x")
         enc = str(tmp_path / "enc.pdf")
@@ -1311,7 +1408,6 @@ class TestSourceFileIds:
             def xref_get_key(self, xref, key):
                 return ("array", "[5 0 R 6 0 R]")
 
-        assert _source_file_ids(_Doc(), plain) == _trailer_ids(plain) != []
         assert _source_file_ids(_Doc(), enc, "u") == _trailer_ids(enc, "u") != []
 
     def test_literal_string_ids_decode_like_pikepdf(self, tmp_path):
