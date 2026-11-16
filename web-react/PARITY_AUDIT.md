@@ -155,3 +155,26 @@ and carry is not:
 - **No frontend change.** `RedactPage.tsx` renders failed checks generically
   from `evidence`, and its local `VerificationReport` type ignores the extra
   fields; `web-react/dist/` was not rebuilt.
+
+### #101 — Analyze/Sanitize coverage: new values, same shapes (2026-11-16)
+
+No slot was renamed or reshaped; the payloads carry new values:
+
+- **`analyzeDocument` report.** A new finding id, `files.external`
+  (category `files`, severity `low`): a file specification that points to a
+  file outside the PDF. `files.embedded` now means a payload is actually
+  present. `meta.xmp` gains `items` (where each metadata stream hangs) and
+  its `count` is the number of streams. Bookmark and form-field actions
+  appear in `scripts.js` / `actions.*` / `links.uri` items with labels such
+  as `Bookmark "Title" /A` and `Form field "name" /AA /K`.
+- **`sanitizeDocument` result.** `removed` may carry four new keys —
+  `annot_aa`, `field_aa`, `embedded_file`, `instantiate_script` — and
+  `document_aa` / `page_aa` count entries rather than dictionaries. Embedded
+  files are counted once each, so `embedded_files` is the number of files in
+  the name tree. The frontend shows only `total_removed`, so nothing there
+  depends on the keys.
+- **No frontend change.** `AnalyzePage.tsx` renders findings generically;
+  `SANITIZE_FIELDS` labels ("Embedded JavaScript", "Auto-run actions
+  (/OpenAction, /AA)") still describe what the options do. `web-react/dist/`
+  was not rebuilt. The verification payload on `sanitizeDocument` arrives
+  with the #101 gate.

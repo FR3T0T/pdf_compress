@@ -23,7 +23,13 @@ from PIL import Image
 
 from pdf_analyze import sanitize_pdf
 from pdf_ops import redact_pdf
-from pdf_verify import verify_redaction, verify_sanitization
+from pdf_verify import (
+    WalkStatus,
+    render_path,
+    verify_redaction,
+    verify_sanitization,
+    walk_objects,
+)
 
 try:
     import fitz  # noqa: F401  (PyMuPDF — hard dep of pdf_verify/pdf_ops)
@@ -769,3 +775,290 @@ class TestVerifySanitization:
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             verify_sanitization(str(tmp_path / "nope.pdf"))
+
+def _planted(path, build) -> str:
+    """One blank page; *build(pdf)* plants content. Saved without
+    fix_metadata_version, which would re-serialize a planted XMP packet."""
+    pdf = pikepdf.Pdf.new()
+    _blank_page(pdf)
+    build(pdf)
+    pdf.save(str(path), fix_metadata_version=False,
+             stream_decode_level=pikepdf.StreamDecodeLevel.none)
+    pdf.close()
+    return str(path)
+
+
+def _typed_xmp(pdf, data=b"<x:xmpmeta xmlns:x='adobe:ns:meta/'>Alex Example</x:xmpmeta>"):
+    st = pdf.make_stream(data)
+    st["/Type"] = pikepdf.Name("/Metadata")
+    st["/Subtype"] = pikepdf.Name("/XML")
+    return st
+
+
+class TestVerifySanitizationMetadata:
+    """With `metadata` promised, any metadata stream — on any object,
+    decodable or not — and any identifying /Info entry fails verification."""
+
+    OPTS = {"metadata": True}
+
+    def test_page_level_xmp_fails_the_promise(self, tmp_path):
+        p = _planted(tmp_path / "p.pdf", lambda pdf: pdf.pages[0].obj.__setitem__(
+            "/Metadata", _typed_xmp(pdf)))
+        report = verify_sanitization(p, self.OPTS)
+        check = _check(report, "sanitize.meta_xmp")
+        assert check.passed is False
+        assert any("page 1" in e.lower() for e in check.evidence)
+
+    def test_undecodable_xmp_fails_the_promise(self, tmp_path):
+        def build(pdf):
+            st = _typed_xmp(pdf)
+            st.write(b"not deflate data", filter=pikepdf.Name("/FlateDecode"))
+            pdf.Root["/Metadata"] = st
+
+        report = verify_sanitization(_planted(tmp_path / "x.pdf", build), self.OPTS)
+        assert _check(report, "sanitize.meta_xmp").passed is False
+
+    def test_custom_info_key_fails_the_promise(self, tmp_path):
+        p = _planted(tmp_path / "i.pdf", lambda pdf: pdf.trailer.__setitem__(
+            "/Info", pdf.make_indirect(pikepdf.Dictionary(
+                Company=pikepdf.String("Example Holdings")))))
+        report = verify_sanitization(p, self.OPTS)
+        assert _check(report, "sanitize.meta_docinfo").passed is False
+
+    def test_sanitized_output_passes(self, tmp_path):
+        def build(pdf):
+            pdf.Root["/Metadata"] = _typed_xmp(pdf)
+            pdf.pages[0].obj["/Metadata"] = _typed_xmp(pdf)
+            pdf.trailer["/Info"] = pdf.make_indirect(pikepdf.Dictionary(
+                Company=pikepdf.String("Example Holdings")))
+
+        src = _planted(tmp_path / "s.pdf", build)
+        out = str(tmp_path / "out.pdf")
+        res = sanitize_pdf(src, out, self.OPTS)
+        assert res["removed"].get("xmp_metadata") == 2
+        assert res["removed"].get("doc_info") == 1
+        report = verify_sanitization(out, self.OPTS)
+        assert _check(report, "sanitize.meta_xmp").passed is True
+        assert _check(report, "sanitize.meta_docinfo").passed is True
+        assert report.verified is True
+
+# ── Whole-file sweep (D-H) ───────────────────────────────────────────────
+
+_ALL_ON = {"javascript": True, "launch_actions": True, "auto_actions": True,
+           "submit_actions": True, "embedded_files": True,
+           "external_links": True, "metadata": True}
+_SWEEP_IDS = {f"sanitize.sweep_{o}" for o in _ALL_ON}
+
+
+def _js():
+    return pikepdf.Dictionary(S=pikepdf.Name("/JavaScript"),
+                              JS=pikepdf.String("app.alert(1);"))
+
+
+def _form_xobject(pdf):
+    st = pdf.make_stream(b"0 0 10 10 re f")
+    st["/Type"] = pikepdf.Name("/XObject")
+    st["/Subtype"] = pikepdf.Name("/Form")
+    st["/BBox"] = [0, 0, 10, 10]
+    return st
+
+
+class TestSweepNameCollisions:
+    """A key name proves nothing. Resource dictionaries map arbitrary names
+    to fonts, images and graphics states; a producer naming them A, B, ...
+    reaches /AA, /EF and /JS, and an image may be called /Metadata."""
+
+    def test_resources_named_like_the_things_it_looks_for(self, tmp_path):
+        def build(pdf):
+            font = pdf.make_indirect(pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"), Subtype=pikepdf.Name("/Type1"),
+                BaseFont=pikepdf.Name("/Helvetica"),
+                FontDescriptor=pikepdf.Dictionary(Type=pikepdf.Name("/FontDescriptor"))))
+            gstate = pikepdf.Dictionary(
+                Type=pikepdf.Name("/ExtGState"),
+                D=pikepdf.Array([pikepdf.Array([3]), 0]),         # dash pattern, not "mouse down"
+                SMask=pikepdf.Dictionary(S=pikepdf.Name("/Luminosity"),
+                                         G=_form_xobject(pdf)))
+            names = ("JS", "AA", "EF", "Metadata", "OpenAction", "S", "URI")
+            pdf.pages[0].obj["/Resources"] = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary({f"/{n}": font for n in names}),
+                XObject=pikepdf.Dictionary({f"/{n}": _form_xobject(pdf) for n in names}),
+                ExtGState=pikepdf.Dictionary({f"/{n}": gstate for n in names}),
+                ColorSpace=pikepdf.Dictionary(S=pikepdf.Name("/DeviceGray"),
+                                              JS=pikepdf.Name("/DeviceRGB")))
+            pdf.pages[0].obj["/Contents"] = pdf.make_stream(
+                b"/JS gs /Metadata Do BT /AA 12 Tf (x) Tj ET")
+
+        report = verify_sanitization(_planted(tmp_path / "c.pdf", build), _ALL_ON)
+        assert {c.id for c in report.checks} >= _SWEEP_IDS
+        assert report.verified is True, [(c.id, c.evidence) for c in report.failed_checks()]
+
+
+class TestSweepIsIndependent:
+    """It finds what it is looking for where the analyzer has no site."""
+
+    def test_script_at_a_site_nobody_walks_fails_with_its_path(self, tmp_path):
+        # An action stored under a key that is no action site at all. Neither
+        # the analyzer nor the sanitizer has any reason to look there.
+        def build(pdf):
+            pdf.pages[0].obj["/Annots"] = pikepdf.Array([pdf.make_indirect(
+                pikepdf.Dictionary(Type=pikepdf.Name("/Annot"),
+                                   Subtype=pikepdf.Name("/Link"),
+                                   Rect=[0, 0, 50, 50], Stash=_js()))])
+
+        src = _planted(tmp_path / "stash.pdf", build)
+        out = str(tmp_path / "out.pdf")
+        assert sanitize_pdf(src, out)["removed"] == {}        # nothing it knows to remove
+        report = verify_sanitization(out)
+        assert _check(report, "sanitize.scripts_js").passed is True     # the analyzer sees nothing
+        sweep = _check(report, "sanitize.sweep_javascript")
+        assert sweep.passed is False
+        assert any("/Annots[0]/Stash" in e for e in sweep.evidence)
+        assert report.verified is False
+
+    def test_3d_instantiation_script_is_seen_then_gone(self, tmp_path):
+        # A script on a 3D stream is not an action, so only a predicate about
+        # the stream itself sees it. Sanitize removes it under `javascript`.
+        def build(pdf):
+            artwork = pdf.make_stream(b"U3D\x00")
+            artwork["/Type"] = pikepdf.Name("/3D")
+            artwork["/Subtype"] = pikepdf.Name("/U3D")
+            artwork["/OnInstantiate"] = pdf.make_stream(b"app.alert(1);")
+            pdf.pages[0].obj["/Annots"] = pikepdf.Array([pdf.make_indirect(
+                pikepdf.Dictionary(Type=pikepdf.Name("/Annot"), Subtype=pikepdf.Name("/3D"),
+                                   Rect=[0, 0, 50, 50]))])
+            pdf.pages[0].obj["/Annots"][0]["/3DD"] = artwork
+
+        src = _planted(tmp_path / "3d.pdf", build)
+        before = _check(verify_sanitization(src), "sanitize.sweep_javascript")
+        assert before.passed is False
+        assert any("/3DD" in e and "OnInstantiate" in e for e in before.evidence)
+
+        out = str(tmp_path / "out.pdf")
+        sanitize_pdf(src, out)
+        after = verify_sanitization(out)
+        assert after.verified is True, [(c.id, c.evidence) for c in after.failed_checks()]
+
+    def test_inline_script_text_without_an_action_type(self, tmp_path):
+        p = _planted(tmp_path / "s.pdf", lambda pdf: pdf.Root.__setitem__(
+            "/Custom", pikepdf.Dictionary(JS=pikepdf.String("app.alert(1);"))))
+        sweep = _check(verify_sanitization(p, {"javascript": True}),
+                       "sanitize.sweep_javascript")
+        assert sweep.passed is False and "trailer/Root/Custom" in sweep.evidence[0]
+
+    @pytest.mark.parametrize("make", [
+        lambda pdf: pikepdf.Array([pdf.pages[0].obj, pikepdf.Name("/Fit")]),
+        lambda pdf: pikepdf.Name("/Chapter1"),
+        lambda pdf: pikepdf.String("Chapter1"),
+    ], ids=["explicit-array", "named-as-name", "named-as-string"])
+    def test_destination_openaction_is_not_an_action(self, tmp_path, make):
+        p = _planted(tmp_path / "d.pdf", lambda pdf: pdf.Root.__setitem__(
+            "/OpenAction", make(pdf)))
+        report = verify_sanitization(p, _ALL_ON)
+        assert report.verified is True, [(c.id, c.evidence) for c in report.failed_checks()]
+
+    def test_disabled_options_are_not_swept(self, tmp_path):
+        p = _planted(tmp_path / "o.pdf", lambda pdf: pdf.Root.__setitem__("/OpenAction", _js()))
+        report = verify_sanitization(p, {k: False for k in _ALL_ON})
+        assert not {c.id for c in report.checks} & _SWEEP_IDS
+
+
+class TestSweepDepth:
+    """The walk is iterative. A /Next chain is a linked list a file can make
+    as long as it likes; Python's recursion limit is about a thousand."""
+
+    def test_script_at_the_end_of_a_very_long_chain(self, tmp_path):
+        links = 20_000
+
+        def build(pdf):
+            node = pdf.make_indirect(_js())
+            for _ in range(links):
+                node = pdf.make_indirect(pikepdf.Dictionary(
+                    S=pikepdf.Name("/Named"), N=pikepdf.Name("/NextPage"), Next=node))
+            pdf.Root["/OpenAction"] = node
+
+        p = _planted(tmp_path / "deep.pdf", build)
+        report = verify_sanitization(p, {"javascript": True, "auto_actions": False})
+        sweep = _check(report, "sanitize.sweep_javascript")
+        assert sweep.passed is False
+        assert sweep.evidence == [
+            f"a JavaScript action at trailer/Root/OpenAction/Next(x{links})"]
+
+    def test_script_under_deep_inline_nesting(self, tmp_path):
+        def build(pdf):
+            node = _js()
+            for _ in range(150):
+                node = pikepdf.Dictionary(Inner=pikepdf.Array([node]))
+            pdf.Root["/Custom"] = node
+
+        p = _planted(tmp_path / "nest.pdf", build)
+        sweep = _check(verify_sanitization(p, {"javascript": True}),
+                       "sanitize.sweep_javascript")
+        assert sweep.passed is False
+
+    def test_cycles_end(self, tmp_path):
+        def build(pdf):
+            a = pdf.make_indirect(pikepdf.Dictionary(Name=pikepdf.String("a")))
+            b = pdf.make_indirect(pikepdf.Dictionary(Name=pikepdf.String("b"), Peer=a))
+            a["/Peer"] = b
+            pdf.Root["/Custom"] = a
+
+        status = WalkStatus()
+        with pikepdf.open(_planted(tmp_path / "cyc.pdf", build)) as pdf:
+            seen = [render_path(path) for path, _obj in walk_objects(pdf, status)]
+        assert status.complete
+        assert seen.count("trailer/Root/Custom") == 1
+        assert "trailer/Root/Custom/Peer" in seen
+
+    def test_strings_are_yielded_on_request(self, tmp_path):
+        # What a term search over the whole file would read.
+        p = _planted(tmp_path / "t.pdf", lambda pdf: pdf.Root.__setitem__(
+            "/Custom", pikepdf.Dictionary(Note=pikepdf.String("needle-123"))))
+        with pikepdf.open(p) as pdf:
+            found = {render_path(path): bytes(obj) for path, obj
+                     in walk_objects(pdf, WalkStatus(), strings=True)
+                     if isinstance(obj, pikepdf.String)}
+        assert found["trailer/Root/Custom/Note"] == b"needle-123"
+
+
+class TestSweepNeverPassesOnAPartialWalk:
+    """If the sweep did not see the whole file, what it did not see cannot
+    be reported absent. Every enabled option's check fails."""
+
+    def _clean(self, tmp_path) -> str:
+        return _planted(tmp_path / "clean.pdf", lambda pdf: pdf.Root.__setitem__(
+            "/Custom", pikepdf.Dictionary(Marker=pikepdf.Name("/Unreadable"))))
+
+    def test_clean_file_passes_when_fully_walked(self, tmp_path):
+        assert verify_sanitization(self._clean(tmp_path), _ALL_ON).verified is True
+
+    def test_unreadable_object_fails_every_sweep_check(self, tmp_path, monkeypatch):
+        real = pikepdf.Object.keys
+
+        def keys(self):
+            found = real(self)
+            if "/Marker" in found:
+                raise RuntimeError("simulated damaged object")
+            return found
+
+        monkeypatch.setattr(pikepdf.Object, "keys", keys)
+        report = verify_sanitization(self._clean(tmp_path), _ALL_ON)
+        sweeps = [c for c in report.checks if c.id in _SWEEP_IDS]
+        assert len(sweeps) == len(_SWEEP_IDS)
+        assert all(c.passed is False for c in sweeps)
+        assert all("did not cover the whole file" in c.evidence[0] for c in sweeps)
+        assert all("trailer/Root/Custom" in c.evidence[0] for c in sweeps)
+        assert report.verified is False
+
+    def test_object_limit_is_recorded_not_swallowed(self, tmp_path):
+        status = WalkStatus()
+        with pikepdf.open(self._clean(tmp_path)) as pdf:
+            list(walk_objects(pdf, status, max_nodes=2))
+        assert status.complete is False
+        assert "stopped after 2 objects" in status.problems[0]
+
+    def test_output_that_cannot_be_opened_fails_every_sweep_check(self, tmp_path):
+        from pdf_verify import _sweep_checks
+        checks = _sweep_checks(str(tmp_path / "missing.pdf"), _ALL_ON)
+        assert {c.id for c in checks} == _SWEEP_IDS
+        assert all(c.passed is False and c.evidence for c in checks)

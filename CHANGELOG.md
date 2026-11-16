@@ -2,6 +2,34 @@
 ## Unreleased
 
 ### Added
+- **Whole-file sweep in `verify_sanitization` (#101).** The verifier's
+  promise checks re-run the analyzer, so alone they were only as good as the
+  list of places the analyzer knows to look. `verify_sanitization` now takes
+  a second, independent look: `walk_objects` (new, public, in
+  `pdf_verify.py`) visits every dictionary and stream reachable from the
+  trailer — inline ones included — and for each enabled option a predicate
+  asks what the object *is*: an action by its `/S`, script text, an `/AA`
+  dictionary holding actions under the standard trigger names, a stream typed
+  as metadata, a dictionary whose `/EF` holds a stream, a 3D stream with an
+  `/OnInstantiate` script. One `sanitize.sweep_<option>` check per enabled
+  option; a hit fails it with the object path as evidence, **even at a place
+  the analyzer has no site for**. No predicate fires on a key name alone, so
+  a font named `/JS`, `/AA` or `/EF` or an image named `/Metadata` is not a
+  hit. The walk is iterative (tested on a 20,000-link `/Next` chain) and
+  cycle-safe, and it never passes on a partial walk: an object that cannot be
+  read, an output that cannot be opened, or a walk cut short fails every
+  sweep check. `walk_objects(..., strings=True)` also yields every string, for
+  a later whole-file term search in `verify_redaction`. Nothing calls
+  `verify_sanitization` from `sanitize_pdf` yet; that gate is the next change.
+  Tests: `TestSweep*` in `tests/test_pdf_verify.py`.
+- **Analyze/Sanitize parity matrix (#101).** `tests/test_sanitize_parity.py`
+  is generated from `pdf_analyze.ACTION_SITE_KINDS` — the one list of places
+  an action can hang — crossed with the action types the options remove
+  (JavaScript, Launch, SubmitForm, URI), plain and one step down a `/Next`
+  chain. Option on: Analyze finds it, the sweep finds it, Sanitize removes it
+  and counts it once, the output verifies. Option off: it survives and is
+  reported as a residual. A site kind with no way to plant an action fails
+  the suite, so a kind cannot be given to the analyzer and not the sanitizer.
 - **Fail-closed true redaction (#99).** Redaction now proves its own output
   is clean or refuses to save it. After the real `apply_redactions` pass,
   `redact_pdf` (`pdf_ops.py`) widens the scrub to every document-level
@@ -35,6 +63,67 @@
   save-failure) and `tests/test_pdf_verify.py` (D1 flatten targeting).
 
 ### Changed
+- **Default Sanitize now removes every additional action (`/AA`) on
+  annotations and form fields (#101).** Analyze has always reported any `/AA`
+  entry as an auto-run action, whatever it does, but with `auto_actions` on
+  (the default) Sanitize removed the whole `/AA` only from the catalog and
+  pages; on annotations it removed just the JavaScript, launch and submit
+  entries. It now removes every entry there and on form fields too. In
+  practice: **format, keystroke, validate and calculate scripts on form
+  fields are stripped wherever the field is** (previously only on fields that
+  were themselves page annotations), and non-script entries such as a
+  pointer-enter `/Hide` go as well. With `auto_actions` off, each other option
+  still removes its own action type from `/OpenAction` and every `/AA`, entry
+  by entry — before, a script in a page `/AA` survived `javascript` alone.
+- **Sanitize: `external_links` removes a URI action wherever it is (#101).**
+  It used to remove only a link annotation whose own `/A` was the URI. A URI
+  further down a `/Next` chain, in `/OpenAction`, on a bookmark or on a form
+  field is now removed too; a harmless action it was chained to stays.
+- **Sanitize leaves a destination `/OpenAction` in place (#101).** An
+  `/OpenAction` that is an array or a name only says where the document
+  opens. It was deleted and counted under `auto_actions`, although Analyze
+  never reported it. It is now kept; an `/OpenAction` that is an action is
+  still removed.
+- **Analyze reports metadata by presence (#101).** `meta.xmp` is reported for
+  any stream typed `/Metadata` or `/XML` on any object — the catalog, a page,
+  anything else — and for whatever stream sits in the catalog's `/Metadata`
+  slot, whether or not it can be parsed or even decoded; the finding lists
+  where each one hangs. An empty packet counts: it is in the file.
+  `meta.docinfo` reports every non-empty `/Info` entry, custom keys included,
+  except `/Trapped` (a prepress flag). Analyze no longer opens pikepdf's
+  metadata editing context to look, which made it report `/Info` entries a
+  file did not have.
+- **Analyze: a link to an external file is not an embedded file (#101).** A
+  file specification is reported under `files.embedded` only when it actually
+  carries a payload (`/EF` holding a stream) — and now also when it is
+  written inline inside another object, which was missed before. One with no
+  payload moves to a new, lower-severity finding, `files.external`
+  ("References to external files"): nothing is embedded, but the path
+  travels with the document. Sanitize does not remove those, so with
+  `embedded_files` on they are residuals, not failures. A font that happens
+  to be named `/EF` is no longer reported as an unnamed embedded file.
+- **Sanitize counters count what was there (#101).** `document_aa` and
+  `page_aa` count entries, not dictionaries. `xmp_metadata` counts metadata
+  streams and `doc_info` counts an `/Info` only if it had entries, so a blank
+  PDF reports nothing removed (it used to report two). **An embedded file is
+  one count however many places list it**: `embedded_files` counts the files
+  in the name tree (not the tree), and `associated_file`,
+  `file_attachment_annot` and the new `embedded_file` (a payload emptied in
+  place) each count only a file nothing counted before — pikepdf 10.16 and
+  later registers an attachment in both the name tree and the catalog `/AF`
+  as the same object, which used to count twice. Other new keys: `annot_aa`
+  and `field_aa` (an `/AA` entry removed only because it fires by itself) and
+  `instantiate_script`. Scripts, launches, submits and links removed from
+  bookmarks, fields and a link's `/PA` use the existing `annot_javascript`,
+  `launch_action`, `submit_action` and `external_link`.
+- **Sanitized output is a fixed point with a content-derived `/ID` (#117,
+  #101).** `sanitize_pdf` writes through `save_with_content_id`, so the
+  output no longer carries the source's trailer `/ID` (the verification
+  check for it lands with the #101 gate). It writes twice: qpdf packs object
+  streams by the numbers objects had on the way in, so only the second write
+  is the layout it would give that same file again. Sanitizing a sanitized
+  file now changes no byte, and the same input gives the same bytes on every
+  run. `fix_metadata_version` is off for these writes.
 - **Search-term redaction no longer rewrites metadata it was not asked to
   remove (#101).** A consequence of the XMP scrub fix below. Inspecting the
   XMP used to enter pikepdf's metadata editing context, which wrote an empty
@@ -91,6 +180,46 @@
   code with no remaining callers.
 
 ### Fixed
+- **Sanitize and Analyze missed actions on bookmarks and in the form-field
+  tree (#101).** JavaScript on a bookmark, or on a form field that no page
+  lists as an annotation (a parent field whose widget is a kid, a field with
+  no widget), was neither reported nor removed, and the output verified. A
+  button widget with a JavaScript `/A` was taken off its page and counted as
+  removed while the same dictionary, script included, stayed reachable
+  through `/AcroForm`. Both sides now walk one definition of where an action
+  can hang (`_action_owners` / `_owner_sites` in `pdf_analyze.py`): the
+  catalog, pages, annotations (their `/A`, their `/AA`, and `/PA` — the URI
+  action a link keeps from before it was retargeted), bookmarks and form
+  fields, each through its `/Next` chain. Outlines and the field tree are
+  walked iteratively and cycle-safe. Under `javascript`, Sanitize also
+  deletes the `/OnInstantiate` script of a 3D stream, which is JavaScript
+  but not an action and so sits at none of those sites. The sanitizer's annotation loop keeps its own page walk because
+  it rewrites `/Annots`; a test holds it to the same annotations as the
+  shared walk, including an indirect `/Annots` array, a null entry and an
+  annotation listed on two pages (dropped from both, counted once). Tests:
+  `TestActionSites`, `TestAnnotationWalkParity`, `TestOpenActionDestination`
+  in `tests/test_pdf_analyze.py`.
+- **Sanitize: metadata removal deleted nothing it could not parse (#101).**
+  It cleared pikepdf's parsed view of the XMP and saved, which wrote a
+  malformed packet's recovered tree back with its contents, never touched a
+  metadata stream on a page or other object, and invented a packet and an
+  `/Info` in files that had neither. It now deletes every metadata stream
+  outright, by what the stream says it is (`/Type /Metadata` or `/Subtype
+  /XML`) wherever it is referenced, never by a key that happens to be called
+  `/Metadata`. And `sanitize_pdf` raised `PdfError: While trying to update
+  XMP metadata` under any options on a file whose XMP stream could not be
+  decoded, because saving with `fix_metadata_version` parses the packet;
+  that file now sanitizes. Tests: `TestMetadataPresence` in
+  `tests/test_pdf_analyze.py`, `TestVerifySanitizationMetadata` in
+  `tests/test_pdf_verify.py`.
+- **Sanitize: embedded files outside the name tree, `/AF` and
+  `/FileAttachment` annotations survived (#101).** A payload on any other
+  holder was reported and kept; one in an inline file specification was not
+  even reported, and the output verified with it intact. After the
+  structural removals, any dictionary still reachable whose `/EF` holds a
+  stream is emptied in place — the payload, and the file name, description
+  and every other key that describes it. Tests: `TestEmbeddedFileRule` in
+  `tests/test_pdf_analyze.py`.
 - **A refused redaction no longer destroys the destination (#116).**
   `redact_pdf` renamed its output onto `output_path`, verified it there, and
   deleted it on refusal. Redacting in place (`output_path == input_path`) and
