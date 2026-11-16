@@ -141,7 +141,7 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 ### Repair & Analysis
 - **Repair PDF** — fix corrupted PDF files
 - **Compare PDFs** — find differences between two PDFs
-- **Analyze Document** — offline privacy & security audit; finds embedded JavaScript, auto-run/launch actions, external trackers, embedded files, hidden layers, invisible text, and identifying metadata, with one-click sanitizing
+- **Analyze Document** — offline privacy & security audit; finds embedded JavaScript (including scripts on bookmarks and form fields), auto-run/launch actions, external trackers, embedded files and references to external files, hidden layers, invisible text, and identifying metadata (document, page or object level), with one-click sanitizing
 
 ---
 
