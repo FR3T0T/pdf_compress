@@ -28,7 +28,11 @@ is reported and what can be removed do not drift apart.
   - Encryption status
 
 Plus :func:`sanitize_pdf`, a one-pass cleaner that strips the dangerous
-bits in place (or to a new file) and reports exactly what it removed.
+bits in place (or to a new file) and reports exactly what it removed. It
+verifies the cleaned copy before committing it and refuses one it cannot
+prove clean (``pdf_verify.verify_sanitization``). :func:`sanitize_payload`
+is that same run as the JSON-ready answer the app's bridge returns —
+success, refusal or failure — kept here so it is testable without Qt.
 
 The module is dependency-light and import-safe: optional libraries are
 imported lazily inside the functions that need them.
@@ -42,6 +46,7 @@ import logging
 import os
 import re
 import tempfile
+import traceback
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
@@ -1112,18 +1117,23 @@ def _scan_embedded_files(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
 
 
 def _scan_forms(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
-    """AcroForm and XFA presence."""
+    """AcroForm and XFA presence.
+
+    A catalog entry that is not a dictionary is not a form, and a field list
+    that is not an array holds no fields: neither is something that could
+    not be read. What does fail to read is reported, so the two findings
+    show as not checked rather than as absent.
+    """
     try:
         acro = pdf.Root.get("/AcroForm")
-    except Exception:
-        acro = None
-    if acro is None:
-        return
-    try:
+        if not isinstance(acro, (pikepdf.Dictionary, pikepdf.Stream)):
+            return
         has_xfa = "/XFA" in acro
-        nfields = len(acro.get("/Fields", []))
-    except Exception:
-        has_xfa, nfields = False, 0
+        fields = acro.get("/Fields")
+        nfields = len(fields) if isinstance(fields, pikepdf.Array) else 0
+    except Exception as exc:
+        _trouble("the form could not be read", exc)
+        return
 
     if has_xfa:
         res.add(Finding(
@@ -1143,18 +1153,20 @@ def _scan_forms(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
 
 
 def _scan_optional_content(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
-    """Optional content groups (layers) — content can be hidden."""
+    """Optional content groups (layers) — content can be hidden.
+
+    Like _scan_forms: what is not a layer list is not one, and what cannot
+    be read is reported.
+    """
     try:
         ocp = pdf.Root.get("/OCProperties")
-    except Exception:
-        ocp = None
-    if ocp is None:
+        if not isinstance(ocp, (pikepdf.Dictionary, pikepdf.Stream)):
+            return
+        groups = ocp.get("/OCGs")
+        n = len(groups) if isinstance(groups, pikepdf.Array) else 0
+    except Exception as exc:
+        _trouble("the layer list could not be read", exc)
         return
-    try:
-        groups = ocp.get("/OCGs", [])
-        n = len(groups)
-    except Exception:
-        n = 0
     if n:
         res.add(Finding(
             id="content.ocg", category="content", severity="low",
@@ -2108,7 +2120,10 @@ def _scrub_owner_actions(owner_kind: str, label: str, owner, opts: dict, bump) -
 
     An action that must go is deleted from where it is stored, and counted
     once; one that stays has its /Next chain cleaned. With `auto_actions`
-    the owner's /AA goes whole; otherwise it goes only once it is empty.
+    the owner's /AA goes whole; otherwise it goes only once it is empty. An
+    /AA that is not a dictionary holds no action this walk can count one by
+    one, so its removal is itself the count: one, under the owner's /AA
+    counter.
 
     Returns True if the owner's own /A entry was deleted. What that means
     for the owner is the caller's business: an annotation is dropped from
@@ -2150,12 +2165,15 @@ def _scrub_owner_actions(owner_kind: str, label: str, owner, opts: dict, bump) -
                 head_removed = True
         except Exception as exc:
             _trouble(f"an action of {_plain_owner(label)} could not be removed", exc)
-    if _OWNER_ENTRIES[owner_kind][1] is not None:
+    aa_kind = _OWNER_ENTRIES[owner_kind][1]
+    if aa_kind is not None:
         try:
             aa = owner.get("/AA")
             if aa is not None and (opts.get("auto_actions") or (
                     isinstance(aa, pikepdf.Dictionary) and len(aa.keys()) == 0)):
                 del owner["/AA"]
+                if not isinstance(aa, pikepdf.Dictionary):
+                    bump(aa_kind)
         except Exception as exc:
             _trouble(f"the additional actions of {_plain_owner(label)} could not be removed", exc)
     return head_removed
@@ -2267,14 +2285,57 @@ class SanitizationVerificationError(Exception):
     Raised instead of returning success (fail-closed, #101). ``report`` is
     the verification report as a dict: which checks failed and why, what
     could not be checked at all, and any diagnostics from the removal.
+    ``detail`` is the same refusal as the short lists a screen shows (see
+    pdf_verify.sanitize_refusal_detail).
     Nothing was written to the destination: the candidate lived in a temp
     file, now deleted, and whatever was at output_path before — the input
     itself, when sanitizing in place — is untouched.
     """
 
-    def __init__(self, message: str, *, report: Optional[dict] = None):
+    def __init__(self, message: str, *, report: Optional[dict] = None,
+                 detail: Optional[dict] = None):
         super().__init__(message)
         self.report = report
+        self.detail = detail
+
+
+class SanitizationOutputError(RuntimeError):
+    """The cleaned copy could not be written, read back, or moved into place.
+
+    Not a refusal: nothing was found wrong with the output, it could not be
+    produced. As with a refusal, nothing was written to the destination and
+    the candidate is gone. The message is for a person and names no file.
+    The library error behind it does — it quotes the path of the temp file
+    it was working on — so of that error only the type is kept, in
+    ``cause``, and it is not chained to this one.
+    """
+
+    def __init__(self, message: str, *, cause: str = ""):
+        super().__init__(message)
+        self.cause = cause
+
+
+#: stage at which the candidate was lost -> (what to tell the user, what to
+#: add when the operating system is what refused).
+_NOT_SAVED = {
+    "write": ("The cleaned copy could not be written, so nothing was saved.",
+              " Check that the destination folder exists and can be written to."),
+    "read": ("The cleaned copy could not be read back after it was written, so "
+             "nothing was saved.", ""),
+    "commit": ("The cleaned copy could not be moved into place, so nothing was saved.",
+               " Check that the destination file is not open in another program "
+               "and is not read-only."),
+}
+
+
+def _not_saved(stage: str, exc: BaseException) -> SanitizationOutputError:
+    """The error for a candidate lost at *stage* to *exc*: plain words, and
+    the type of *exc*. Raise it ``from None``."""
+    message, hint = _NOT_SAVED[stage]
+    cause = type(exc).__name__
+    log.warning("sanitize: the cleaned copy was lost at the %s stage (%s)", stage, cause)
+    return SanitizationOutputError(
+        message + (hint if isinstance(exc, OSError) else ""), cause=cause)
 
 
 def _remove_content(pdf: pikepdf.Pdf, opts: dict) -> dict[str, int]:
@@ -2483,8 +2544,15 @@ def _remove_content(pdf: pikepdf.Pdf, opts: dict) -> dict[str, int]:
         try:
             info = pdf.trailer.get("/Info")
             if info is not None:
-                try: had_entries = len(info.keys()) > 0
-                except Exception: had_entries = True     # not a dictionary at all
+                # Counted if there was anything to remove: a dictionary's
+                # entries, or an /Info that is no dictionary at all — a
+                # string, an array, a name, a number are each something the
+                # trailer held and now does not.
+                try:
+                    had_entries = (not isinstance(info, (pikepdf.Dictionary, pikepdf.Stream))
+                                   or len(info.keys()) > 0)
+                except Exception:
+                    had_entries = True
                 # Emptied, not only unhooked from the trailer: the same
                 # dictionary can be held under another key as well, and what
                 # is still referenced is still written. But only when it is
@@ -2538,6 +2606,11 @@ def sanitize_pdf(input_path: str, output_path: str,
     original is untouched. Findings the options did not promise to remove
     are not a failure; they are listed on the report as residuals.
 
+    If the candidate cannot be written, read back or moved into place — a
+    folder that is not there, a full disk, a destination open in another
+    program — SanitizationOutputError is raised instead, in plain words and
+    naming no file. That too leaves output_path as it was.
+
     Returns {"removed", "total_removed", "output", "output_size",
     "verification"}: the counters, and the verification report as a dict.
     """
@@ -2557,16 +2630,30 @@ def sanitize_pdf(input_path: str, output_path: str,
         with _collecting_trouble() as diagnostics:
             removed = _remove_content(pdf, opts)
 
+        # A damaged source opens by having its cross-reference table
+        # rebuilt, and the trailer rebuilt with it can lack /Size. qpdf
+        # writes the true size over whatever that key holds — but only if
+        # the key is there, and a file with object streams and no /Size
+        # cannot be opened again, by qpdf or anything else.
+        if "/Size" not in pdf.trailer:
+            pdf.trailer["/Size"] = 0
+
         # The candidate. fix_metadata_version stays off: it parses any XMP
         # packet on the way out, which rewrites one the user kept and raises
         # outright on one that cannot be decoded.
         out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
-        fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=out_dir)
-        os.close(fd)
         save_kwargs = {"fix_metadata_version": False,
                        "object_stream_mode": pikepdf.ObjectStreamMode.generate}
+        # Whatever goes wrong from here to the verified copy is a copy that
+        # could not be produced, not a document that could not be cleaned:
+        # it is reported in plain words (_not_saved), because the library's
+        # own message names the temp file.
+        tmp, stage = None, "write"
         try:
+            fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=out_dir)
+            os.close(fd)
             save_with_content_id(pdf, tmp, **save_kwargs)
+            stage = "read"
             # Write what was just written. qpdf packs objects into object
             # streams by the numbers they had on the way in, so the first
             # write of a file is not the layout qpdf gives that same file
@@ -2588,10 +2675,10 @@ def sanitize_pdf(input_path: str, output_path: str,
                 for _ in range(2):
                     with pikepdf.open(tmp, allow_overwriting_input=True) as again:
                         save_with_content_id(again, tmp, **other)
-        except Exception:
-            if os.path.exists(tmp):
+        except Exception as exc:
+            if tmp is not None and os.path.exists(tmp):
                 os.unlink(tmp)
-            raise
+            raise _not_saved(stage, exc) from None
 
     # Verify, then commit: the temp is closed, and it is exactly what would
     # be renamed into place. (Imported here, not at the top: pdf_verify
@@ -2605,8 +2692,12 @@ def sanitize_pdf(input_path: str, output_path: str,
         report.diagnostics = list(diagnostics)
         if not report.verified:
             raise SanitizationVerificationError(
-                pdf_verify.sanitize_refusal_message(report), report=report.to_dict())
-        os.replace(tmp, output_path)
+                pdf_verify.sanitize_refusal_message(report), report=report.to_dict(),
+                detail=pdf_verify.sanitize_refusal_detail(report))
+        try:
+            os.replace(tmp, output_path)
+        except OSError as exc:
+            raise _not_saved("commit", exc) from None
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -2731,6 +2822,49 @@ def strip_file(input_path: str, output_path: str,
     if head.startswith(_JPEG_MAGIC) or head.startswith(_PNG_MAGIC):
         return strip_image_metadata(input_path, output_path)
     raise ValueError("Unsupported file type (expected PDF, JPEG, or PNG)")
+
+
+def sanitize_payload(input_path: str, output_path: str, options: Any = None) -> dict:
+    """strip_file(), as the JSON-ready answer the app gives its window.
+
+    It never raises — the bridge slot that returns this has nowhere to raise
+    to — and it is here, not in the bridge, so that it can be tested without
+    Qt. One of three shapes:
+
+      * done — the strip_file result plus ``"success": True``. For a PDF
+        that includes ``verification``, the report its output passed before
+        it was committed; an image has none.
+      * refused (SanitizationVerificationError) — ``"success": False``,
+        ``"error"`` the one sentence saying why, ``"verification"`` the
+        report, and ``"refusal"`` the same thing as short lists for a
+        screen: what is still present, what could not be checked, whether
+        it is the identifier (pdf_verify.sanitize_refusal_detail).
+      * failed — ``"success": False``, ``"error"``, and ``"errorType"``,
+        the type of what went wrong.
+
+    *options* that are not a dict count as none given. Nothing logged from
+    here names a file: of an unexpected error the log gets the type and
+    where in the code it happened, not its text, because library messages
+    quote the path they were reading.
+    """
+    try:
+        result = strip_file(input_path, output_path,
+                            options if isinstance(options, dict) else None)
+    except SanitizationVerificationError as exc:
+        log.info("sanitize refused: the output could not be verified")
+        return {"success": False, "error": str(exc),
+                "verification": exc.report, "refusal": exc.detail}
+    except SanitizationOutputError as exc:          # logged where it was raised
+        return {"success": False, "error": str(exc), "errorType": exc.cause}
+    except FileNotFoundError:
+        log.warning("sanitize failed: the input is not there (FileNotFoundError)")
+        return {"success": False, "error": "The file to sanitize could not be found.",
+                "errorType": "FileNotFoundError"}
+    except Exception as exc:
+        log.error("sanitize failed (%s)\n%s", type(exc).__name__,
+                  "".join(traceback.format_tb(exc.__traceback__)))
+        return {"success": False, "error": str(exc), "errorType": type(exc).__name__}
+    return {**result, "success": True}
 
 
 # ════════════════════════════════════════════════════════════════════

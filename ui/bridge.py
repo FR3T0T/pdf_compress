@@ -51,7 +51,7 @@ from epdf_crypto import (
     epdf_read_metadata,
     is_epdf,
 )
-from pdf_analyze import DEFAULT_SANITIZE, analyze_file, strip_file
+from pdf_analyze import DEFAULT_SANITIZE, analyze_file, sanitize_payload
 from pdf_ops import (
     RedactionVerificationError,
     add_page_numbers,
@@ -648,21 +648,23 @@ class Bridge(QObject):
         keys: javascript, launch_actions, auto_actions, embedded_files,
         submit_actions, external_links, metadata); JPEG/PNG images go to
         ``strip_image_metadata`` (which removes all EXIF/GPS/thumbnail/
-        authorship metadata — the options don't apply). PDF behaviour is
-        unchanged.
+        authorship metadata — the options don't apply).
+
+        A PDF is verified before it is committed (#101). The answer is one of
+        three shapes, built by the Qt-free ``pdf_analyze.sanitize_payload`` so
+        it is tested without this module: success with ``verification`` (the
+        report the output passed; images have none); a refusal with
+        ``error``, ``verification`` and ``refusal`` (what is still present,
+        what could not be checked, the identifier case — nothing was
+        written); or a failure with ``error`` and ``errorType``. Nothing is
+        logged here: ``sanitize_payload`` logs, and never a file path.
         """
         try:
-            try:
-                opts = json.loads(options_json) if options_json else {}
-            except Exception:
-                opts = {}
-            result = strip_file(path, output_path, opts)
-            result["success"] = True
-            return json.dumps(result, ensure_ascii=False)
-        except Exception as exc:
-            log.exception("sanitizeDocument failed for %s", path)
-            return json.dumps({"success": False, "error": str(exc)},
-                              ensure_ascii=False)
+            opts = json.loads(options_json) if options_json else {}
+        except Exception:
+            opts = {}
+        return json.dumps(sanitize_payload(path, output_path, opts),
+                          ensure_ascii=False, default=str)
 
     # ── Translation ───────────────────────────────────────────────
 

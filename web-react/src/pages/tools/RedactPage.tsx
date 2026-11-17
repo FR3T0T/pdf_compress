@@ -561,10 +561,17 @@ export function RedactPage() {
   );
 }
 
-/** Fail-closed redaction result (#99): verify_redaction refused the output
- *  (it was deleted). Shows what survived and where, and — only when every
- *  residual is page-content — offers the D1 flatten-to-image retry. A
- *  document-level residual can't be flattened, so no offer is shown. */
+/** Fail-closed redaction result (#99): verify_redaction refused the
+ *  candidate before it reached the destination, so nothing was written
+ *  there and whatever was at that path is untouched. Shows what survived
+ *  and where, and — only when every residual is page-content — offers the
+ *  D1 flatten-to-image retry. A document-level residual can't be flattened,
+ *  so no offer is shown.
+ *
+ *  A refusal is not always about content: when the only failed check is
+ *  `redaction.file_id`, the redaction itself held and the copy was refused
+ *  because it would still carry the source's identifier. The wording says
+ *  which of the two it was. */
 function VerificationFailurePanel({
   failure,
   flattenablePages,
@@ -577,16 +584,20 @@ function VerificationFailurePanel({
   busy: boolean;
 }) {
   const failed = (failure.verification?.checks ?? []).filter((c) => !c.passed);
+  const identifierOnly = failed.length > 0 && failed.every((c) => c.id === 'redaction.file_id');
   return (
     <div style={{ marginTop: 'var(--space-4)' }}>
       <Card>
         <div style={{ borderLeft: '3px solid var(--sev-high)', paddingLeft: 'var(--space-3)' }}>
           <strong style={{ fontSize: 'var(--font-size-sm)', color: 'var(--sev-high)' }}>
-            Redaction refused — the output could not be proven clean.
+            {identifierOnly
+              ? 'Redaction refused — the output would still be linked to the original.'
+              : 'Redaction refused — the output could not be proven clean.'}
           </strong>
           <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)', marginTop: 4 }}>
-            Nothing was written. Sensitive content was still detectable after redaction, so the
-            file was discarded rather than saved with a leak.
+            {identifierOnly
+              ? "Nothing was written. The redacted copy would still carry the original file's identifier, which links the two files, so it was not saved."
+              : 'Nothing was written. Sensitive content was still detectable after redaction, so the copy was not saved with a leak.'}
           </div>
 
           {failed.length > 0 && (
@@ -621,8 +632,9 @@ function VerificationFailurePanel({
             </div>
           ) : (
             <div style={{ marginTop: 'var(--space-3)', color: 'var(--text-3)', fontSize: 'var(--font-size-xs)' }}>
-              This residual is in document-level data (metadata, bookmarks, or attachments) that
-              flattening cannot fix. Please report this file — the scrubber should have removed it.
+              {identifierOnly
+                ? 'The identifier is not on any page, so flattening cannot change it. Please report this file — the identifier should have been replaced.'
+                : 'This residual is in document-level data (metadata, bookmarks, or attachments) that flattening cannot fix. Please report this file — the scrubber should have removed it.'}
             </div>
           )}
         </div>

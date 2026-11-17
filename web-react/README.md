@@ -37,7 +37,9 @@ npm run preview   # optional: serve the dist/ build locally to sanity-check
 `npm run dev` opens in a normal browser where `window.BridgeAPI` doesn't
 exist. The bridge module (`src/bridge/bridgeApi.ts`) detects that and serves
 realistic mock responses instead, so every page is reviewable standalone
-(drop zones fall back to a real `<input type="file">`). Route `#/gallery` is a
+(drop zones fall back to a real `<input type="file">`). On the Analyze page
+the mock Sanitize is verified, and lists what the ticked options left alone;
+tick "External links" to see a refusal instead. Route `#/gallery` is a
 dev-only component gallery, not shown in the sidebar.
 
 ## Project structure

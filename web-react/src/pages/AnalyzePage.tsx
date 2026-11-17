@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { bridgeApi } from '../bridge/bridgeApi';
 import { MOCK_SANITIZE_DEFAULTS } from '../bridge/mockData';
 import { SEVERITY_ORDER } from '../types/analyze';
-import type { AnalyzeReport, SanitizeOptions } from '../types/analyze';
+import type { AnalyzeReport, SanitizeOptions, SanitizeResponse } from '../types/analyze';
 import type { PickedFile } from '../types/bridge';
 import { DropZone } from '../components/shared/DropZone';
 import { PageHeader } from '../components/shared/PageHeader';
@@ -10,6 +10,7 @@ import { useToast } from '../components/shared/Toast';
 import { RiskHeader } from '../components/RiskHeader';
 import { FindingRow } from '../components/FindingRow';
 import { SanitizePanel } from '../components/SanitizePanel';
+import { SanitizeOutcome } from '../components/SanitizeOutcome';
 import { Card } from '../components/shared/Card';
 import { useWorkspace, useWorkspaceBusy } from '../workspace/WorkspaceContext';
 
@@ -25,6 +26,10 @@ export function AnalyzePage() {
   // than seed it with a placeholder that could still be in flight.
   const [sanitizeDefaults, setSanitizeDefaults] = useState<SanitizeOptions | null>(null);
   const [sanitizing, setSanitizing] = useState(false);
+  // The last Sanitize answer for this file: a verified run or a refusal is
+  // shown under the panel (SanitizeOutcome), because a toast cannot carry
+  // what was left or why nothing was saved.
+  const [outcome, setOutcome] = useState<SanitizeResponse | null>(null);
 
   // -- Workspace (persistent working document) -----------------------------
   // Read-only: analysis can run against the workspace document, and Sanitize
@@ -49,6 +54,7 @@ export function AnalyzePage() {
   // Deliberately depends on filePath only — analyze() is redefined every
   // render and would otherwise re-run this on every keystroke elsewhere.
   useEffect(() => {
+    setOutcome(null);
     if (filePath) void analyze(filePath);
     else {
       setReport(null);
@@ -59,7 +65,11 @@ export function AnalyzePage() {
   const findings = useMemo(() => {
     if (!report) return [];
     const order = Object.fromEntries(SEVERITY_ORDER.map((s, i) => [s, i]));
-    return [...report.findings].sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9));
+    // "Audit incomplete" goes first whatever its severity: it qualifies
+    // every other row, and the absence of rows.
+    const rank = (f: AnalyzeReport['findings'][number]) =>
+      f.id === 'audit.incomplete' ? -1 : (order[f.severity] ?? 9);
+    return [...report.findings].sort((a, b) => rank(a) - rank(b));
   }, [report]);
 
   const analyze = async (path: string) => {
@@ -97,18 +107,36 @@ export function AnalyzePage() {
   const runSanitize = async (outputPath: string, options: SanitizeOptions) => {
     if (!filePath) return;
     setSanitizing(true);
+    setOutcome(null);
     try {
       const res = await bridgeApi.sanitizeDocument(filePath, outputPath, options);
+      setOutcome(res);
+      // A PDF's clean copy is verified before it is saved (#101), so a
+      // success with a report means verified; images carry no report.
+      const left = res.verification?.residualFindings.length ?? 0;
+      const proof = !res.verification?.verified
+        ? ''
+        : left
+          ? ` Verified — ${left} finding${left === 1 ? '' : 's'} outside the selected options remain${left === 1 ? 's' : ''}.`
+          : ' Verified.';
       if (!res.success) {
-        toast.error(res.error || 'Sanitize failed.');
+        // A refusal carries its report and is spelled out under the panel;
+        // anything else is a one-line failure.
+        toast.error(
+          res.verification
+            ? 'Sanitize refused — nothing was saved. The reason is shown below.'
+            : res.error || 'Sanitize failed.'
+        );
       } else if (!res.total_removed) {
         toast.info(
           isImage
             ? 'No metadata needed removing — clean copy written.'
-            : 'Nothing matched the selected options — clean copy written.'
+            : `Nothing matched the selected options — clean copy written.${proof}`
         );
       } else {
-        toast.success(`Removed ${res.total_removed} item${res.total_removed === 1 ? '' : 's'}. Clean copy saved.`);
+        toast.success(
+          `Removed ${res.total_removed} item${res.total_removed === 1 ? '' : 's'}. Clean copy saved.${proof}`
+        );
       }
     } catch {
       toast.error('Could not sanitize the file.');
@@ -172,6 +200,7 @@ export function AnalyzePage() {
                 busy={sanitizing}
                 imageMode={isImage}
               />
+              {outcome && <SanitizeOutcome result={outcome} />}
             </div>
           )}
         </>

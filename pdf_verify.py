@@ -40,9 +40,29 @@ transform raises, with the report, having touched nothing at the destination:
     /ID elements it asserts, like the redaction side, that the output
     carries none of them (``sanitize.file_id``).
     :func:`sanitize_refusal_message` turns a failed report into the one
-    sentence a refusal shows. ``pdf_analyze`` runs the same sweep from
+    sentence a refusal shows, and :func:`sanitize_refusal_detail` into the
+    short lists a screen shows under it (what is still present, what could
+    not be checked, the identifier case); ``pdf_analyze.sanitize_payload``
+    hands both to the app. ``pdf_analyze`` runs the same sweep from
     Analyze (imported there lazily; this module imports that one), so what
     would be refused here is reported there first.
+
+Known limits of the sanitize gate, each needing a file built for the purpose
+(the README lists them for users):
+
+  - Sanitize empties the trailer's /Info dictionary in place when it is
+    nothing but document information, so a second reference to it keeps
+    nothing. A dictionary of only strings, names, numbers and booleans, with
+    no /Type, /Subtype or /S, that the trailer calls /Info *and* something
+    else uses (a graphics state written without /Type) is emptied with it.
+  - The other way round, an /Info also held under a second key that is not
+    plain (it declares a /Type, or holds an array or a dictionary) is only
+    unhooked from the trailer. Its entries stay in the output under the
+    other key, and the output verifies: nothing there marks them as document
+    information any more. Narrowing either rule widens the other.
+  - ``sanitize.file_id`` and ``redaction.file_id`` compare the ELEMENTS of
+    the two trailer /ID values (:func:`_file_id_check`). An identifier the
+    source carries inside a nested array is not an element, and is not seen.
 
 Fail-closed semantics: an output that cannot be opened, decrypted, or
 re-scanned yields a FAILED check; a surface (or single page/stream/rect)
@@ -1266,6 +1286,66 @@ def sanitize_refusal_message(report: VerificationReport) -> str:
     if any(c.id == "sanitize.file_id" for c in failed):
         parts.append("the output would still carry the source file's identifier")
     return "Sanitize could not be verified: " + ("; ".join(parts) or "a check failed") + "."
+
+
+def sanitize_refusal_detail(report: VerificationReport) -> dict:
+    """The same refusal as the short lists a screen shows.
+
+    ``stillPresent``
+        One line for each category an enabled option promised to remove and
+        the output still has: its name, then where. The places are the
+        sweep's evidence, which is already in plain words; where only the
+        audit found it, they are the audit's own lines, the ones Analyze
+        lists. Three places at most — the report has them all.
+    ``notChecked``
+        The categories that could not be checked at all. A category that is
+        still present is not repeated here.
+    ``identifier``
+        The output would still carry its source's identifier.
+    ``unreadable``
+        The output could not be read back.
+
+    Everything is empty or false for a report that verified. The wording is
+    produced here, not in the window, so that it is in one place and tested.
+    """
+    def name(check: VerificationCheck) -> str:
+        words = _CATEGORY_WORDS.get(check.id.split(".", 1)[-1],
+                                    "content the selected options remove")
+        return words[:1].upper() + words[1:]
+
+    failed = report.failed_checks()
+    special = {"sanitize.file_id", "sanitization.readable"}
+    swept: dict[str, list[str]] = {}        # category -> where, in the sweep's words
+    audited: dict[str, list[str]] = {}      # category -> the audit's own lines
+    present, unchecked = [], []
+    for c in failed:
+        if c.id in special:
+            continue
+        if c.unevaluated:
+            unchecked.append(name(c))
+            continue
+        present.append(name(c))
+        if c.id.startswith("sanitize.sweep_"):
+            # A sweep check lists what it found first, one line per object
+            # path; anything after that is about the sweep, not a place.
+            swept.setdefault(name(c), []).extend(c.evidence[:len(c.object_paths)])
+        else:
+            # The first line names the finding; a later one may say the
+            # audit also could not finish.
+            audited.setdefault(name(c), []).extend(
+                e for e in c.evidence[1:] if "could not be fully checked" not in e)
+
+    still = []
+    for category in _dedupe(present):
+        places = _dedupe(swept.get(category) or audited.get(category, []))
+        shown = "; ".join(places[:3] + (["and others"] if len(places) > 3 else []))
+        still.append(f"{category}: {shown}" if shown else category)
+    return {
+        "stillPresent": still,
+        "notChecked": [c for c in _dedupe(unchecked) if c not in present],
+        "identifier": any(c.id == "sanitize.file_id" for c in failed),
+        "unreadable": any(c.id == "sanitization.readable" for c in failed),
+    }
 
 
 def verify_sanitization(output_path: str, options: Optional[dict] = None, *,
