@@ -359,13 +359,15 @@ class TestVerifyRedactionOutcomes:
         d = verify_redaction(src, [TERM], input_path="in.pdf").to_dict()
         assert set(d) == {"inputPath", "outputPath", "tool", "timestamp",
                           "checks", "residualFindings", "verified",
-                          "flattenTargetPages", "sourceSha256", "outputSha256"}
+                          "flattenTargetPages", "sourceSha256", "outputSha256",
+                          "unevaluated", "diagnostics"}
         assert d["tool"] == "redaction"
         assert d["inputPath"] == "in.pdf"
         assert d["verified"] is True
         assert d["flattenTargetPages"] is None       # nothing failed
         assert all(set(c) == {"id", "description", "passed", "evidence",
-                              "pages", "isDocumentLevel"}
+                              "pages", "isDocumentLevel", "unevaluated",
+                              "objectPaths"}
                    for c in d["checks"])
 
 
@@ -907,13 +909,12 @@ class TestSweepIsIndependent:
                                    Rect=[0, 0, 50, 50], Stash=_js()))])
 
         src = _planted(tmp_path / "stash.pdf", build)
-        out = str(tmp_path / "out.pdf")
-        assert sanitize_pdf(src, out)["removed"] == {}        # nothing it knows to remove
-        report = verify_sanitization(out)
-        assert _check(report, "sanitize.scripts_js").passed is True     # the analyzer sees nothing
+        report = verify_sanitization(src)
+        assert _check(report, "sanitize.scripts_js").passed is True     # no site scanner sees it
         sweep = _check(report, "sanitize.sweep_javascript")
-        assert sweep.passed is False
-        assert any("/Annots[0]/Stash" in e for e in sweep.evidence)
+        assert sweep.passed is False and sweep.unevaluated is False
+        assert sweep.evidence == ["a JavaScript action on page 1, annotation 1, under /Stash"]
+        assert sweep.object_paths == ["trailer/Root/Pages/Kids[0]/Annots[0]/Stash"]
         assert report.verified is False
 
     def test_3d_instantiation_script_is_seen_then_gone(self, tmp_path):
@@ -932,7 +933,9 @@ class TestSweepIsIndependent:
         src = _planted(tmp_path / "3d.pdf", build)
         before = _check(verify_sanitization(src), "sanitize.sweep_javascript")
         assert before.passed is False
-        assert any("/3DD" in e and "OnInstantiate" in e for e in before.evidence)
+        assert before.evidence == [
+            "a script that runs when 3D artwork loads on page 1, annotation 1"]
+        assert before.object_paths == ["trailer/Root/Pages/Kids[0]/Annots[0]/3DD"]
 
         out = str(tmp_path / "out.pdf")
         sanitize_pdf(src, out)
@@ -944,7 +947,9 @@ class TestSweepIsIndependent:
             "/Custom", pikepdf.Dictionary(JS=pikepdf.String("app.alert(1);"))))
         sweep = _check(verify_sanitization(p, {"javascript": True}),
                        "sanitize.sweep_javascript")
-        assert sweep.passed is False and "trailer/Root/Custom" in sweep.evidence[0]
+        assert sweep.passed is False
+        assert sweep.evidence == ["a script in the document catalog, under /Custom"]
+        assert sweep.object_paths == ["trailer/Root/Custom"]
 
     @pytest.mark.parametrize("make", [
         lambda pdf: pikepdf.Array([pdf.pages[0].obj, pikepdf.Name("/Fit")]),
@@ -982,7 +987,9 @@ class TestSweepDepth:
         sweep = _check(report, "sanitize.sweep_javascript")
         assert sweep.passed is False
         assert sweep.evidence == [
-            f"a JavaScript action at trailer/Root/OpenAction/Next(x{links})"]
+            f"a JavaScript action in the document's open action, {links} steps "
+            f"down a chain of actions"]
+        assert sweep.object_paths == [f"trailer/Root/OpenAction/Next(x{links})"]
 
     def test_script_under_deep_inline_nesting(self, tmp_path):
         def build(pdf):

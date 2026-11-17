@@ -42,7 +42,10 @@ import logging
 import os
 import re
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
+from decimal import Decimal
 from typing import Any, NamedTuple, Optional
 
 import pikepdf
@@ -80,9 +83,26 @@ class AnalysisResult:
     pdf_version: str = ""
     encrypted: bool = False
     findings: list[Finding] = field(default_factory=list)
+    #: finding id -> why it could not be fully evaluated. An id in here means
+    #: "not checked", which is not "not there": the audit tolerates a
+    #: structure it cannot read and carries on, but it says so, by the id of
+    #: every finding that structure could have produced.
+    unevaluated: dict[str, list[str]] = field(default_factory=dict)
 
     def add(self, f: Finding) -> None:
         self.findings.append(f)
+
+    def incomplete(self, ids, reasons) -> None:
+        """Record that the findings *ids* could not be fully evaluated."""
+        reasons = [reasons] if isinstance(reasons, str) else list(reasons)
+        if not reasons:
+            return                  # nothing went wrong: nothing to record
+        for fid in ids:
+            known = self.unevaluated.setdefault(fid, [])
+            known.extend(r for r in reasons if r not in known)
+
+    def find(self, fid: str) -> Optional[Finding]:
+        return next((f for f in self.findings if f.id == fid), None)
 
     # -- rollups -------------------------------------------------------
     def counts(self) -> dict[str, int]:
@@ -110,6 +130,7 @@ class AnalysisResult:
             "findings": [asdict(f) for f in self.findings],
             "counts": self.counts(),
             "overallRisk": self.overall_risk(),
+            "unevaluated": {fid: list(why) for fid, why in self.unevaluated.items()},
         }
         return d
 
@@ -135,13 +156,144 @@ def _as_str(obj: Any) -> str:
         return ""
 
 
+# ── Tolerant, not silent ─────────────────────────────────────────────
+#
+#  The walkers below are tolerant by design: one structure they cannot read
+#  must not end the audit or the cleanup. But "could not look" is not
+#  "nothing there", so every place that swallows an exception reports it
+#  with _trouble(). Whoever is running the walk collects the reports — the
+#  analyzer turns them into "this finding could not be evaluated", the
+#  sanitizer keeps them as diagnostics for a refusal. A context variable
+#  carries the collector so the walkers, which both sides share, need no
+#  extra parameter and cannot be called in a way that drops the report.
+
+_trouble_sink: ContextVar[Optional[list]] = ContextVar("_trouble_sink", default=None)
+
+
+def _trouble(what: str, exc: Optional[BaseException] = None) -> None:
+    """Report a structure that could not be read. *what* says which, in
+    words that name no file; of the exception only its type is kept, because
+    library messages quote the path of the file they were reading."""
+    sink = _trouble_sink.get()
+    if sink is not None:
+        note = what if exc is None else f"{what} ({type(exc).__name__})"
+        if note not in sink:
+            sink.append(note)
+
+
+@contextmanager
+def _collecting_trouble():
+    """Collect what the walkers report while the block runs; yields the list."""
+    notes: list[str] = []
+    token = _trouble_sink.set(notes)
+    try:
+        yield notes
+    finally:
+        _trouble_sink.reset(token)
+
+
 def _iter_all_objects(pdf: pikepdf.Pdf):
-    """Yield every indirect object once (bounded, cycle-safe)."""
+    """Yield every indirect object in the file once."""
     try:
         for obj in pdf.objects:
             yield obj
-    except Exception:
-        return
+    except Exception as exc:
+        _trouble("the list of objects in the file could not be read to the end", exc)
+
+
+def _name_tree_leaves(node):
+    """Yield (node, entries) for every node of a name tree that holds
+    entries: leaves hold ``[key, value, key, value, ...]`` in /Names,
+    intermediate nodes hold /Kids. Iterative and cycle-safe, so it needs no
+    depth limit."""
+    seen, stack = set(), [node]
+    while stack:
+        cur = stack.pop()
+        try:
+            if not isinstance(cur, pikepdf.Dictionary):
+                continue
+            if cur.is_indirect:
+                key = tuple(cur.objgen)
+                if key in seen:
+                    continue
+                seen.add(key)
+            entries = cur.get("/Names")
+            kids = cur.get("/Kids")
+            if isinstance(kids, pikepdf.Array):
+                stack.extend(list(kids)[::-1])
+            if isinstance(entries, pikepdf.Array):
+                yield cur, entries
+        except Exception as exc:
+            _trouble("part of a name tree could not be read", exc)
+
+
+def _name_tree_items(node):
+    """Yield (key, value) for every entry of a name tree (see
+    _name_tree_leaves)."""
+    for _leaf, entries in _name_tree_leaves(node):
+        try:
+            for i in range(0, len(entries) - 1, 2):
+                yield entries[i], entries[i + 1]
+        except Exception as exc:
+            _trouble("part of a name tree could not be read", exc)
+
+
+def _name_tree_values(node):
+    """The values of a name tree (see _name_tree_items)."""
+    for _key, value in _name_tree_items(node):
+        yield value
+
+
+#: Name trees under the catalog's /Names whose values are pages that are not
+#: in the page tree: page templates, and "named pages". A viewer can show or
+#: spawn them, so whatever hangs on them is in the document.
+_PAGE_NAME_TREES = (("/Templates", "Template page"), ("/Pages", "Named page"))
+
+
+def _all_pages(pdf: pikepdf.Pdf):
+    """Yield (label, page dictionary) for every page of the document: the
+    ones in the page tree, then the ones held only by the /Names /Templates
+    and /Names /Pages name trees. Each page once.
+
+    The analyzer and the sanitizer both take their pages from here, so a
+    page one of them walks is a page the other walks.
+    """
+    seen = set()
+
+    def first_visit(obj) -> bool:
+        try:
+            if not obj.is_indirect:
+                return True
+            key = tuple(obj.objgen)
+        except Exception as exc:
+            _trouble("a page's identity could not be read", exc)
+            return True
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    try:
+        tree_pages = [page.obj for page in pdf.pages]
+    except Exception as exc:
+        _trouble("the page tree could not be read", exc)
+        tree_pages = []
+    for pi, page in enumerate(tree_pages, 1):
+        if first_visit(page):
+            yield f"Page {pi}", page
+    try:
+        names = pdf.Root.get("/Names")
+        trees = ([(names.get(key), word) for key, word in _PAGE_NAME_TREES]
+                 if isinstance(names, pikepdf.Dictionary) else [])
+    except Exception as exc:
+        _trouble("the catalog's name trees could not be read", exc)
+        trees = []
+    for tree, word in trees:
+        if tree is None:
+            continue
+        for name, page in _name_tree_items(tree):
+            if isinstance(page, pikepdf.Dictionary) and first_visit(page):
+                yield f"{word} {_label(name)}", page
 
 
 _URL_RE = re.compile(r"https?://[^\s/]+", re.IGNORECASE)
@@ -167,6 +319,34 @@ _INFO_STANDARD = ("/Author", "/Creator", "/Producer", "/Title",
 #: a prepress flag (/True, /False or /Unknown).
 _INFO_NOT_IDENTIFYING = frozenset({"/Trapped"})
 
+#: What a value in a document information dictionary can be: a string, a
+#: name, a number or a boolean (pikepdf hands the last two over as Python
+#: values).
+_INFO_VALUE_TYPES = (pikepdf.String, pikepdf.Name, int, float, Decimal)
+
+
+def _is_plain_info(obj) -> bool:
+    """True if *obj* is nothing but document information: a dictionary, not
+    a stream, that declares no /Type, /Subtype or /S, and whose every value
+    is a string, a name, a number or a boolean.
+
+    The trailer's /Info is whatever object the trailer points at, and a file
+    can point it at one with another job: a real one has /Info and the page
+    tree root as the same object. Such an object says what it is (/Type,
+    /Subtype, /S) or holds what document information never does — an array,
+    a dictionary, a stream. Only an object that passes this test may be
+    emptied; the others are left exactly as they are.
+    """
+    try:
+        if not isinstance(obj, pikepdf.Dictionary):
+            return False
+        keys = obj.keys()
+        return (not keys & {"/Type", "/Subtype", "/S"}
+                and all(isinstance(obj[k], _INFO_VALUE_TYPES) for k in keys))
+    except Exception as exc:
+        _trouble("the document information dictionary could not be read", exc)
+        return False
+
 
 def _is_metadata_stream(obj) -> bool:
     """True for a stream that declares itself metadata: /Type /Metadata or
@@ -180,8 +360,50 @@ def _is_metadata_stream(obj) -> bool:
         return (isinstance(obj, pikepdf.Stream)
                 and (_as_str(obj.get("/Type")) == "/Metadata"
                      or _as_str(obj.get("/Subtype")) == "/XML"))
-    except Exception:
+    except Exception as exc:
+        _trouble("a stream's type could not be read", exc)
         return False
+
+
+def _metadata_slots(pdf: pikepdf.Pdf):
+    """Yield (holder, stream) for every /Metadata entry that is metadata by
+    position: on the catalog, on a page, and on any other object that says
+    what it is with a /Type name.
+
+    On those the entry is defined to be the object's metadata, and it is
+    where a reader looks, so the stream there counts whether or not it is
+    typed. A resource dictionary is not such an object: it maps arbitrary
+    names — /Metadata among them — to fonts and images, and it declares no
+    /Type.
+    """
+    def candidates():
+        try:
+            yield pdf.Root, True
+        except Exception as exc:
+            _trouble("the document catalog could not be read", exc)
+        for _label, page in _all_pages(pdf):
+            yield page, True
+        for obj in _iter_all_objects(pdf):
+            yield obj, False
+
+    seen = set()
+    for holder, known in candidates():
+        try:
+            if not isinstance(holder, (pikepdf.Dictionary, pikepdf.Stream)):
+                continue
+            md = holder.get("/Metadata")
+            if not isinstance(md, pikepdf.Stream):
+                continue
+            if not (known or isinstance(holder.get("/Type"), pikepdf.Name)):
+                continue
+            if holder.is_indirect:
+                key = tuple(holder.objgen)
+                if key in seen:
+                    continue
+                seen.add(key)
+            yield holder, md
+        except Exception as exc:
+            _trouble("an object's metadata entry could not be read", exc)
 
 
 def _metadata_streams(pdf: pikepdf.Pdf) -> dict:
@@ -190,20 +412,15 @@ def _metadata_streams(pdf: pikepdf.Pdf) -> dict:
     Found by presence. Nothing is decoded or parsed, so a packet that is
     malformed, in another encoding, or not decodable at all still counts —
     it is in the file either way. Covers every stream typed as metadata, on
-    whatever object it hangs, plus whatever stream sits in the catalog's
-    /Metadata slot even if untyped: that slot is the document's metadata by
-    position, and it is where readers look.
+    whatever object it hangs, plus whatever stream sits in a /Metadata slot
+    (_metadata_slots) even if untyped.
     """
     found = {}
     for obj in _iter_all_objects(pdf):
         if _is_metadata_stream(obj):
             found[tuple(obj.objgen)] = obj
-    try:
-        md = pdf.Root.get("/Metadata")
-        if isinstance(md, pikepdf.Stream):
-            found.setdefault(tuple(md.objgen), md)
-    except Exception:
-        pass
+    for _holder, md in _metadata_slots(pdf):
+        found.setdefault(tuple(md.objgen), md)
     return found
 
 
@@ -218,15 +435,12 @@ def _metadata_locations(pdf: pikepdf.Pdf, streams: dict) -> list[str]:
             if isinstance(md, pikepdf.Stream) and tuple(md.objgen) in streams:
                 where.append(label)
                 placed.add(tuple(md.objgen))
-        except Exception:
-            pass
+        except Exception as exc:
+            _trouble(f"the metadata entry of {label.lower()} could not be read", exc)
 
     held_by(pdf.Root, "Document catalog")
-    try:
-        for pi, page in enumerate(pdf.pages, 1):
-            held_by(page, f"Page {pi}")
-    except Exception:
-        pass
+    for label, page in _all_pages(pdf):
+        held_by(page, label)
     for num, gen in sorted(set(streams) - placed):
         where.append(f"Object {num} {gen} (not on the catalog or a page)")
     return where
@@ -235,16 +449,14 @@ def _metadata_locations(pdf: pikepdf.Pdf, streams: dict) -> list[str]:
 def _scan_metadata(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
     """Identifying document-info fields and XMP metadata streams."""
     leaky = []
-    try:
-        docinfo = pdf.trailer.get("/Info")
-    except Exception:
-        docinfo = None
-
-    if isinstance(docinfo, pikepdf.Dictionary):
+    with _collecting_trouble() as trouble:
         try:
-            keys = [str(k) for k in docinfo.keys()]
-        except Exception:
-            keys = []
+            docinfo = pdf.trailer.get("/Info")
+            keys = ([str(k) for k in docinfo.keys()]
+                    if isinstance(docinfo, pikepdf.Dictionary) else [])
+        except Exception as exc:
+            _trouble("the document information dictionary could not be read", exc)
+            docinfo, keys = None, []
         # Every entry counts, not only the standard ones: a custom key such
         # as /Company identifies its author just as well as /Author does.
         for k in ([k for k in _INFO_STANDARD if k in keys]
@@ -255,10 +467,14 @@ def _scan_metadata(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
                 val = _as_str(docinfo[k]).strip()
                 if val:
                     leaky.append(f"{k[1:]}: {val[:120]}")
-            except Exception:
-                continue
+            except Exception as exc:
+                _trouble("a document information entry could not be read", exc)
+    res.incomplete(("meta.docinfo",), trouble)
 
-    streams = _metadata_streams(pdf)
+    with _collecting_trouble() as trouble:
+        streams = _metadata_streams(pdf)
+        locations = _metadata_locations(pdf, streams) if streams else []
+    res.incomplete(("meta.xmp",), trouble)
 
     if leaky:
         res.add(Finding(
@@ -282,7 +498,7 @@ def _scan_metadata(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
                    "can be attached to the document or to a single page or "
                    "object.",
             count=len(streams),
-            items=_metadata_locations(pdf, streams),
+            items=locations,
         ))
 
 
@@ -370,17 +586,42 @@ _OWNER_ENTRIES = {
 
 
 class _Site(NamedTuple):
-    """One place an action is stored: ``holder[key]`` is the action."""
+    """One place an action is stored: ``holder[key]`` is the action — or, in
+    an /AA dictionary, possibly an array of them (see _entry_actions)."""
     kind: str        # one of ACTION_SITE_KINDS
     where: str       # label for the report
     holder: Any      # the owner itself, or its /AA dictionary
     key: str         # "/A", "/OpenAction", or the /AA trigger name
 
 
+def _entry_actions(entry) -> list:
+    """The action dictionaries one stored entry holds.
+
+    An entry is one action. A file can also put an array of actions under an
+    /AA trigger; that is not what the format defines, but the array is in
+    the file and so is what it holds, and with `auto_actions` the whole /AA
+    goes — so the options that go by what an action does must see inside it
+    too, or `javascript` alone would leave a script that `auto_actions`
+    removes.
+    """
+    if isinstance(entry, pikepdf.Dictionary):
+        return [entry]
+    if isinstance(entry, pikepdf.Array):
+        return [a for a in entry if isinstance(a, pikepdf.Dictionary)]
+    return []
+
+
 def _label(text: Any) -> str:
     """A title or field name as it appears inside a site label."""
     s = " ".join(_as_str(text).split())[:60]
     return f'"{s}"' if s else "(unnamed)"
+
+
+def _plain_owner(label: str) -> str:
+    """A site label for a diagnostic: lower-cased, and without the quoted
+    title or field name, which is document content."""
+    plain = re.sub(r'\s*"[^"]*"', "", label).strip()
+    return plain[:1].lower() + plain[1:]
 
 
 def _outline_items(root):
@@ -393,7 +634,8 @@ def _outline_items(root):
     try:
         outlines = root.get("/Outlines")
         first = outlines.get("/First") if isinstance(outlines, pikepdf.Dictionary) else None
-    except Exception:
+    except Exception as exc:
+        _trouble("the bookmark tree could not be read", exc)
         return
     seen, stack = set(), [first]
     while stack:
@@ -410,7 +652,8 @@ def _outline_items(root):
                 if child is not None:
                     stack.append(child)
                 item = item.get("/Next")
-            except Exception:
+            except Exception as exc:
+                _trouble("a bookmark could not be read", exc)
                 break
 
 
@@ -425,7 +668,8 @@ def _form_fields(root):
         acro = root.get("/AcroForm")
         fields = acro.get("/Fields") if isinstance(acro, pikepdf.Dictionary) else None
         stack = list(fields)[::-1] if isinstance(fields, pikepdf.Array) else []
-    except Exception:
+    except Exception as exc:
+        _trouble("the form's field list could not be read", exc)
         return
     seen = set()
     while stack:
@@ -442,8 +686,8 @@ def _form_fields(root):
             kids = fld.get("/Kids")
             if isinstance(kids, pikepdf.Array):
                 stack.extend(list(kids)[::-1])
-        except Exception:
-            continue
+        except Exception as exc:
+            _trouble("a form field could not be read", exc)
 
 
 def _page_annotations(page) -> list:
@@ -454,15 +698,17 @@ def _page_annotations(page) -> list:
         if not isinstance(annots, pikepdf.Array):
             return []
         return [a for a in annots if isinstance(a, pikepdf.Dictionary)]
-    except Exception:
+    except Exception as exc:
+        _trouble("a page's annotation list could not be read", exc)
         return []
 
 
 def _action_owners(pdf: pikepdf.Pdf):
     """Yield (owner_kind, label, owner) for every object that can carry an
-    action: the catalog, each page, each annotation, each bookmark, each
-    form field. An object reachable two ways — an annotation listed on two
-    pages, a widget that is also a field — is yielded once.
+    action: the catalog, each page (in the page tree or not — see
+    _all_pages), each annotation, each bookmark, each form field. An object
+    reachable two ways — an annotation listed on two pages, a widget that is
+    also a field — is yielded once.
     """
     root = pdf.Root
     yield "document", "Document", root
@@ -473,22 +719,19 @@ def _action_owners(pdf: pikepdf.Pdf):
             if not obj.is_indirect:
                 return True
             key = tuple(obj.objgen)
-        except Exception:
+        except Exception as exc:
+            _trouble("an object's identity could not be read", exc)
             return True
         if key in seen:
             return False
         seen.add(key)
         return True
 
-    try:
-        pages = list(pdf.pages)
-    except Exception:
-        pages = []
-    for pi, page in enumerate(pages, 1):
-        yield "page", f"Page {pi}", page
+    for label, page in _all_pages(pdf):
+        yield "page", label, page
         for annot in _page_annotations(page):
             if first_visit(annot):
-                yield "annot", f"Page {pi} annotation", annot
+                yield "annot", f"{label} annotation", annot
     for item in _outline_items(root):
         yield "outline", f"Bookmark {_label(item.get('/Title'))}", item
     for fld in _form_fields(root):
@@ -501,30 +744,38 @@ def _owner_sites(owner_kind: str, label: str, owner):
 
     Only dictionaries are actions. An /OpenAction that is an array or a name
     is a destination — where the document opens, not something that runs —
-    and is not a site.
+    and is not a site. An /AA entry is a site when it is an action or an
+    array holding one (_entry_actions).
     """
     entries, aa_kind = _OWNER_ENTRIES[owner_kind]
     for kind, key in entries:
         try:
             if isinstance(owner.get(key), pikepdf.Dictionary):
                 yield _Site(kind, label, owner, key)
-        except Exception:
-            pass
+        except Exception as exc:
+            _trouble(f"the {key} entry of {_plain_owner(label)} could not be read", exc)
     if aa_kind is not None:
         try:
             aa = owner.get("/AA")
             if isinstance(aa, pikepdf.Dictionary):
                 for trig in aa.keys():
-                    if isinstance(aa[trig], pikepdf.Dictionary):
+                    if _entry_actions(aa[trig]):
                         yield _Site(aa_kind, label, aa, str(trig))
-        except Exception:
-            pass
+        except Exception as exc:
+            _trouble(f"the additional actions of {_plain_owner(label)} could not be read", exc)
 
 
 def _action_sites(pdf: pikepdf.Pdf):
-    """Yield a _Site for every place in the document an action is stored."""
+    """Yield a _Site for every place in the document an action is stored.
+
+    One owner that cannot be read is reported and passed over; the others
+    are still walked.
+    """
     for owner_kind, label, owner in _action_owners(pdf):
-        yield from _owner_sites(owner_kind, label, owner)
+        try:
+            yield from _owner_sites(owner_kind, label, owner)
+        except Exception as exc:
+            _trouble(f"the actions of {_plain_owner(label)} could not be read", exc)
 
 
 def _site_where(site: _Site) -> str:
@@ -541,53 +792,71 @@ def _iter_actions(pdf: pikepdf.Pdf):
     This is where Launch / URI / SubmitForm / GoToR / JavaScript actions
     actually live, and many are *inline* dictionaries that ``pdf.objects``
     never yields.
+
+    A /Next chain is a linked list a file can make as long as it likes, so
+    it is followed iteratively and to its end: there is no depth at which an
+    action stops being looked at. An indirect action is yielded once, which
+    is also what ends a chain that loops back on itself.
     """
     seen = set()
-
-    def _walk(action, where: str, depth: int = 0):
-        if action is None or depth > 32:
-            return
-        try:
-            if not isinstance(action, pikepdf.Dictionary):
-                return
-        except Exception:
-            return
-        # Dedupe only on *indirect* objects via their stable (num, gen) id.
-        # Inline dicts get fresh transient Python wrappers whose id() is
-        # reused after GC, so id()-based dedup wrongly skips siblings.
-        try:
-            if action.is_indirect:
-                key = tuple(action.objgen)
-                if key in seen:
-                    return
-                seen.add(key)
-        except Exception:
-            pass
-        yield (where, action)
-        # follow /Next (single dict or array)
-        try:
-            nxt = action.get("/Next")
-            if isinstance(nxt, pikepdf.Array):
-                for n in nxt:
-                    yield from _walk(n, where + " /Next", depth + 1)
-            elif nxt is not None:
-                yield from _walk(nxt, where + " /Next", depth + 1)
-        except Exception:
-            pass
-
     for site in _action_sites(pdf):
+        base = _site_where(site)
         try:
-            action = site.holder[site.key]
-        except Exception:
+            stack = [(a, 0) for a in reversed(_entry_actions(site.holder[site.key]))]
+        except Exception as exc:
+            _trouble(f"an action of {_plain_owner(site.where)} could not be read", exc)
             continue
-        for where, node in _walk(action, _site_where(site)):
-            yield site, where, node
+        while stack:
+            action, depth = stack.pop()
+            try:
+                if not isinstance(action, pikepdf.Dictionary):
+                    continue
+                # Dedupe only on *indirect* objects via their stable (num,
+                # gen) id. Inline dicts get fresh transient Python wrappers
+                # whose id() is reused after GC, so id()-based dedup wrongly
+                # skips siblings.
+                if action.is_indirect:
+                    key = tuple(action.objgen)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                nxt = action.get("/Next")
+                following = (list(nxt)[::-1] if isinstance(nxt, pikepdf.Array)
+                             else [] if nxt is None else [nxt])
+            except Exception as exc:
+                _trouble(f"an action of {_plain_owner(site.where)} could not be read", exc)
+                continue
+            yield site, (base if depth == 0 else f"{base} /Next" if depth == 1
+                         else f"{base} /Next x{depth}"), action
+            stack.extend((n, depth + 1) for n in following)
 
 
 def _collect_actions(pdf: pikepdf.Pdf):
     """Yield (where, action_dict) for every action reachable in the document."""
     for _site, where, action in _iter_actions(pdf):
         yield where, action
+
+
+#: Findings the action walk can produce (see _scan_scripts_and_actions).
+_ACTION_FINDINGS = ("scripts.js", "actions.launch", "actions.autorun",
+                    "actions.remote", "forms.submit")
+
+
+def _instantiate_scripts(pdf: pikepdf.Pdf):
+    """Yield every stream typed /3D that carries an /OnInstantiate script.
+
+    That script runs when the 3D artwork loads. It is JavaScript but not an
+    action, so it sits at no action site; it is found by what the stream is.
+    The analyzer reports from this and the sanitizer removes from this.
+    """
+    for obj in _iter_all_objects(pdf):
+        try:
+            if (isinstance(obj, pikepdf.Stream)
+                    and _as_str(obj.get("/Type")) == "/3D"
+                    and "/OnInstantiate" in obj):
+                yield obj
+        except Exception as exc:
+            _trouble("a stream's type could not be read", exc)
 
 
 def _scan_scripts_and_actions(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
@@ -600,35 +869,43 @@ def _scan_scripts_and_actions(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
 
     root = pdf.Root
 
-    # -- Name tree /JavaScript (document-wide named scripts) -----------
-    try:
-        names = root.get("/Names")
-        if names is not None and "/JavaScript" in names:
-            js_hits.append("Named JavaScript entries in /Names tree")
-    except Exception:
-        pass
+    # -- Scripts that are not actions ----------------------------------
+    with _collecting_trouble() as trouble:
+        try:
+            # Name tree /JavaScript (document-wide named scripts)
+            names = root.get("/Names")
+            if names is not None and "/JavaScript" in names:
+                js_hits.append("Named JavaScript entries in /Names tree")
+        except Exception as exc:
+            _trouble("the catalog's name trees could not be read", exc)
+        for _stream in _instantiate_scripts(pdf):
+            js_hits.append("3D artwork: a script that runs when the artwork loads")
+    res.incomplete(("scripts.js",), trouble)
 
     # -- Every reachable action ----------------------------------------
-    for site, where, action in _iter_actions(pdf):
-        try:
-            stype = _as_str(action.get("/S"))
-        except Exception:
-            stype = ""
+    with _collecting_trouble() as trouble:
+        for site, where, action in _iter_actions(pdf):
+            try:
+                stype = _as_str(action.get("/S"))
+                if site.kind in _AUTORUN_KINDS:
+                    autorun.append(_describe_autorun(site, where, stype))
 
-        if site.kind in _AUTORUN_KINDS:
-            autorun.append(_describe_autorun(site, where, stype))
-
-        if stype == "/JavaScript" or "/JS" in action:
-            js_hits.append(f"{where}: JavaScript")
-        elif stype == "/Launch":
-            tgt = _as_str(action.get("/F") or action.get("/Win") or "")
-            launch_hits.append(f"{where}: {tgt[:100]}" if tgt else where)
-        elif stype in ("/GoToR", "/GoToE"):
-            tgt = _as_str(action.get("/F"))
-            remote_goto.append(f"{where}: {tgt[:100]}" if tgt else f"{where}: {stype}")
-        elif stype in ("/SubmitForm", "/ImportData"):
-            tgt = _as_str(action.get("/F"))
-            submit_hits.append(f"{where} ({stype[1:]}): {tgt[:100]}" if tgt else f"{where}: {stype}")
+                if stype == "/JavaScript" or "/JS" in action:
+                    js_hits.append(f"{where}: JavaScript")
+                elif stype == "/Launch":
+                    tgt = _as_str(action.get("/F") or action.get("/Win") or "")
+                    launch_hits.append(f"{where}: {tgt[:100]}" if tgt else where)
+                elif stype in ("/GoToR", "/GoToE"):
+                    tgt = _as_str(action.get("/F"))
+                    remote_goto.append(f"{where}: {tgt[:100]}" if tgt else f"{where}: {stype}")
+                elif stype in ("/SubmitForm", "/ImportData"):
+                    tgt = _as_str(action.get("/F"))
+                    submit_hits.append(f"{where} ({stype[1:]}): {tgt[:100]}" if tgt
+                                       else f"{where}: {stype}")
+            except Exception as exc:
+                _trouble(f"an action of {_plain_owner(site.where)} could not be read", exc)
+    # Anything the walk could not read might have been any kind of action.
+    res.incomplete(_ACTION_FINDINGS, trouble)
 
     # -- Emit findings -------------------------------------------------
     js_hits = _dedupe(js_hits)
@@ -681,12 +958,14 @@ def _scan_scripts_and_actions(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
 def _scan_links(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
     """External URI links — possible tracking beacons / phone-home."""
     uris: list[str] = []
-    for _where, action in _collect_actions(pdf):
-        try:
-            if _as_str(action.get("/S")) == "/URI" and "/URI" in action:
-                uris.append(_as_str(action["/URI"]))
-        except Exception:
-            continue
+    with _collecting_trouble() as trouble:
+        for site, _where, action in _iter_actions(pdf):
+            try:
+                if _as_str(action.get("/S")) == "/URI" and "/URI" in action:
+                    uris.append(_as_str(action["/URI"]))
+            except Exception as exc:
+                _trouble(f"an action of {_plain_owner(site.where)} could not be read", exc)
+    res.incomplete(("links.uri",), trouble)
 
     uris = [u for u in uris if u.strip()]
     if not uris:
@@ -707,41 +986,6 @@ def _scan_links(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
     ))
 
 
-def _walk_ef_name_tree(node, out: list, depth: int = 0) -> None:
-    """Collect embedded-file display names from an /EmbeddedFiles name tree,
-    recursing intermediate nodes that hold /Kids instead of /Names.
-
-    A PDF name tree can be a single leaf ({/Names: [key, val, ...]}) or a
-    balanced tree of intermediate {/Kids: [...]} nodes with leaves at the
-    bottom — the old code only read a root-level /Names and missed any
-    /Kids-structured tree (ANL-04). Depth-capped and exception-tolerant.
-    """
-    if depth > 50:
-        return
-    try:
-        if not isinstance(node, pikepdf.Dictionary):
-            return
-    except Exception:
-        return
-    try:
-        arr = node.get("/Names")
-        if arr is not None:
-            # Leaf: [key1, filespec1, key2, filespec2, ...] — keys are the
-            # display names.
-            for i in range(0, len(arr) - 1, 2):
-                try: out.append(_as_str(arr[i]))
-                except Exception: continue
-    except Exception:
-        pass
-    try:
-        kids = node.get("/Kids")
-        if kids is not None:
-            for kid in kids:
-                _walk_ef_name_tree(kid, out, depth + 1)
-    except Exception:
-        pass
-
-
 #: Keys of an /EF dictionary under which the embedded file's stream is stored.
 _EF_STREAM_KEYS = ("/F", "/UF", "/DOS", "/Mac", "/Unix")
 
@@ -759,33 +1003,36 @@ def _has_payload(d) -> bool:
         ef = d.get("/EF")
         return (isinstance(ef, pikepdf.Dictionary)
                 and any(isinstance(ef.get(k), pikepdf.Stream) for k in _EF_STREAM_KEYS))
-    except Exception:
+    except Exception as exc:
+        _trouble("a file specification could not be read", exc)
         return False
 
 
 def _filespec_name(d) -> str:
     try:
         return _as_str(d.get("/UF") or d.get("/F") or "").strip()
-    except Exception:
+    except Exception as exc:
+        _trouble("a file specification's name could not be read", exc)
         return ""
 
 
-def _nested_dicts(obj, depth: int = 0):
+def _nested_dicts(obj):
     """Yield *obj* if it is a dictionary or stream, then every direct
     (inline) dictionary nested inside it. Indirect children are not
-    followed: each is an object in its own right and is visited as one."""
-    if depth > 100:
-        return
-    if isinstance(obj, (pikepdf.Dictionary, pikepdf.Stream)):
-        yield obj
-        children = [obj[k] for k in obj.keys()]
-    elif isinstance(obj, pikepdf.Array):
-        children = list(obj)
-    else:
-        return
-    for child in children:
-        if isinstance(child, (pikepdf.Dictionary, pikepdf.Array)) and not child.is_indirect:
-            yield from _nested_dicts(child, depth + 1)
+    followed: each is an object in its own right and is visited as one.
+    Iterative; inline nesting cannot loop, so it needs no depth limit."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, (pikepdf.Dictionary, pikepdf.Stream)):
+            yield cur
+            children = [cur[k] for k in cur.keys()]
+        elif isinstance(cur, pikepdf.Array):
+            children = list(cur)
+        else:
+            continue
+        stack.extend(c for c in reversed(children)
+                     if isinstance(c, (pikepdf.Dictionary, pikepdf.Array)) and not c.is_indirect)
 
 
 def _filespec_dicts(pdf: pikepdf.Pdf):
@@ -809,61 +1056,39 @@ def _filespec_dicts(pdf: pikepdf.Pdf):
             for d in _nested_dicts(obj):
                 if "/EF" in d or _as_str(d.get("/Type")) == "/Filespec":
                     yield d
-        except Exception:
-            continue
-
-
-def _name_tree_values(node):
-    """Yield every value stored in a name tree: leaves hold
-    ``[key, value, key, value, ...]`` in /Names, intermediate nodes hold
-    /Kids. Iterative and cycle-safe."""
-    seen, stack = set(), [node]
-    while stack:
-        cur = stack.pop()
-        try:
-            if not isinstance(cur, pikepdf.Dictionary):
-                continue
-            if cur.is_indirect:
-                key = tuple(cur.objgen)
-                if key in seen:
-                    continue
-                seen.add(key)
-            entries = cur.get("/Names")
-            if isinstance(entries, pikepdf.Array):
-                for i in range(1, len(entries), 2):
-                    yield entries[i]
-            kids = cur.get("/Kids")
-            if isinstance(kids, pikepdf.Array):
-                stack.extend(list(kids)[::-1])
-        except Exception:
-            continue
+        except Exception as exc:
+            _trouble("an object could not be searched for file specifications", exc)
 
 
 def _scan_embedded_files(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
     """Embedded files (attachments), and references to files outside the PDF."""
     names: list[str] = []
     external: list[str] = []
-    try:
-        root = pdf.Root
-        nm = root.get("/Names")
-        if isinstance(nm, pikepdf.Dictionary) and "/EmbeddedFiles" in nm:
-            _walk_ef_name_tree(nm["/EmbeddedFiles"], names)
-    except Exception:
-        pass
+    with _collecting_trouble() as trouble:
+        try:
+            # A name tree may be a single leaf or intermediate /Kids nodes
+            # with leaves below (ANL-04); its keys are the display names.
+            nm = pdf.Root.get("/Names")
+            if isinstance(nm, pikepdf.Dictionary) and "/EmbeddedFiles" in nm:
+                names.extend(_as_str(key) for key, _value
+                             in _name_tree_items(nm["/EmbeddedFiles"]))
+        except Exception as exc:
+            _trouble("the catalog's attachment list could not be read", exc)
 
-    # Filespecs anywhere, not only in the name tree: on /FileAttachment and
-    # other annotations, in /AF arrays, inside actions. /Type is optional on
-    # a filespec and omitted by some producers (ANL-04), so what decides is
-    # the payload: a filespec whose /EF holds a stream is an embedded file,
-    # whatever it is called and wherever it sits. One with no payload only
-    # points at a file elsewhere — nothing to remove, but the path it carries
-    # is reported separately.
-    for d in _filespec_dicts(pdf):
-        name = _filespec_name(d)
-        if _has_payload(d):
-            names.append(name or "(unnamed embedded file)")
-        elif name and _as_str(d.get("/Type")) == "/Filespec":
-            external.append(name)
+        # Filespecs anywhere, not only in the name tree: on /FileAttachment
+        # and other annotations, in /AF arrays, inside actions. /Type is
+        # optional on a filespec and omitted by some producers (ANL-04), so
+        # what decides is the payload: a filespec whose /EF holds a stream is
+        # an embedded file, whatever it is called and wherever it sits. One
+        # with no payload only points at a file elsewhere — nothing to
+        # remove, but the path it carries is reported separately.
+        for d in _filespec_dicts(pdf):
+            name = _filespec_name(d)
+            if _has_payload(d):
+                names.append(name or "(unnamed embedded file)")
+            elif name and _as_str(d.get("/Type")) == "/Filespec":
+                external.append(name)
+    res.incomplete(("files.embedded", "files.external"), trouble)
 
     names = _dedupe([n for n in names if n.strip()])
     if names:
@@ -990,7 +1215,8 @@ def _scan_invisible_text(path: str, res: AnalysisResult) -> None:
     """
     try:
         import fitz  # PyMuPDF
-    except Exception:
+    except Exception as exc:
+        _trouble("PyMuPDF is not available to read page content", exc)
         return
 
     pages_with_invisible = 0
@@ -1005,7 +1231,9 @@ def _scan_invisible_text(path: str, res: AnalysisResult) -> None:
                 pages_with_invisible += 1
         doc.close()
     except Exception as exc:
-        log.debug("invisible-text scan skipped: %s", exc)
+        # The type only: library messages quote the path they were reading.
+        log.debug("invisible-text scan stopped (%s)", type(exc).__name__)
+        _trouble("page content could not be read", exc)
         return
 
     if pages_with_invisible:
@@ -1033,8 +1261,18 @@ def _dedupe(seq: list[str]) -> list[str]:
 #  Public API — analysis
 # ════════════════════════════════════════════════════════════════════
 
-def analyze_document(path: str, password: Optional[str] = None) -> dict:
-    """Run the full privacy/security audit and return a JSON-ready dict."""
+def analyze_document(path: str, password: Optional[str] = None, *,
+                     unremovable: bool = True) -> dict:
+    """Run the full privacy/security audit and return a JSON-ready dict.
+
+    The result's ``unevaluated`` maps a finding id to why it could not be
+    fully checked; when it is not empty the audit reports
+    ``audit.incomplete`` and never ``clean``.
+
+    *unremovable* (on by default) adds the whole-file check for content
+    Sanitize has no way to remove (see _scan_unremovable). The verifier
+    turns it off: it runs that sweep itself, against the promises made.
+    """
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
 
@@ -1091,24 +1329,44 @@ def analyze_document(path: str, password: Optional[str] = None) -> dict:
                 detail="Standard PDF encryption is in use.",
             ))
 
-        # Run every scanner defensively — one failure must not abort the rest.
-        # (_scan_embedded_image_metadata is defined lower, in the image
-        # section, so it can reuse the standalone-image EXIF helpers.)
-        for scan in (_scan_metadata, _scan_scripts_and_actions, _scan_links,
-                     _scan_embedded_files, _scan_forms, _scan_optional_content,
-                     _scan_embedded_image_metadata):
-            try:
-                scan(pdf, res)
-            except Exception as exc:
-                log.warning("scanner %s failed: %s", scan.__name__, exc)
+        # Run every scanner defensively — one failure must not abort the rest
+        # — and pair each with the findings it can produce, so that one which
+        # dies, or which meets something it cannot read, is recorded against
+        # those findings instead of leaving them looking clean. The pairs are
+        # built here, per call, so a scanner swapped out at run time is still
+        # matched to its findings. (_scan_embedded_image_metadata is defined
+        # lower, in the image section, so it can reuse the EXIF helpers.)
+        for scan, ids in (
+                (_scan_metadata, ("meta.docinfo", "meta.xmp")),
+                (_scan_scripts_and_actions, _ACTION_FINDINGS),
+                (_scan_links, ("links.uri",)),
+                (_scan_embedded_files, ("files.embedded", "files.external")),
+                (_scan_forms, ("forms.xfa", "forms.acro")),
+                (_scan_optional_content, ("content.ocg",)),
+                (_scan_embedded_image_metadata,
+                 ("location.embedded_image", "metadata.embedded_image"))):
+            _run_scanner(res, ids, scan, pdf, res)
+
+        # Last, because it changes the in-memory document: what would still
+        # be here after a sanitize with everything on.
+        if unremovable:
+            _run_scanner(res, _SWEPT_FINDINGS, _scan_unremovable, pdf, res)
 
     # Invisible-text scan needs the path (PyMuPDF), runs outside the pikepdf ctx
-    try:
-        _scan_invisible_text(path, res)
-    except Exception as exc:
-        log.debug("invisible text scan failed: %s", exc)
+    _run_scanner(res, ("content.invisible_text",), _scan_invisible_text, path, res)
 
-    if not res.findings:
+    if res.unevaluated:
+        res.add(Finding(
+            id="audit.incomplete", category="audit", severity="medium",
+            title="Audit incomplete",
+            detail="Part of this file could not be read, so the checks listed "
+                   "here did not finish. For these, no finding does not mean "
+                   "nothing is there.",
+            count=len(res.unevaluated),
+            items=[f"{_FINDING_INFO.get(fid, ('', '', fid))[2]}: {'; '.join(why[:3])}"
+                   for fid, why in res.unevaluated.items()],
+        ))
+    elif not res.findings:
         res.add(Finding(
             id="clean", category="content", severity="info",
             title="No privacy or security concerns detected",
@@ -1117,6 +1375,108 @@ def analyze_document(path: str, password: Optional[str] = None) -> dict:
         ))
 
     return res.to_dict()
+
+
+def _run_scanner(res: AnalysisResult, ids, scan, *args) -> None:
+    """Run one scanner; whatever stopped it, or whatever it could not read
+    and did not account for itself, is recorded against *ids*."""
+    with _collecting_trouble() as trouble:
+        try:
+            scan(*args)
+        except Exception as exc:
+            # The type only: library messages quote the path they were reading.
+            log.warning("an audit check stopped early (%s)", type(exc).__name__)
+            trouble.append(f"the check stopped early ({type(exc).__name__})")
+    res.incomplete(ids, trouble)
+
+
+#: finding id -> (category, severity, title). Used to name a finding that
+#: could not be evaluated, and to open one the whole-file check found where
+#: no scanner looks.
+_FINDING_INFO = {
+    "meta.docinfo": ("metadata", "low", "Document metadata"),
+    "meta.xmp": ("metadata", "low", "XMP metadata stream"),
+    "scripts.js": ("scripts", "high", "Embedded JavaScript"),
+    "actions.launch": ("actions", "high", "Launch action(s)"),
+    "actions.autorun": ("actions", "medium", "Auto-run actions"),
+    "actions.remote": ("actions", "medium", "Remote / external GoTo actions"),
+    "forms.submit": ("forms", "high", "Form submit / import actions"),
+    "links.uri": ("links", "low", "External links / URLs"),
+    "files.embedded": ("files", "high", "Embedded files / attachments"),
+    "files.external": ("files", "low", "References to external files"),
+    "forms.xfa": ("forms", "medium", "XFA dynamic form"),
+    "forms.acro": ("forms", "info", "Interactive form fields"),
+    "content.ocg": ("content", "low", "Optional-content layers"),
+    "content.invisible_text": ("content", "medium", "Invisible text layer"),
+    "location.embedded_image": ("location", "high", "Location data in embedded images"),
+    "metadata.embedded_image": ("metadata", "medium", "Camera data in embedded images"),
+}
+
+#: The findings the whole-file check can add to: everything a sanitize
+#: option promises to remove.
+_SWEPT_FINDINGS = ("scripts.js", "actions.launch", "actions.autorun", "forms.submit",
+                   "files.embedded", "links.uri", "meta.docinfo", "meta.xmp")
+
+
+def _scan_unremovable(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
+    """Report what the verifier's sweep sees and the scanners do not.
+
+    The scanners look where the sanitizer knows how to remove; the
+    verifier's sweep looks at every object. A user told `clean` here must
+    not then be refused there, so the sweep is run here as well, twice.
+
+    After a sanitize with every option on — done in memory only; this
+    handle is never saved. Whatever is left sits somewhere no removal
+    reaches. Each leftover is added to the finding it belongs to, with where
+    it is and the note that Sanitize cannot remove it.
+
+    And before it, on the file as it is. Something the scanners list
+    nowhere can still be removable — but only along with what holds it, by
+    another option (a script tucked inside an /AA dictionary goes with
+    `auto_actions`). The first pass shows nothing left, yet `javascript`
+    alone would be refused. So a category the sweep finds in the untouched
+    file and no scanner reported is reported from the sweep. Only what the
+    sweep finds by what an object is counts here; what it finds by position
+    (a name tree, the /Info dictionary) the option concerned removes by
+    position, whatever is inside.
+
+    Must run after every other scanner: it changes the in-memory document.
+    """
+    # Imported here, not at the top: pdf_verify imports this module.
+    import pdf_verify
+
+    everything = {k: True for k in DEFAULT_SANITIZE}
+    before, status_before = pdf_verify._sweep(pdf, everything)
+    with _collecting_trouble():       # the removal's own trouble shows as leftovers
+        _remove_content(pdf, everything)
+    after, status = pdf_verify._sweep(pdf, everything)
+    problems = status_before.problems + status.problems
+    if problems:
+        res.incomplete(_SWEPT_FINDINGS, _dedupe(
+            [f"the whole-file check stopped short: {p}" for p in problems])[:3])
+
+    def report(hit, note: str, detail: str) -> None:
+        finding = res.find(hit.finding)
+        if finding is None:
+            category, severity, title = _FINDING_INFO[hit.finding]
+            finding = Finding(id=hit.finding, category=category, severity=severity,
+                              title=title, detail=detail)
+            res.add(finding)
+        item = f"{hit.what[:1].upper()}{hit.what[1:]} {hit.where} — {note}"
+        if item not in finding.items:
+            finding.items.append(item)
+            finding.count += 1
+
+    for hit in (h for found in after.values() for h in found):
+        report(hit, "Sanitize cannot remove it from here",
+               "Found by the whole-file check, in a place Sanitize has no way to "
+               "remove it from.")
+    unlisted = [h for found in before.values() for h in found
+                if not h.positional and res.find(h.finding) is None]
+    for hit in unlisted:
+        report(hit, "Sanitize removes it only together with what holds it",
+               "Found by the whole-file check, inside something another Sanitize "
+               "option removes whole. Removing this category alone may be refused.")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1380,45 +1740,66 @@ def _image_filter_names(xobj) -> list:
     return [str(filt)]
 
 
+def _xobject_entries(holder) -> list:
+    """The ``(name, xobject)`` pairs in the /XObject dictionary of *holder*'s
+    resources — *holder* being a page or a form XObject. Empty if it has
+    none."""
+    try:
+        resources = holder.get("/Resources")
+        xobjs = resources.get("/XObject") if resources is not None else None
+    except Exception:
+        return []
+    return list(xobjs.items()) if xobjs is not None else []
+
+
 def _iter_image_xobjects(pdf: pikepdf.Pdf):
     """Yield ``(page_index, name, xobject)`` for every image XObject reachable
-    from a page's resources, recursing into form XObjects.
+    from a page's resources, through any depth of form XObjects.
 
-    Deduplicates by indirect-object identity (``objgen``) so an image reused
-    on many pages is visited exactly once — the caller gets each distinct
-    embedded image a single time.
+    Each image is yielded once and each form is entered once per document,
+    both remembered by object number. For images that is the point: one
+    reused on many pages is one embedded image. For forms it is what makes
+    the walk finish. Forms nest, and share what they nest — a few hundred
+    forms that each draw the same handful of others have more paths through
+    them than can be walked (a real two-page file with 270 forms did not
+    finish) — so a form already entered, from another parent or another
+    page, is not entered again. An image is reported on the first page that
+    reaches it.
+
+    Iterative, with no limit on depth: remembering the forms is also what
+    ends a loop of forms that contain each other.
     """
-    seen = set()
-
-    def walk(resources, page_index, depth=0):
-        if resources is None or depth > 8:
-            return
-        try:
-            xobjs = resources.get("/XObject")
-        except Exception:
-            return
-        if xobjs is None:
-            return
-        for name, xobj in xobjs.items():
-            try:
-                subtype = str(xobj.get("/Subtype"))
-            except Exception:
-                continue
-            if subtype == "/Image":
-                og = xobj.objgen
-                if og in seen:
+    seen_images, seen_forms = set(), set()
+    for page_index, page in enumerate(pdf.pages, 1):
+        # One iterator per form being read, innermost last, so images come
+        # out in the order a reader meets them.
+        stack = [iter(_xobject_entries(page))]
+        while stack:
+            for name, xobj in stack[-1]:
+                try:
+                    subtype = str(xobj.get("/Subtype"))
+                except Exception:
                     continue
-                seen.add(og)
-                yield page_index, name, xobj
-            elif subtype == "/Form":
-                yield from walk(xobj.get("/Resources"), page_index, depth + 1)
-
-    for pi, page in enumerate(pdf.pages, 1):
-        try:
-            resources = page.get("/Resources")
-        except Exception:
-            continue
-        yield from walk(resources, pi)
+                if subtype == "/Image":
+                    og = xobj.objgen
+                    if og in seen_images:
+                        continue
+                    seen_images.add(og)
+                    yield page_index, name, xobj
+                elif subtype == "/Form":
+                    # A form is a stream, so it has an object number. One
+                    # written inline is not a form any reader would draw; it
+                    # cannot be shared or contain itself, so it is read
+                    # where it stands.
+                    if xobj.is_indirect:
+                        og = tuple(xobj.objgen)
+                        if og in seen_forms:
+                            continue
+                        seen_forms.add(og)
+                    stack.append(iter(_xobject_entries(xobj)))
+                    break
+            else:
+                stack.pop()
 
 
 def _scan_embedded_image_metadata(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
@@ -1617,89 +1998,91 @@ def _action_head_drop(action, opts: dict) -> Optional[str]:
     """Return the removed[] counter key if *action*'s own node must be
     dropped under *opts*, else None.
 
-    A node is dangerous when its /S is JavaScript/Launch/SubmitForm/
-    ImportData (gated on the matching opt) or it carries an inline /JS
-    entry (gated on ``javascript``) — the same signal the analyzer's
+    A node goes when its /S is JavaScript/Launch/SubmitForm/ImportData/URI
+    (gated on the matching opt) or it carries an inline /JS entry (gated on
+    ``javascript``) — the same signal the analyzer's
     _scan_scripts_and_actions flags (``/S`` or inline ``/JS``).
     """
     try:
         stype = _as_str(action.get("/S"))
-    except Exception:
-        return None
-    opt_counter = _DANGEROUS_ACTIONS.get(stype)
-    if opt_counter is not None and opts.get(opt_counter[0]):
-        return opt_counter[1]
-    try:
+        opt_counter = _DANGEROUS_ACTIONS.get(stype)
+        if opt_counter is not None and opts.get(opt_counter[0]):
+            return opt_counter[1]
         if "/JS" in action and opts.get("javascript"):
             return "annot_javascript"
-    except Exception:
-        pass
+    except Exception as exc:
+        _trouble("an action's type could not be read", exc)
     return None
 
 
-def _clean_action_next(action, opts: dict, bump, depth: int = 0) -> None:
-    """Recursively excise dangerous nodes buried in *action*'s ``/Next``
-    chain, in place, preserving benign nodes and their surviving tail.
+def _as_list(value) -> list:
+    """A /Next (or /AF) value as a list: it may be one object or an array."""
+    if value is None:
+        return []
+    return list(value) if isinstance(value, pikepdf.Array) else [value]
 
-    ANL-02: the analyzer's ``_collect_actions._walk`` follows ``/Next``
-    when flagging buried JavaScript/Launch/SubmitForm, but the sanitiser
-    used to inspect only the top-level ``/A`` — so an annotation with a
-    benign ``/URI`` head (kept when ``external_links`` is off) but a
-    ``/Next`` that runs JavaScript survived even with ``javascript`` on.
-    Each dropped node bumps the same counter its head would, so the count
-    stays honest. Depth-capped (a >30-deep action chain isn't legitimate)
-    and exception-tolerant like the rest of this module.
+
+def _clean_action_next(action, opts: dict, bump) -> None:
+    """Excise from *action*'s ``/Next`` chain every node *opts* removes, in
+    place, keeping the others and whatever follows them.
+
+    ANL-02: the analyzer follows ``/Next`` when flagging buried
+    JavaScript/Launch/SubmitForm, so the sanitizer must too — an annotation
+    with a harmless head whose ``/Next`` runs JavaScript must not keep the
+    script. A removed node's own ``/Next`` is promoted into its place, so a
+    harmless action chained after it is not lost with it. Each removed node
+    bumps the counter its type has.
+
+    Iterative, and to the end of the chain however long it is. A chain is a
+    linked list a file can make as long as it likes; stopping partway would
+    either leave what was asked for or cut off what was not.
     """
-    if depth > 30:
-        try: del action["/Next"]
-        except Exception: pass
-        return
-    try:
-        nxt = action.get("/Next")
-    except Exception:
-        return
-    if nxt is None:
-        return
-    try:
-        nodes = list(nxt) if isinstance(nxt, pikepdf.Array) else [nxt]
-    except Exception:
-        return
-
-    survivors = []
-    for node in nodes:
+    todo, seen, counted = [action], set(), set()
+    while todo:
+        owner = todo.pop()
         try:
-            if not isinstance(node, pikepdf.Dictionary):
+            pending = _as_list(owner.get("/Next"))
+            if not pending:
                 continue
-        except Exception:
-            continue
-        # Clean this node's own tail first so a promoted survivor is already
-        # scrubbed and never needs re-processing.
-        _clean_action_next(node, opts, bump, depth + 1)
-        key = _action_head_drop(node, opts)
-        if key is None:
-            survivors.append(node)
-            continue
-        bump(key)
-        # Dangerous node excised — promote its (already-cleaned) /Next tail
-        # so a benign action chained after it isn't lost with it.
-        try:
-            tail = node.get("/Next")
-        except Exception:
-            tail = None
-        if isinstance(tail, pikepdf.Array):
-            survivors.extend(list(tail))
-        elif tail is not None:
-            survivors.append(tail)
-
-    try:
-        if not survivors:
-            del action["/Next"]
-        elif len(survivors) == 1:
-            action["/Next"] = survivors[0]
-        else:
-            action["/Next"] = pikepdf.Array(survivors)
-    except Exception:
-        pass
+            survivors, changed, spliced = [], False, set()
+            while pending:
+                node = pending.pop(0)
+                if not isinstance(node, pikepdf.Dictionary):
+                    changed = True                    # not an action: dropped
+                    continue
+                key = _action_head_drop(node, opts)
+                if key is None:
+                    survivors.append(node)
+                    continue
+                changed = True
+                ident = tuple(node.objgen) if node.is_indirect else None
+                if ident is not None and ident in spliced:
+                    continue                          # a chain looping through it
+                spliced.add(ident)
+                if ident is None or ident not in counted:
+                    bump(key)
+                    counted.add(ident)
+                pending[:0] = _as_list(node.get("/Next"))   # promote what followed it
+            if changed:
+                if not survivors:
+                    del owner["/Next"]
+                elif len(survivors) == 1:
+                    owner["/Next"] = survivors[0]
+                else:
+                    owner["/Next"] = pikepdf.Array(survivors)
+            # Carry on down what was kept, re-read from the owner so that the
+            # nodes cleaned next are the ones it now holds.
+            for node in _as_list(owner.get("/Next")):
+                if not isinstance(node, pikepdf.Dictionary):
+                    continue
+                if node.is_indirect:
+                    ident = tuple(node.objgen)
+                    if ident in seen:
+                        continue
+                    seen.add(ident)
+                todo.append(node)
+        except Exception as exc:
+            _trouble("a chain of actions could not be cleaned", exc)
 
 
 def _entry_removal(kind: str, action, opts: dict) -> Optional[str]:
@@ -1735,26 +2118,80 @@ def _scrub_owner_actions(owner_kind: str, label: str, owner, opts: dict, bump) -
     head_removed = False
     for site in list(_owner_sites(owner_kind, label, owner)):
         try:
-            action = site.holder[site.key]
-            key = _entry_removal(site.kind, action, opts)
+            entry = site.holder[site.key]
+            if isinstance(entry, pikepdf.Array):
+                # An /AA entry holding several actions (_entry_actions): each
+                # is judged like a lone one; the entry goes once none is left.
+                keep, gone = [], []
+                for action in entry:
+                    key = (_entry_removal(site.kind, action, opts)
+                           if isinstance(action, pikepdf.Dictionary) else None)
+                    if key is None:
+                        if isinstance(action, pikepdf.Dictionary):
+                            _clean_action_next(action, opts, bump)
+                        keep.append(action)
+                    else:
+                        gone.append(key)
+                if gone:
+                    if any(isinstance(a, pikepdf.Dictionary) for a in keep):
+                        site.holder[site.key] = pikepdf.Array(keep)
+                    else:
+                        del site.holder[site.key]
+                    for key in gone:
+                        bump(key)
+                continue
+            key = _entry_removal(site.kind, entry, opts)
             if key is None:
-                _clean_action_next(action, opts, bump)
+                _clean_action_next(entry, opts, bump)
                 continue
             del site.holder[site.key]
             bump(key)
             if site.key == "/A":
                 head_removed = True
-        except Exception:
-            continue
+        except Exception as exc:
+            _trouble(f"an action of {_plain_owner(label)} could not be removed", exc)
     if _OWNER_ENTRIES[owner_kind][1] is not None:
         try:
             aa = owner.get("/AA")
             if aa is not None and (opts.get("auto_actions") or (
                     isinstance(aa, pikepdf.Dictionary) and len(aa.keys()) == 0)):
                 del owner["/AA"]
-        except Exception:
-            pass
+        except Exception as exc:
+            _trouble(f"the additional actions of {_plain_owner(label)} could not be removed", exc)
     return head_removed
+
+
+def _clean_named_scripts(tree, opts: dict, bump) -> None:
+    """Apply *opts* to the catalog's named scripts when `javascript` is off
+    and the scripts themselves stay.
+
+    Each named script is an action, so what the other options remove can be
+    chained after one through /Next — or stored in place of one. With
+    `javascript` on the whole tree goes and takes all of that with it; with
+    it off, a launch action down a script's chain is still a launch action
+    `launch_actions` promised to remove. An entry whose own action must go
+    is taken out of the tree, name and all; the others have their chains
+    cleaned.
+    """
+    for leaf, entries in _name_tree_leaves(tree):
+        try:
+            keep, gone = [], []
+            for i in range(0, len(entries) - 1, 2):
+                action = entries[i + 1]
+                is_action = isinstance(action, pikepdf.Dictionary)
+                key = _action_head_drop(action, opts) if is_action else None
+                if key is not None:
+                    gone.append(key)
+                    continue
+                if is_action:
+                    _clean_action_next(action, opts, bump)
+                keep += [entries[i], action]
+            if gone:
+                leaf["/Names"] = pikepdf.Array(keep)
+                for key in gone:
+                    bump(key)
+        except Exception as exc:
+            _trouble("the document's named scripts could not be cleaned", exc)
 
 
 def _reachable(pdf: pikepdf.Pdf):
@@ -1784,8 +2221,8 @@ def _reachable(pdf: pikepdf.Pdf):
                 children = [obj[k] for k in obj.keys()]
             stack.extend(c for c in children if isinstance(
                 c, (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)))
-        except Exception:
-            continue
+        except Exception as exc:
+            _trouble("an object could not be read while looking for embedded files", exc)
 
 
 def _drop_stream_refs(pdf: pikepdf.Pdf, targets: set) -> None:
@@ -1803,219 +2240,324 @@ def _drop_stream_refs(pdf: pikepdf.Pdf, targets: set) -> None:
     def is_direct_container(v) -> bool:
         return isinstance(v, (pikepdf.Dictionary, pikepdf.Array)) and not v.is_indirect
 
-    def clean(container, depth: int = 0) -> None:
-        if depth > 100:
-            return
-        if isinstance(container, pikepdf.Array):
-            for i in range(len(container) - 1, -1, -1):
-                v = container[i]
-                if is_target(v): del container[i]
-                elif is_direct_container(v): clean(v, depth + 1)
-        else:
-            for k in list(container.keys()):
-                v = container[k]
-                if is_target(v): del container[k]
-                elif is_direct_container(v): clean(v, depth + 1)
-
     for obj in [pdf.trailer, *_iter_all_objects(pdf)]:
         try:
-            if isinstance(obj, (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)):
-                clean(obj)
-        except Exception:
-            continue
+            stack = [obj] if isinstance(
+                obj, (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)) else []
+            while stack:
+                container = stack.pop()
+                if isinstance(container, pikepdf.Array):
+                    for i in range(len(container) - 1, -1, -1):
+                        v = container[i]
+                        if is_target(v): del container[i]
+                        elif is_direct_container(v): stack.append(v)
+                else:
+                    for k in list(container.keys()):
+                        v = container[k]
+                        if is_target(v): del container[k]
+                        elif is_direct_container(v): stack.append(v)
+        except Exception as exc:
+            _trouble("an object could not be cleared of its metadata reference", exc)
 
 
-def sanitize_pdf(input_path: str, output_path: str,
-                 options: Optional[dict] = None) -> dict:
-    """Strip dangerous/active content from a PDF.
+class SanitizationVerificationError(Exception):
+    """Sanitize produced a candidate that verify_sanitization could not prove
+    clean.
 
-    Returns a dict describing what was removed.  Writes atomically.
+    Raised instead of returning success (fail-closed, #101). ``report`` is
+    the verification report as a dict: which checks failed and why, what
+    could not be checked at all, and any diagnostics from the removal.
+    Nothing was written to the destination: the candidate lived in a temp
+    file, now deleted, and whatever was at output_path before — the input
+    itself, when sanitizing in place — is untouched.
     """
-    opts = {**DEFAULT_SANITIZE, **(options or {})}
+
+    def __init__(self, message: str, *, report: Optional[dict] = None):
+        super().__init__(message)
+        self.report = report
+
+
+def _remove_content(pdf: pikepdf.Pdf, opts: dict) -> dict[str, int]:
+    """Remove from the open document everything *opts* asks for; return the
+    removed[] counters.
+
+    This is the whole of what Sanitize does to a file, apart from writing
+    it. It is tolerant — a structure it cannot process is reported with
+    _trouble() and passed over — because the gate that follows checks the
+    result, not this function's opinion of itself. The analyzer also runs
+    it, on a handle it never saves, to learn what would be left.
+    """
     removed: dict[str, int] = {}
 
     def _bump(key: str, n: int = 1) -> None:
         if n > 0:                   # a counter exists only for what was removed
             removed[key] = removed.get(key, 0) + n
 
+    root = pdf.Root
+
+    # Catalog actions: /OpenAction and the document's /AA, entry by entry.
+    try:
+        _scrub_owner_actions("document", "Document", root, opts, _bump)
+    except Exception as exc:
+        _trouble("the document's own actions could not be cleaned", exc)
+    # /Names -> /JavaScript (document-level named scripts): the tree goes
+    # whole with `javascript`; without it the scripts stay and only what the
+    # other options remove is taken from them.
+    try:
+        names = root.get("/Names")
+        if names is not None and "/JavaScript" in names:
+            if opts["javascript"]:
+                del names["/JavaScript"]
+                _bump("named_javascript")
+            else:
+                _clean_named_scripts(names["/JavaScript"], opts, _bump)
+    except Exception as exc:
+        _trouble("the document's named scripts could not be removed", exc)
+
+    # Embedded files. One file is one count, however many places list it:
+    # the counter that gets it is the first removal to reach it. (pikepdf >=
+    # 10.16 registers an attachment in both the name tree and the catalog's
+    # /AF, as the same object.)
+    counted_files: set = set()
+
+    def _first_time(fs) -> bool:
+        try:
+            if fs is None or not fs.is_indirect:
+                return True         # an inline filespec has one holder
+            key = tuple(fs.objgen)
+        except Exception:
+            return True
+        if key in counted_files:
+            return False
+        counted_files.add(key)
+        return True
+
+    def _drop_af(holder, whose: str) -> None:
+        """Delete *holder*'s /AF (associated files), counting the files in
+        it that nothing counted before. /AF references embedded streams
+        independently of the name tree, so it is stripped wherever it
+        appears — root, pages, annotations — or the streams stay referenced
+        and survive (ANL-04)."""
+        try:
+            af = holder.get("/AF")
+            if af is None:
+                return
+            listed = _as_list(af)
+            del holder["/AF"]
+            _bump("associated_file", sum(1 for fs in listed if _first_time(fs)))
+        except Exception as exc:
+            _trouble(f"the associated files of {whose} could not be removed", exc)
+
+    if opts["embedded_files"]:
+        try:
+            names = root.get("/Names")
+            if names is not None and "/EmbeddedFiles" in names:
+                listed = list(_name_tree_values(names["/EmbeddedFiles"]))
+                del names["/EmbeddedFiles"]
+                _bump("embedded_files", sum(1 for fs in listed if _first_time(fs)))
+        except Exception as exc:
+            _trouble("the document's attachment list could not be removed", exc)
+        _drop_af(root, "the document")
+
+    # Pages and their annotations — the pages in the page tree and the ones
+    # outside it (_all_pages, which the analyzer walks too). This loop
+    # reaches the annotations itself rather than through _action_owners
+    # because it rewrites each page's /Annots as it goes; a test holds the
+    # two walks to the same set of annotations.
+    dropped: set = set()        # (num, gen) of annotations already dropped
+    for label, page in _all_pages(pdf):
+        try:
+            _scrub_owner_actions("page", label, page, opts, _bump)
+            if opts["embedded_files"]:
+                _drop_af(page, _plain_owner(label))
+            annots = page.get("/Annots")
+            if not isinstance(annots, pikepdf.Array):
+                continue
+        except Exception as exc:
+            _trouble(f"{_plain_owner(label)} could not be cleaned", exc)
+            continue
+        keep = []
+        for annot in list(annots):
+            try:
+                ident = tuple(annot.objgen) if annot.is_indirect else None
+                if ident is not None and ident in dropped:
+                    continue             # listed on an earlier page too; gone there
+                # /A, /PA and /AA, by the rule every site uses: an action
+                # goes for what it does or, in /AA, for firing by itself; one
+                # that stays has its /Next chain cleaned (ANL-02). When the
+                # annotation's own /A had to go, the annotation is dropped —
+                # and the /A has been deleted from it as well, because
+                # taking a widget off the page does not take it out of the
+                # file: /AcroForm still lists it.
+                drop = _scrub_owner_actions("annot", f"{label} annotation",
+                                            annot, opts, _bump)
+                # Embedded files carried by the annotation itself:
+                # /FileAttachment annots hold a stream via /FS→/EF, and /AF
+                # arrays reference embedded streams — both independent of
+                # the name tree, and both invisible to the /A→/S check
+                # above (ANL-04).
+                if opts["embedded_files"]:
+                    if _as_str(annot.get("/Subtype")) == "/FileAttachment":
+                        drop = True
+                        if _first_time(annot.get("/FS")):
+                            _bump("file_attachment_annot")
+                    _drop_af(annot, f"{_plain_owner(label)} annotation")
+                if not drop:
+                    keep.append(annot)
+                elif ident is not None:
+                    dropped.add(ident)
+            except Exception as exc:
+                if isinstance(annot, pikepdf.Dictionary):     # a null entry is not trouble
+                    _trouble(f"{_plain_owner(label)} annotation could not be cleaned", exc)
+                keep.append(annot)
+        try:
+            if len(keep) != len(annots):
+                page["/Annots"] = pikepdf.Array(keep)
+        except Exception as exc:
+            _trouble(f"the annotation list of {_plain_owner(label)} could not be rewritten", exc)
+
+    # Bookmarks, and form fields no page shows (a parent field, a field with
+    # no widget, a widget just dropped above). The owners come from the same
+    # generator the analyzer walks.
+    for owner_kind, label, owner in _action_owners(pdf):
+        if owner_kind in ("outline", "field"):
+            try:
+                _scrub_owner_actions(owner_kind, label, owner, opts, _bump)
+            except Exception as exc:
+                _trouble(f"{_plain_owner(label)} could not be cleaned", exc)
+
+    # Embedded files the structural removals above could not reach: a
+    # payload on any other holder (a /Screen or /RichMedia annotation, a
+    # rendition, an action, a private key). It is found by what it is — a
+    # dictionary whose /EF holds a stream — among the objects that will
+    # still be written, and emptied in place: the payload, and with it the
+    # file name, description and everything else that describes it.
+    if opts["embedded_files"]:
+        try:
+            if any(_has_payload(d) for d in _filespec_dicts(pdf)):
+                for d in _reachable(pdf):
+                    if _has_payload(d):
+                        for k in list(d.keys()):
+                            if k != "/Type":
+                                del d[k]
+                        if _first_time(d):
+                            _bump("embedded_file")
+        except Exception as exc:
+            _trouble("embedded files outside the attachment list could not be removed", exc)
+
+    # A script run when 3D artwork loads (_instantiate_scripts). The artwork
+    # stays; the script goes.
+    if opts["javascript"]:
+        for stream in list(_instantiate_scripts(pdf)):
+            try:
+                del stream["/OnInstantiate"]
+                _bump("instantiate_script")
+            except Exception as exc:
+                _trouble("a 3D artwork script could not be removed", exc)
+
+    if opts["metadata"]:
+        # Delete the metadata streams themselves, wherever they hang. Never
+        # open the packet for editing: pikepdf's recovering parser accepts
+        # malformed XMP it cannot then clear, so clear()-and-save writes the
+        # recovered tree back with its contents intact — and entering the
+        # editing context at all invents a packet (and an /Info) in a file
+        # that had neither.
+        try:
+            streams = _metadata_streams(pdf)
+            if streams:
+                # A /Metadata slot is emptied where it stands. A stream that
+                # declares itself metadata is then unhooked from wherever
+                # else it is referenced; one that does not is not — outside
+                # a /Metadata slot nothing says it is metadata, and a file
+                # can point a page's /Contents at the same stream.
+                for holder, _md in list(_metadata_slots(pdf)):
+                    try:
+                        del holder["/Metadata"]
+                    except Exception as exc:
+                        _trouble("an object's metadata entry could not be removed", exc)
+                _drop_stream_refs(pdf, {k for k, s in streams.items()
+                                        if _is_metadata_stream(s)})
+                _bump("xmp_metadata", len(streams))
+        except Exception as exc:
+            _trouble("metadata streams could not be removed", exc)
+        try:
+            info = pdf.trailer.get("/Info")
+            if info is not None:
+                try: had_entries = len(info.keys()) > 0
+                except Exception: had_entries = True     # not a dictionary at all
+                # Emptied, not only unhooked from the trailer: the same
+                # dictionary can be held under another key as well, and what
+                # is still referenced is still written. But only when it is
+                # nothing except document information (_is_plain_info). A
+                # trailer can point /Info at the page tree root, a page, the
+                # catalog; emptying that would take the document with it, so
+                # there the trailer's entry is all that goes.
+                if _is_plain_info(info):
+                    try:
+                        for k in list(info.keys()):
+                            del info[k]
+                    except Exception as exc:
+                        _trouble("the document information dictionary could not be emptied", exc)
+                del pdf.trailer["/Info"]
+                if had_entries:
+                    _bump("doc_info")
+        except Exception as exc:
+            _trouble("the document information dictionary could not be removed", exc)
+
+    return removed
+
+
+def _shares_identifier(path: str, source_ids: list[str], source_sha: str) -> bool:
+    """True if the file at *path* carries one of *source_ids* in its trailer
+    /ID without being, byte for byte, the source itself."""
+    wanted = {s for s in source_ids if s}
+    if not wanted:
+        return False
+    with pikepdf.open(path) as pdf:
+        shared = wanted & set(trailer_ids(pdf))
+    return bool(shared) and file_sha256(path) != source_sha
+
+
+def sanitize_pdf(input_path: str, output_path: str,
+                 options: Optional[dict] = None) -> dict:
+    """Strip dangerous/active content from a PDF, then PROVE it is gone or
+    refuse (fail-closed, #101).
+
+    Verify, then commit. The cleaned candidate is written to a temp file
+    beside output_path — twice, so its layout is the settled one — and that
+    file, the exact bytes that would be committed, is handed to
+    verify_sanitization(). It must find every category the enabled options
+    promise absent (by re-running the analyzer AND by an independent sweep of
+    every object), must have been able to look everywhere, and must find no
+    trailer /ID element in common with the source. Only then is the
+    candidate renamed onto output_path.
+
+    If it cannot be verified, SanitizationVerificationError is raised with
+    the report, and the run has not created, replaced or deleted
+    output_path — when that is the input itself (sanitizing in place), the
+    original is untouched. Findings the options did not promise to remove
+    are not a failure; they are listed on the report as residuals.
+
+    Returns {"removed", "total_removed", "output", "output_size",
+    "verification"}: the counters, and the verification report as a dict.
+    """
+    opts = {**DEFAULT_SANITIZE, **(options or {})}
+    source_sha = file_sha256(input_path)
+
     # allow_overwriting_input reads the input fully into memory at open time and
-    # releases the OS file handle, so the atomic write below can os.replace over
+    # releases the OS file handle, so the commit below can os.replace over
     # input_path for an in-place sanitise (output_path == input_path). Without
     # it, os.replace hits a handle pikepdf still holds → PermissionError
     # [WinError 5] on Windows (ANL-01). Harmless when output_path differs.
     with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
-        root = pdf.Root
+        # The source's identity, before anything changes the document: the
+        # verifier is handed these as plain values and never opens the input.
+        source_ids = trailer_ids(pdf)
 
-        # Catalog actions: /OpenAction and the document's /AA, entry by entry.
-        _scrub_owner_actions("document", "Document", root, opts, _bump)
-        # /Names -> /JavaScript (document-level named scripts)
-        try:
-            names = root.get("/Names")
-            if names is not None and "/JavaScript" in names and opts["javascript"]:
-                del names["/JavaScript"]
-                _bump("named_javascript")
-        except Exception:
-            pass
+        with _collecting_trouble() as diagnostics:
+            removed = _remove_content(pdf, opts)
 
-        # Embedded files. One file is one count, however many places list
-        # it: the counter that gets it is the first removal to reach it.
-        # (pikepdf >= 10.16 registers an attachment in both the name tree and
-        # the catalog's /AF, as the same object.)
-        counted_files: set = set()
-
-        def _first_time(fs) -> bool:
-            try:
-                if fs is None or not fs.is_indirect:
-                    return True         # an inline filespec has one holder
-                key = tuple(fs.objgen)
-            except Exception:
-                return True
-            if key in counted_files:
-                return False
-            counted_files.add(key)
-            return True
-
-        def _drop_af(holder) -> None:
-            """Delete *holder*'s /AF (associated files), counting the files
-            in it that nothing counted before. /AF references embedded
-            streams independently of the name tree, so it is stripped
-            wherever it appears — root, pages, annotations — or the streams
-            stay referenced and survive (ANL-04)."""
-            try:
-                af = holder.get("/AF")
-                if af is None:
-                    return
-                listed = list(af) if isinstance(af, pikepdf.Array) else [af]
-                del holder["/AF"]
-                _bump("associated_file", sum(1 for fs in listed if _first_time(fs)))
-            except Exception:
-                pass
-
-        if opts["embedded_files"]:
-            try:
-                names = root.get("/Names")
-                if names is not None and "/EmbeddedFiles" in names:
-                    listed = list(_name_tree_values(names["/EmbeddedFiles"]))
-                    del names["/EmbeddedFiles"]
-                    _bump("embedded_files", sum(1 for fs in listed if _first_time(fs)))
-            except Exception:
-                pass
-            _drop_af(root)
-
-        # Walk pages & annotations for active content. This loop reaches the
-        # annotations itself rather than through _action_owners because it
-        # rewrites each page's /Annots as it goes; a test holds the two walks
-        # to the same set of annotations.
-        dropped: set = set()        # (num, gen) of annotations already dropped
-        for pi, page in enumerate(pdf.pages, 1):
-            _scrub_owner_actions("page", f"Page {pi}", page, opts, _bump)
-            if opts["embedded_files"]:
-                _drop_af(page)
-
-            annots = page.get("/Annots")
-            if annots is None:
-                continue
-            keep = []
-            for annot in list(annots):
-                try:
-                    ident = tuple(annot.objgen) if annot.is_indirect else None
-                    if ident is not None and ident in dropped:
-                        continue             # listed on an earlier page too; gone there
-                    # /A and /AA, by the rule every site uses: an action goes
-                    # for what it does or, in /AA, for firing by itself; one
-                    # that stays has its /Next chain cleaned (ANL-02). When
-                    # the annotation's own /A had to go, the annotation is
-                    # dropped — and the /A has been deleted from it as well,
-                    # because taking a widget off the page does not take it
-                    # out of the file: /AcroForm still lists it.
-                    drop = _scrub_owner_actions("annot", f"Page {pi} annotation",
-                                                annot, opts, _bump)
-                    # Embedded files carried by the annotation itself:
-                    # /FileAttachment annots hold a stream via /FS→/EF, and /AF
-                    # arrays reference embedded streams — both independent of
-                    # the name tree, and both invisible to the /A→/S check
-                    # above (ANL-04).
-                    if opts["embedded_files"]:
-                        if _as_str(annot.get("/Subtype")) == "/FileAttachment":
-                            drop = True
-                            if _first_time(annot.get("/FS")):
-                                _bump("file_attachment_annot")
-                        _drop_af(annot)
-                    if not drop:
-                        keep.append(annot)
-                    elif ident is not None:
-                        dropped.add(ident)
-                except Exception:
-                    keep.append(annot)
-            if len(keep) != len(annots):
-                page["/Annots"] = pikepdf.Array(keep)
-
-        # Bookmarks, and form fields no page shows (a parent field, a field
-        # with no widget, a widget just dropped above). The owners come from
-        # the same generator the analyzer walks.
-        for owner_kind, label, owner in _action_owners(pdf):
-            if owner_kind in ("outline", "field"):
-                _scrub_owner_actions(owner_kind, label, owner, opts, _bump)
-
-        # Embedded files the structural removals above could not reach: a
-        # payload on any other holder (a /Screen or /RichMedia annotation, a
-        # rendition, an action, a private key). It is found by what it is —
-        # a dictionary whose /EF holds a stream — among the objects that will
-        # still be written, and emptied in place: the payload, and with it
-        # the file name, description and everything else that describes it.
-        if opts["embedded_files"]:
-            try:
-                if any(_has_payload(d) for d in _filespec_dicts(pdf)):
-                    for d in _reachable(pdf):
-                        if _has_payload(d):
-                            for k in list(d.keys()):
-                                if k != "/Type":
-                                    del d[k]
-                            if _first_time(d):
-                                _bump("embedded_file")
-            except Exception:
-                pass
-
-        # A script run when 3D artwork loads: an /OnInstantiate stream on a
-        # stream typed /3D. It is JavaScript, but not an action, so no action
-        # site holds it; it is found by what the stream is. The artwork stays.
-        if opts["javascript"]:
-            for obj in _iter_all_objects(pdf):
-                try:
-                    if (isinstance(obj, pikepdf.Stream)
-                            and _as_str(obj.get("/Type")) == "/3D"
-                            and "/OnInstantiate" in obj):
-                        del obj["/OnInstantiate"]
-                        _bump("instantiate_script")
-                except Exception:
-                    continue
-
-        if opts["metadata"]:
-            # Delete the metadata streams themselves, wherever they hang.
-            # Never open the packet for editing: pikepdf's recovering parser
-            # accepts malformed XMP it cannot then clear, so clear()-and-save
-            # writes the recovered tree back with its contents intact — and
-            # entering the editing context at all invents a packet (and an
-            # /Info) in a file that had neither.
-            try:
-                streams = _metadata_streams(pdf)
-                if streams:
-                    _drop_stream_refs(pdf, set(streams))
-                    _bump("xmp_metadata", len(streams))
-            except Exception:
-                pass
-            try:
-                info = pdf.trailer.get("/Info")
-                if info is not None:
-                    try: had_entries = len(info.keys()) > 0
-                    except Exception: had_entries = True
-                    del pdf.trailer["/Info"]
-                    if had_entries:
-                        _bump("doc_info")
-            except Exception:
-                pass
-
-        # Atomic write. fix_metadata_version stays off: it parses any XMP
+        # The candidate. fix_metadata_version stays off: it parses any XMP
         # packet on the way out, which rewrites one the user kept and raises
         # outright on one that cannot be decoded.
         out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
@@ -2033,17 +2575,48 @@ def sanitize_pdf(input_path: str, output_path: str,
             # its identifier (a digest of the content) come out the same.
             with pikepdf.open(tmp, allow_overwriting_input=True) as settled:
                 save_with_content_id(settled, tmp, **save_kwargs)
-            os.replace(tmp, output_path)
+            # An identifier that is a digest of the content is the same
+            # whenever the content is. A file sanitized before, then re-saved
+            # or edited by a tool that keeps the first /ID element (as the
+            # format asks of it), still carries the identifier this output
+            # is about to get. The gate would refuse that, rightly, and the
+            # user could do nothing about it — so the same content is
+            # written in a second layout, whose digest is a different one.
+            if _shares_identifier(tmp, source_ids, source_sha):
+                other = {**save_kwargs,
+                         "object_stream_mode": pikepdf.ObjectStreamMode.disable}
+                for _ in range(2):
+                    with pikepdf.open(tmp, allow_overwriting_input=True) as again:
+                        save_with_content_id(again, tmp, **other)
         except Exception:
             if os.path.exists(tmp):
                 os.unlink(tmp)
             raise
+
+    # Verify, then commit: the temp is closed, and it is exactly what would
+    # be renamed into place. (Imported here, not at the top: pdf_verify
+    # imports this module.)
+    try:
+        import pdf_verify
+        report = pdf_verify.verify_sanitization(
+            tmp, opts, input_path=input_path,
+            source_ids=source_ids, source_sha256=source_sha)
+        report.retarget(output_path)
+        report.diagnostics = list(diagnostics)
+        if not report.verified:
+            raise SanitizationVerificationError(
+                pdf_verify.sanitize_refusal_message(report), report=report.to_dict())
+        os.replace(tmp, output_path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
     return {
         "removed": removed,
         "total_removed": sum(removed.values()),
         "output": output_path,
         "output_size": os.path.getsize(output_path),
+        "verification": report.to_dict(),
     }
 
 
