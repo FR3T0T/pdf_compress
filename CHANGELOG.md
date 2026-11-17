@@ -2,6 +2,83 @@
 ## Unreleased
 
 ### Added
+- **Sanitize proves its output before it commits it (#101).** `sanitize_pdf`
+  (`pdf_analyze.py`) writes the cleaned candidate to a temp file beside the
+  destination, runs `verify_sanitization` on those exact bytes, and renames
+  the candidate onto `output_path` only if it verified. If it did not, it
+  raises the new `pdf_analyze.SanitizationVerificationError` — `report` is the
+  verification report as a dict — and the run has not created, replaced or
+  deleted `output_path`: sanitizing in place leaves the original
+  byte-identical, a file already at a separate destination is untouched, and
+  no temp file is left behind. Verified means three things. Every finding the
+  enabled options promise is absent from a fresh audit of the candidate. The
+  audit and the whole-file sweep were able to look everywhere (see the next
+  bullet). And the candidate shares no trailer `/ID` element with its source
+  (`sanitize.file_id`): `sanitize_pdf` captures the source's identifiers and
+  SHA-256 while it has the input open and hands them over as plain values, so
+  the verifier never opens the input; an output byte-identical to its source
+  is exempt, which is what sanitizing an already-clean file produces.
+  Findings no option promised (GPS in an embedded photo, a remote GoTo) are
+  residuals on the report, not failures. The return value gains
+  `"verification"`; image inputs through `strip_file` carry none. Cost,
+  measured on a 600-page file with 7,200 annotations: Sanitize 0.4 s → 1.0 s.
+  The gate audits the output, so Sanitize now takes at least as long as
+  Analyze does on the same file: on a decompression-bomb test file that
+  Analyze needs 74 s for (before and after this change), Sanitize went from
+  0.02 s to 80 s.
+  The bridge and the UI do not show the report or the refusal detail yet;
+  that is the next change. Tests: `TestGate` in `tests/test_sanitize_gate.py`.
+- **"Could not check" is no longer "nothing there" (#101).** Analyze's
+  scanners and walkers are tolerant — one structure they cannot read must not
+  end the audit — but they used to swallow the exception and report whatever
+  was left, so a scanner that crashed read as `clean`. Every such place now
+  records which findings it could not evaluate: `AnalysisResult.unevaluated`,
+  `{finding id: [reasons]}`, in `to_dict()` as `unevaluated`. A scanner that
+  stops marks every finding it can emit; a walker that cannot read one
+  bookmark, field, annotation or name-tree node says so and carries on.
+  Analyze never answers `clean` when anything is unevaluated: it emits
+  `audit.incomplete` (medium) listing what could not be checked.
+  `verify_sanitization` fails a promised finding that could not be evaluated
+  (the check is marked `unevaluated`) and lists unpromised ones in the
+  report's new `unevaluated` field, so the report never implies they were
+  checked. There are no depth caps left to record: `/Next` chains, name trees
+  and nested dictionaries are walked iteratively to their end (the
+  sanitizer's chain cleaner used to stop 30 links down and drop the rest of
+  the chain uncounted). Reasons give the exception's type, never its message —
+  library messages quote the path of the file. Tests: `TestCouldNotEvaluate`.
+- **Analyze reports what the verifier's sweep can see (#101).** A user must
+  never get `clean` from Analyze and then a refusal from Sanitize. After its
+  scanners, Analyze now runs the verifier's whole-file sweep twice on its
+  in-memory copy (nothing is saved): on the document as it is, and after a
+  sanitize with every option on. Whatever is left after that sanitize is added
+  to the finding it belongs to, in plain words, with "Sanitize cannot remove
+  it from here". A category the sweep finds in the untouched file that no
+  scanner listed — it goes only along with something another option removes
+  whole — is listed with "Sanitize removes it only together with what holds
+  it". Analyze also reports a 3D stream's `/OnInstantiate` script under
+  `scripts.js` (Sanitize already removed it), and follows a `/Next` chain to
+  its end, where it used to stop at 32 links. Cost on the same 600-page file:
+  Analyze 0.6 s → 1.1 s. Tests: `TestAnalyzeSeesWhatTheSweepSees`,
+  `TestOneOptionAlone`.
+- **Pages outside the page tree (#101).** A page held only by the catalog's
+  `/Names /Templates` or `/Names /Pages` name tree (a page template, a "named
+  page") can be shown or spawned by a viewer, and nothing looked at it.
+  Analyze and Sanitize now take their pages from one generator
+  (`_all_pages`), which yields those after the page tree, each page once, so
+  page `/AA`, annotations, `/AF` and page metadata there are reported, removed
+  and verified like any other. The parity matrix runs every page-based site
+  kind in all three homes (294 cases). Tests: `TestPagesOutsideThePageTree`.
+- **Refusals and sweep evidence in plain words (#101).** A refused sanitize
+  says which of three things happened: something the options promised to
+  remove is still there (named: "still present in the output: JavaScript"),
+  something could not be checked (named, and said to be unchecked rather than
+  present), or the output would still carry its source's identifier
+  (`pdf_verify.sanitize_refusal_message`). Sweep evidence reads "a JavaScript
+  action on page 1, annotation 2, under /Stash" (`pdf_verify.plain_location`,
+  Qt-free); the raw object path is kept beside it in the check's new
+  `objectPaths`. What the remover itself could not process is attached to the
+  report as `diagnostics` — structure names and exception types only, no file
+  paths or names. Tests: `TestRefusalWording`, `TestDiagnostics`.
 - **Whole-file sweep in `verify_sanitization` (#101).** The verifier's
   promise checks re-run the analyzer, so alone they were only as good as the
   list of places the analyzer knows to look. `verify_sanitization` now takes
@@ -12,16 +89,23 @@
   dictionary holding actions under the standard trigger names, a stream typed
   as metadata, a dictionary whose `/EF` holds a stream, a 3D stream with an
   `/OnInstantiate` script. One `sanitize.sweep_<option>` check per enabled
-  option; a hit fails it with the object path as evidence, **even at a place
-  the analyzer has no site for**. No predicate fires on a key name alone, so
+  option; a hit fails it, with what was found and where as evidence, **even
+  at a place the analyzer has no site for**. No predicate fires on a key name
+  alone, so
   a font named `/JS`, `/AA` or `/EF` or an image named `/Metadata` is not a
-  hit. The walk is iterative (tested on a 20,000-link `/Next` chain) and
+  hit. A stream typed `/EmbeddedFile` is a hit wherever it is, with one
+  exception by position: a packet of the catalog's `/AcroForm /XFA` entry.
+  Adobe LiveCycle Designer types its XFA packets that way; they are the form
+  (`forms.xfa`, which no option removes, so a residual), not attachments, and
+  counting them refused every such form under the default options. A file
+  specification that embeds a packet is still found and removed. The walk is iterative (tested on a 20,000-link `/Next` chain) and
   cycle-safe, and it never passes on a partial walk: an object that cannot be
   read, an output that cannot be opened, or a walk cut short fails every
   sweep check. `walk_objects(..., strings=True)` also yields every string, for
-  a later whole-file term search in `verify_redaction`. Nothing calls
-  `verify_sanitization` from `sanitize_pdf` yet; that gate is the next change.
-  Tests: `TestSweep*` in `tests/test_pdf_verify.py`.
+  a later whole-file term search in `verify_redaction`. `sanitize_pdf` runs
+  it on every output before committing (the gate, above). Tests: `TestSweep*`
+  in `tests/test_pdf_verify.py`, `TestXfaPackets` in
+  `tests/test_sanitize_gate.py`.
 - **Analyze/Sanitize parity matrix (#101).** `tests/test_sanitize_parity.py`
   is generated from `pdf_analyze.ACTION_SITE_KINDS` — the one list of places
   an action can hang — crossed with the action types the options remove
@@ -86,9 +170,14 @@
   still removed.
 - **Analyze reports metadata by presence (#101).** `meta.xmp` is reported for
   any stream typed `/Metadata` or `/XML` on any object — the catalog, a page,
-  anything else — and for whatever stream sits in the catalog's `/Metadata`
-  slot, whether or not it can be parsed or even decoded; the finding lists
-  where each one hangs. An empty packet counts: it is in the file.
+  anything else — and for whatever stream sits in the `/Metadata` slot of the
+  catalog, a page, or any other object that declares a `/Type`, typed or not
+  and whether or not it can be parsed or even decoded; the finding lists
+  where each one hangs. (A resource dictionary declares no `/Type`, so an
+  image it names `/Metadata` is not metadata.) Sanitize empties such a slot
+  where it stands; a stream that declares itself metadata is also unhooked
+  from wherever else it is referenced, one that does not is not — a file can
+  point a page's `/Contents` at the same stream. An empty packet counts: it is in the file.
   `meta.docinfo` reports every non-empty `/Info` entry, custom keys included,
   except `/Trapped` (a prepress flag). Analyze no longer opens pikepdf's
   metadata editing context to look, which made it report `/Info` entries a
@@ -118,12 +207,22 @@
   `launch_action`, `submit_action` and `external_link`.
 - **Sanitized output is a fixed point with a content-derived `/ID` (#117,
   #101).** `sanitize_pdf` writes through `save_with_content_id`, so the
-  output no longer carries the source's trailer `/ID` (the verification
-  check for it lands with the #101 gate). It writes twice: qpdf packs object
+  output no longer carries the source's trailer `/ID` (the gate's
+  `sanitize.file_id` check holds it to that). It writes twice: qpdf packs object
   streams by the numbers objects had on the way in, so only the second write
   is the layout it would give that same file again. Sanitizing a sanitized
   file now changes no byte, and the same input gives the same bytes on every
-  run. `fix_metadata_version` is off for these writes.
+  run. `fix_metadata_version` is off for these writes. One exception to "the
+  same content gives the same bytes": an identifier that is a digest of the
+  content is the same whenever the content is, so a source that descends from
+  an earlier sanitized copy — re-saved, or edited by a tool that keeps the
+  first `/ID` element, as the format asks — can already carry the identifier
+  its clean copy would get. The gate would refuse that output, and the user
+  could do nothing about it. `sanitize_pdf` then writes the same content in a
+  second layout (no object streams), whose digest is a different one; that
+  output verifies, and sanitizing it again gives the ordinary layout. A
+  source that already carries the identifiers of both layouts is refused, and
+  Analyze does not list that beforehand; it takes deliberate construction.
 - **Search-term redaction no longer rewrites metadata it was not asked to
   remove (#101).** A consequence of the XMP scrub fix below. Inspecting the
   XMP used to enter pikepdf's metadata editing context, which wrote an empty
@@ -165,8 +264,8 @@
   surface, page, stream, or cross-check that cannot be read — never a pass.
   Every failure's evidence names its surface and page (or "document-level")
   — the page-attribution the upcoming fail-closed redaction UX needs to
-  offer targeted flatten-to-image. Pure addition: nothing calls it yet
-  (wiring into `redact_pdf`/`sanitize_pdf` is #99/#101). Covered by
+  offer targeted flatten-to-image. A pure addition when it landed; `redact_pdf`
+  (#99) and `sanitize_pdf` (#101) now call it before committing. Covered by
   `tests/test_pdf_verify.py` (37 tests: one per surface, rect mode,
   locked/corrupt outputs, sanitize round-trips, and fail-closed regressions
   from an adversarial review — cross-line case-sensitive terms, multi-page
@@ -180,6 +279,42 @@
   code with no remaining callers.
 
 ### Fixed
+- **Sanitize: shapes that verified with content still in the file, or were
+  refused over something Analyze had not listed (#101).** Found by trying to
+  break the gate. (1) An `/Info` dictionary also referenced from another key
+  was only unhooked from the trailer, so its entries were still written; it
+  is now emptied as well — when it is nothing but document information: a
+  dictionary, not a stream, with no `/Type`, `/Subtype` or `/S`, whose every
+  value is a string, a name, a number or a boolean. A trailer can point
+  `/Info` at an object with another job (one real file has `/Info` and the
+  page tree root as the same object); there only the trailer's entry is
+  removed and the object is left as it is. (2) An untyped stream in a page's `/Metadata` slot
+  was neither reported nor removed (see "metadata by presence" above). (3) An
+  `/AA` entry holding an array of actions went whole under `auto_actions` but
+  was invisible to the other options, so Analyze said `clean` and
+  `javascript` alone was refused; each action in such an array is now a site
+  like a lone one, reported, removed and counted. (4) An action chained after
+  a named script, or stored in place of one, went with the tree under
+  `javascript` but stayed under `launch_actions`, `submit_actions` or
+  `external_links` alone; with `javascript` off the named scripts are now
+  cleaned entry by entry. (5) A re-saved copy of an already-sanitized file
+  read `clean` and was then refused for carrying its source's identifier
+  (see the content-derived `/ID` bullet above). Still refused, and listed by
+  Analyze beforehand: a script nested under a private key inside an `/AA`
+  entry, or an `/AA` that is not a dictionary, when `javascript` is on and
+  `auto_actions` is off. Tests: `TestMetadataHeldTwoWays`, `TestOneOptionAlone`,
+  `TestIdentifierTheSourceAlreadyCarries`, `TestInfoThatIsAnotherObject`.
+- **Analyze: the search for photos inside a PDF did not finish on forms that
+  share their contents, and stopped 8 forms deep (#101).** The walk behind
+  `location.embedded_image` and `metadata.embedded_image` remembered the
+  images it had seen but not the form XObjects, so forms that draw the same
+  other forms were walked again for every path that leads to them: on one
+  real two-page file with 270 forms Analyze did not finish, and through the
+  gate — which audits the output — neither would Sanitize. Each form is now
+  entered once per document, by object number. The walk is iterative and has
+  no depth limit, so a photo more than 8 forms down is found, where it was
+  silently skipped. What it does with an image it cannot read is unchanged
+  (#111). Tests: `TestEmbeddedImageWalk`.
 - **Sanitize and Analyze missed actions on bookmarks and in the form-field
   tree (#101).** JavaScript on a bookmark, or on a form field that no page
   lists as an annotation (a parent field whose widget is a kid, a field with

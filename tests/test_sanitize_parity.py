@@ -38,10 +38,10 @@ ALL_OFF = {k: False for k in DEFAULT_SANITIZE}
 # ── Planting an action at each kind of site ──────────────────────────────
 
 
-def _add_annot(pdf, **entries) -> None:
+def _add_annot(pdf, page, **entries) -> None:
     annot = pdf.make_indirect(Dictionary(
         Type=Name.Annot, Subtype=Name.Link, Rect=[0, 0, 50, 50], **entries))
-    pdf.pages[0].obj["/Annots"] = Array([annot])
+    page["/Annots"] = Array([annot])
 
 
 def _add_bookmark(pdf, **entries) -> None:
@@ -58,19 +58,31 @@ def _add_field(pdf, **entries) -> None:
     pdf.Root["/AcroForm"] = Dictionary(Fields=Array([fld]))
 
 
-#: site kind -> plant(pdf, action). One entry per ACTION_SITE_KINDS member.
+#: site kind -> plant(pdf, page, action). One entry per ACTION_SITE_KINDS
+#: member. *page* is the page dictionary to use, for the kinds that live on one.
 PLANT = {
-    "open_action": lambda pdf, a: pdf.Root.__setitem__("/OpenAction", a),
-    "document_aa": lambda pdf, a: pdf.Root.__setitem__("/AA", Dictionary(WC=a)),
-    "page_aa": lambda pdf, a: pdf.pages[0].obj.__setitem__("/AA", Dictionary(O=a)),
-    "annot_a": lambda pdf, a: _add_annot(pdf, A=a),
-    "annot_pa": lambda pdf, a: _add_annot(
-        pdf, PA=a, Dest=Array([pdf.pages[0].obj, Name.Fit])),
-    "annot_aa": lambda pdf, a: _add_annot(pdf, AA=Dictionary(E=a)),
-    "outline_a": lambda pdf, a: _add_bookmark(pdf, A=a),
-    "field_a": lambda pdf, a: _add_field(pdf, A=a),
-    "field_aa": lambda pdf, a: _add_field(pdf, AA=Dictionary(K=a)),
+    "open_action": lambda pdf, page, a: pdf.Root.__setitem__("/OpenAction", a),
+    "document_aa": lambda pdf, page, a: pdf.Root.__setitem__("/AA", Dictionary(WC=a)),
+    "page_aa": lambda pdf, page, a: page.__setitem__("/AA", Dictionary(O=a)),
+    "annot_a": lambda pdf, page, a: _add_annot(pdf, page, A=a),
+    "annot_pa": lambda pdf, page, a: _add_annot(
+        pdf, page, PA=a, Dest=Array([page, Name.Fit])),
+    "annot_aa": lambda pdf, page, a: _add_annot(pdf, page, AA=Dictionary(E=a)),
+    "outline_a": lambda pdf, page, a: _add_bookmark(pdf, A=a),
+    "field_a": lambda pdf, page, a: _add_field(pdf, A=a),
+    "field_aa": lambda pdf, page, a: _add_field(pdf, AA=Dictionary(K=a)),
 }
+
+#: Kinds that hang on a page or on one of its annotations.
+PAGE_KINDS = ("page_aa", "annot_a", "annot_pa", "annot_aa")
+
+#: Where a page can live: in the page tree, or only in one of the catalog's
+#: name trees for pages outside it (templates, named pages).
+HOMES = ("tree", "Templates", "Pages")
+
+
+def _homes(kind: str) -> tuple:
+    return HOMES if kind in PAGE_KINDS else ("tree",)
 
 #: action type -> (make it, the option that removes it, the finding Analyze
 #: reports it under, the counter a removal by type is counted under, bytes
@@ -94,14 +106,22 @@ def _harmless() -> Dictionary:
     return Dictionary(S=Name.Named, N=Name.NextPage)
 
 
-def _build(path, kind: str, action, *, nested: bool) -> str:
+def _build(path, kind: str, action, *, nested: bool, home: str = "tree") -> str:
     pdf = pikepdf.Pdf.new()
-    pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page, MediaBox=[0, 0, 612, 792])))
+    for _ in range(1 if home == "tree" else 2):
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page, MediaBox=[0, 0, 612, 792])))
+    page = pdf.pages[-1].obj
     if nested:
         head = _harmless()
         head["/Next"] = pdf.make_indirect(action)
         action = head
-    PLANT[kind](pdf, action)
+    PLANT[kind](pdf, page, action)
+    if home != "tree":
+        # Take the page out of the page tree; the name tree is now the only
+        # thing that holds it.
+        del pdf.pages[-1]
+        pdf.Root["/Names"] = Dictionary({f"/{home}": Dictionary(
+            Names=Array([String("extra"), page]))})
     pdf.save(str(path))
     pdf.close()
     return str(path)
@@ -155,17 +175,18 @@ def test_every_site_kind_is_exercised():
     assert set(PLANT) == set(ACTION_SITE_KINDS)
 
 
-MATRIX = [(kind, atype, nested)
-          for kind in ACTION_SITE_KINDS for atype in ACTIONS for nested in (False, True)]
-MATRIX_IDS = [f"{k}-{a}-{'next' if n else 'head'}" for k, a, n in MATRIX]
+MATRIX = [(kind, home, atype, nested)
+          for kind in ACTION_SITE_KINDS for home in _homes(kind)
+          for atype in ACTIONS for nested in (False, True)]
+MATRIX_IDS = [f"{k}-{h}-{a}-{'next' if n else 'head'}" for k, h, a, n in MATRIX]
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("kind, atype, nested", MATRIX, ids=MATRIX_IDS)
+@pytest.mark.parametrize("kind, home, atype, nested", MATRIX, ids=MATRIX_IDS)
 class TestSiteByActionType:
-    def test_option_on_removes_it_once_and_verifies(self, tmp_path, kind, atype, nested):
+    def test_option_on_removes_it_once_and_verifies(self, tmp_path, kind, home, atype, nested):
         make, option, finding, counter, marker = ACTIONS[atype]
-        src = _build(tmp_path / "src.pdf", kind, make(), nested=nested)
+        src = _build(tmp_path / "src.pdf", kind, make(), nested=nested, home=home)
         opts = {**ALL_OFF, option: True}
 
         # Analyze finds it, and so — independently — does the sweep.
@@ -185,9 +206,9 @@ class TestSiteByActionType:
         assert after.verified is True, [(c.id, c.evidence) for c in after.failed_checks()]
         assert _check(after, f"sanitize.sweep_{option}").passed is True
 
-    def test_option_off_leaves_it_as_a_residual(self, tmp_path, kind, atype, nested):
+    def test_option_off_leaves_it_as_a_residual(self, tmp_path, kind, home, atype, nested):
         make, _option, finding, _counter, marker = ACTIONS[atype]
-        src = _build(tmp_path / "src.pdf", kind, make(), nested=nested)
+        src = _build(tmp_path / "src.pdf", kind, make(), nested=nested, home=home)
         out = str(tmp_path / "out.pdf")
         res = sanitize_pdf(src, out, ALL_OFF)
         assert res["removed"] == {}
@@ -197,19 +218,19 @@ class TestSiteByActionType:
         assert report.failed_checks() == []
 
 
-AUTORUN = [k for k in ACTION_SITE_KINDS if k in _AUTORUN_KINDS]
+AUTORUN = [(k, h) for k in ACTION_SITE_KINDS if k in _AUTORUN_KINDS for h in _homes(k)]
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("kind", AUTORUN)
+@pytest.mark.parametrize("kind, home", AUTORUN, ids=[f"{k}-{h}" for k, h in AUTORUN])
 class TestAutoRunSites:
     """`auto_actions` removes an action for where it is, whatever it does:
     here a harmless go-to-next-page that no other option would touch."""
 
     OPTS = {**ALL_OFF, "auto_actions": True}
 
-    def test_auto_actions_on_removes_it_once_and_verifies(self, tmp_path, kind):
-        src = _build(tmp_path / "src.pdf", kind, _harmless(), nested=False)
+    def test_auto_actions_on_removes_it_once_and_verifies(self, tmp_path, kind, home):
+        src = _build(tmp_path / "src.pdf", kind, _harmless(), nested=False, home=home)
         assert "actions.autorun" in _ids(src)
         assert _check(verify_sanitization(src, self.OPTS),
                       "sanitize.sweep_auto_actions").passed is False
@@ -221,8 +242,8 @@ class TestAutoRunSites:
         assert after.verified is True, [(c.id, c.evidence) for c in after.failed_checks()]
         assert _check(after, "sanitize.sweep_auto_actions").passed is True
 
-    def test_auto_actions_off_leaves_it_as_a_residual(self, tmp_path, kind):
-        src = _build(tmp_path / "src.pdf", kind, _harmless(), nested=False)
+    def test_auto_actions_off_leaves_it_as_a_residual(self, tmp_path, kind, home):
+        src = _build(tmp_path / "src.pdf", kind, _harmless(), nested=False, home=home)
         out = str(tmp_path / "out.pdf")
         assert sanitize_pdf(src, out, ALL_OFF)["removed"] == {}
         report = verify_sanitization(out, ALL_OFF)

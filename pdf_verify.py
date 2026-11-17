@@ -6,9 +6,11 @@ After a destructive transform (``redact_pdf``, ``sanitize_pdf``) writes its
 output, these functions re-open the OUTPUT file and independently confirm
 the targeted content is actually gone, emitting a structured
 :class:`VerificationReport` rather than trusting the transform library.
-``redact_pdf`` verifies before it commits: the file it hands over is a temp
-candidate beside the destination, renamed into place only if it passes
-(:meth:`VerificationReport.retarget` then names the real destination):
+``redact_pdf`` and ``sanitize_pdf`` both verify before they commit: the file
+they hand over is a temp candidate beside the destination, renamed into
+place only if it passes (:meth:`VerificationReport.retarget` then names the
+real destination). A candidate that does not pass is deleted and the
+transform raises, with the report, having touched nothing at the destination:
 
   - :func:`verify_redaction` — searches every extractable surface of the
     output (page text, raw content streams, annotations, form-field values,
@@ -26,10 +28,21 @@ candidate beside the destination, renamed into place only if it passes
     output and asserts absent exactly the finding categories the enabled
     sanitize options promised to remove (expectations-based — anything else
     the re-scan still flags is reported honestly as a residual finding, not
-    a failure). It then sweeps every object in the output independently of
-    the analyzer (:func:`walk_objects`, :func:`_sweep`), so a promised thing
-    sitting where the analyzer has no site is still found, and a sweep that
-    could not cover the whole file fails rather than passes.
+    a failure). A promised finding the audit could not fully evaluate fails
+    its check, marked ``unevaluated``; an unpromised one is listed in the
+    report's ``unevaluated`` field. It then sweeps every object in the
+    output independently of the analyzer (:func:`walk_objects`,
+    :func:`_sweep`), so a promised thing sitting where the analyzer has no
+    site is still found, and a sweep that could not cover the whole file
+    fails rather than passes. Sweep evidence is written for a reader who has
+    never seen a PDF's object graph (:func:`plain_location`); the raw object
+    path stays on the check as ``object_paths``. Given the source's trailer
+    /ID elements it asserts, like the redaction side, that the output
+    carries none of them (``sanitize.file_id``).
+    :func:`sanitize_refusal_message` turns a failed report into the one
+    sentence a refusal shows. ``pdf_analyze`` runs the same sweep from
+    Analyze (imported there lazily; this module imports that one), so what
+    would be refused here is reported there first.
 
 Fail-closed semantics: an output that cannot be opened, decrypted, or
 re-scanned yields a FAILED check; a surface (or single page/stream/rect)
@@ -56,7 +69,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import fitz  # PyMuPDF
 import pikepdf
@@ -96,6 +109,15 @@ class VerificationCheck:
     #: purely document-level residual. Structured so callers (the #99
     #: fail-closed flatten targeting) never parse evidence strings.
     pages: list[int] = field(default_factory=list)
+    #: True when the check failed because it could not be carried out — the
+    #: output would not open, a scanner did not finish, the sweep did not
+    #: cover the whole file — rather than because it found something.
+    #: "Could not look" is a failure, but a different one to report.
+    unevaluated: bool = False
+    #: Raw object paths (``trailer/Root/Pages/Kids[0]/...``) of what a sweep
+    #: check found, in the order of its evidence lines. The evidence says the
+    #: same thing in plain words; the paths are kept for an exported report.
+    object_paths: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         if not self.pages:
@@ -134,6 +156,14 @@ class VerificationReport:
     source_sha256: Optional[str] = None
     #: SHA-256 of the file the checks ran on (None if it could not be read).
     output_sha256: Optional[str] = None
+    #: Findings that could not be fully evaluated and that no enabled option
+    #: promised to remove: ``[{"id", "reasons"}]``. They fail nothing, but
+    #: they are listed so the report never implies they were checked.
+    unevaluated: list[dict] = field(default_factory=list)
+    #: What went wrong inside the transform itself, if anything (it is
+    #: tolerant, and the checks judge its result, so this is the "why" a
+    #: refusal would otherwise lack). Names no file.
+    diagnostics: list[str] = field(default_factory=list)
 
     @property
     def verified(self) -> bool:
@@ -197,7 +227,9 @@ class VerificationReport:
                 {"id": c.id, "description": c.description,
                  "passed": c.passed, "evidence": list(c.evidence),
                  "pages": list(c.pages),
-                 "isDocumentLevel": c.is_document_level}
+                 "isDocumentLevel": c.is_document_level,
+                 "unevaluated": c.unevaluated,
+                 "objectPaths": list(c.object_paths)}
                 for c in self.checks
             ],
             "residualFindings": self.residual_findings,
@@ -205,6 +237,8 @@ class VerificationReport:
             "flattenTargetPages": self.flatten_target_pages(),
             "sourceSha256": self.source_sha256,
             "outputSha256": self.output_sha256,
+            "unevaluated": [dict(u) for u in self.unevaluated],
+            "diagnostics": list(self.diagnostics),
         }
 
 
@@ -765,15 +799,20 @@ class WalkStatus:
         return not self.problems
 
 
-def render_path(path) -> str:
-    """Text for a path node from :func:`walk_objects`, e.g.
-    ``trailer/Root/Pages/Kids[0]/Annots[2]/A``. A run of one repeated
-    segment — a long /Next chain — is folded: ``/Next(x4000)``."""
+def _segments(path) -> list[str]:
     segs = []
     while path is not None:
         segs.append(path[0])
         path = path[1]
     segs.reverse()
+    return segs
+
+
+def render_path(path) -> str:
+    """Text for a path node from :func:`walk_objects`, e.g.
+    ``trailer/Root/Pages/Kids[0]/Annots[2]/A``. A run of one repeated
+    segment — a long /Next chain — is folded: ``/Next(x4000)``."""
+    segs = _segments(path)
     out, i = [], 0
     while i < len(segs):
         j = i
@@ -805,13 +844,15 @@ def walk_objects(pdf, status: WalkStatus, *, strings: bool = False,
     is recorded on *status*. A caller for whom "nothing found" has to mean
     something must check ``status.complete``.
 
-    *path* is an opaque node; :func:`render_path` turns it into text.
+    *path* is an opaque node (it remembers each object on the way down);
+    :func:`render_path` turns it into text.
     """
     containers = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
     seen: set = set()
-    stack = [(pdf.trailer, ("trailer", None))]
+    stack = [("trailer", None, pdf.trailer)]
     while stack:
-        obj, path = stack.pop()
+        path = stack.pop()
+        obj = path[2]
         try:
             if not isinstance(obj, containers):
                 continue
@@ -833,11 +874,93 @@ def walk_objects(pdf, status: WalkStatus, *, strings: bool = False,
                 children = [(str(k), obj[k]) for k in obj.keys()]
             for seg, child in reversed(children):
                 if isinstance(child, containers):
-                    stack.append((child, (seg, path)))
+                    stack.append((seg, path, child))
                 elif strings and isinstance(child, pikepdf.String):
-                    yield (seg, path), child
+                    yield (seg, path, child), child
         except Exception as exc:
-            status.problems.append(f"could not read {render_path(path)}: {exc}")
+            # The type only: library messages quote the path of the file.
+            status.problems.append(
+                f"could not read {render_path(path)} ({type(exc).__name__})")
+
+
+#: Keys that are the ordinary home of what is found under them, and so add
+#: nothing to a description of where it is.
+_ORDINARY_KEYS = frozenset({
+    "/A", "/PA", "/AA", "/OpenAction", "/Next", "/Metadata", "/EF", "/FS",
+    "/3DD", "/JavaScript", "/EmbeddedFiles", "/Templates", "/Info", "/Root",
+    "/Pages", "/Kids", "/Annots", "/Names", "/Outlines", "/First", "/Last",
+    "/Prev", "/Parent", "/P", "/AcroForm", "/Fields"})
+
+
+def plain_location(segments: list[str], page: Optional[int] = None) -> str:
+    """Where an object is, in plain words, from the segments of its object
+    path (``["trailer", "/Root", "/Pages", "/Kids", "[0]", ...]``) and the
+    number of the page it is on, if it is on one.
+
+    "on page 3, annotation 2, under /Stash"; "in a bookmark"; "in the
+    document's open action, 40 steps down a chain of actions". Written for
+    someone who has never seen a PDF's object graph; the raw path is kept
+    beside it for those who have.
+    """
+    def following(key: str) -> str:
+        return segments[segments.index(key) + 1] if key in segments[:-1] else ""
+
+    names = following("/Names") if segments[1:3] == ["/Root", "/Names"] else ""
+    if page is not None:
+        where = f"on page {page}"
+    elif names == "/Templates":
+        where = "on a template page"
+    elif names == "/Pages":
+        where = "on a named page"
+    elif names == "/JavaScript":
+        where = "in the document's named scripts"
+    elif names == "/EmbeddedFiles":
+        where = "in the document's attachment list"
+    elif "/Outlines" in segments:
+        where = "in a bookmark"
+    elif "/AcroForm" in segments:
+        where = "in a form field"
+    elif segments[1:2] == ["/Info"]:
+        where = "in the document information"
+    elif segments[1:3] == ["/Root", "/OpenAction"]:
+        where = "in the document's open action"
+    elif segments[1:2] == ["/Root"]:
+        where = "in the document catalog"
+    else:
+        where = "in the file trailer"
+    parts = [where]
+
+    index = following("/Annots")
+    if index.startswith("[") and index[1:-1].isdigit():
+        parts.append(f"annotation {int(index[1:-1]) + 1}")
+
+    # A run of /Next at the end is a chain of actions leading to it.
+    body = list(segments)
+    steps = 0
+    while body and body[-1] == "/Next":
+        body.pop()
+        steps += 1
+    # The key it sits under, when that is not one of its ordinary homes
+    # (an /AA trigger such as /O or /K is ordinary there).
+    keys = [i for i, s in enumerate(body) if s.startswith("/")]
+    if keys:
+        last = keys[-1]
+        is_trigger = last > 0 and body[last - 1] == "/AA"
+        if body[last] not in _ORDINARY_KEYS and not is_trigger:
+            parts.append(f"under {body[last]}")
+    if steps:
+        parts.append(f"{steps} step{'' if steps == 1 else 's'} down a chain of actions")
+    return ", ".join(parts)
+
+
+class SweepHit(NamedTuple):
+    """One thing the sweep found."""
+    option: str      # the sanitize option that promises it gone
+    finding: str     # the analyzer finding it belongs under
+    what: str        # "a JavaScript action"
+    where: str       # in plain words: "on page 1, annotation 2"
+    path: str        # the raw object path
+    positional: bool = False   # found by where it is, not by what it is
 
 
 #: Sanitize options the sweep has a predicate for (all of them, today).
@@ -845,13 +968,13 @@ _SWEEP_OPTIONS = ("javascript", "launch_actions", "auto_actions",
                   "submit_actions", "embedded_files", "external_links",
                   "metadata")
 
-#: Action /S value -> (option that removes it, what to call it in evidence).
+#: Action /S value -> (option that removes it, finding, what to call it).
 _SWEEP_ACTION_TYPES = {
-    "/JavaScript": ("javascript", "a JavaScript action"),
-    "/Launch": ("launch_actions", "a launch action"),
-    "/SubmitForm": ("submit_actions", "a submit-form action"),
-    "/ImportData": ("submit_actions", "an import-data action"),
-    "/URI": ("external_links", "a URI action"),
+    "/JavaScript": ("javascript", "scripts.js", "a JavaScript action"),
+    "/Launch": ("launch_actions", "actions.launch", "a launch action"),
+    "/SubmitForm": ("submit_actions", "forms.submit", "a submit-form action"),
+    "/ImportData": ("submit_actions", "forms.submit", "an import-data action"),
+    "/URI": ("external_links", "links.uri", "a link to a web address"),
 }
 
 #: The trigger names PDF 32000 defines for additional-actions dictionaries
@@ -863,10 +986,24 @@ _AA_TRIGGERS = frozenset({
 _EF_KEYS = ("/F", "/UF", "/DOS", "/Mac", "/Unix")
 
 
-def _sweep(pdf, opts: dict) -> tuple[dict[str, list[str]], WalkStatus]:
+def _xfa_packets(pdf) -> set:
+    """``(num, gen)`` of every stream that is a packet of the catalog's
+    /AcroForm /XFA entry: the entry itself when it is one stream, an element
+    of it when it is an array.
+
+    Those streams are the XFA form, by position, whatever /Type they
+    declare — and Adobe LiveCycle Designer declares them /EmbeddedFile.
+    """
+    acro = pdf.Root.get("/AcroForm")
+    xfa = acro.get("/XFA") if isinstance(acro, pikepdf.Dictionary) else None
+    parts = list(xfa) if isinstance(xfa, pikepdf.Array) else [xfa]
+    return {tuple(p.objgen) for p in parts if isinstance(p, pikepdf.Stream)}
+
+
+def _sweep(pdf, opts: dict) -> tuple[dict[str, list[SweepHit]], WalkStatus]:
     """Look at every object in *pdf* for anything an enabled option removes.
 
-    Returns ``({option: [evidence, ...]}, status)`` for the enabled options.
+    Returns ``({option: [SweepHit, ...]}, status)`` for the enabled options.
 
     Every predicate asks what an object IS, never what it is called. A key
     name proves nothing: resource dictionaries map arbitrary names to fonts,
@@ -909,52 +1046,92 @@ def _sweep(pdf, opts: dict) -> tuple[dict[str, list[str]], WalkStatus]:
         /UF, /DOS, /Mac or /Unix. A stream typed /EmbeddedFile. The
         catalog's /Names /EmbeddedFiles tree, by position.
         Not covered: a file specification with no payload, which only names
-        a file elsewhere (reported by the analyzer as `files.external`).
+        a file elsewhere (reported by the analyzer as `files.external`). A
+        packet of the catalog's /AcroForm /XFA entry, even one typed
+        /EmbeddedFile (Adobe LiveCycle Designer types them so): by position
+        it is the XFA form, which the analyzer reports as `forms.xfa` and no
+        option removes (#112). A file specification that embeds such a
+        packet is still a hit, as any dictionary with a payload is.
     metadata
         A stream typed /Metadata or /XML, on any object. Whatever stream is
-        in the catalog's /Metadata slot, typed or not. A trailer /Info with
-        any entry.
+        in the /Metadata slot of the catalog, or of any object that declares
+        a /Type name (a page, a font, an image), typed or not: there the
+        entry is the object's metadata by definition, and the holder says
+        what it is — a resource dictionary, which may map the name /Metadata
+        to an image, declares no /Type. A trailer /Info with any entry.
         Not covered: EXIF inside embedded images (#111); private application
-        data such as /PieceInfo; the file identifier (checked separately).
+        data such as /PieceInfo; the file identifier (checked separately);
+        a former /Info dictionary still held under some other key, which
+        nothing in the output marks as document information (for that
+        reason Sanitize empties the dictionary itself, when it is nothing
+        but document information; one that is also a page, the catalog or
+        anything else with a job is only unhooked from the trailer).
 
     A hit at a place the analyzer has no site for is still a hit: the option
     promised the thing would be gone from the file, not from a list of
     places.
     """
-    hits: dict[str, list[str]] = {o: [] for o in _SWEEP_OPTIONS if opts.get(o)}
+    hits: dict[str, list[SweepHit]] = {o: [] for o in _SWEEP_OPTIONS if opts.get(o)}
     status = WalkStatus()
+    try:
+        page_numbers = {tuple(p.obj.objgen): n for n, p in enumerate(pdf.pages, 1)}
+    except Exception as exc:
+        page_numbers = {}
+        status.problems.append(f"could not read the page tree ({type(exc).__name__})")
 
-    def hit(option: str, what: str, path) -> None:
+    def page_of(path) -> Optional[int]:
+        while path is not None:
+            obj = path[2]
+            try:
+                if (isinstance(obj, pikepdf.Dictionary) and obj.is_indirect
+                        and tuple(obj.objgen) in page_numbers):
+                    return page_numbers[tuple(obj.objgen)]
+            except Exception:
+                return None
+            path = path[1]
+        return None
+
+    def hit(option: str, finding: str, what: str, path, positional: bool = False) -> None:
         if option in hits:
-            hits[option].append(f"{what} at {render_path(path)}")
+            hits[option].append(SweepHit(
+                option, finding, what,
+                plain_location(_segments(path), page_of(path)), render_path(path),
+                positional))
 
     def typed(obj, key: str) -> str:
         v = obj.get(key)
         return str(v) if isinstance(v, pikepdf.Name) else ""
 
     # -- the few things that are defined by where they are --------------
-    trailer_path = ("trailer", None)
-    root_path = ("/Root", trailer_path)
+    trailer_path = ("trailer", None, None)
+    xfa_packets: set = set()
     try:
         root = pdf.Root
+        if "embedded_files" in hits:
+            xfa_packets = _xfa_packets(pdf)
+        root_path = ("/Root", trailer_path, root)
         if isinstance(root.get("/OpenAction"), pikepdf.Dictionary):
-            hit("auto_actions", "an action", ("/OpenAction", root_path))
+            hit("auto_actions", "actions.autorun", "an action that runs on opening",
+                ("/OpenAction", root_path, None), True)
         names = root.get("/Names")
         if isinstance(names, pikepdf.Dictionary):
+            names_path = ("/Names", root_path, None)
             if "/JavaScript" in names:
-                hit("javascript", "a named-JavaScript tree",
-                    ("/JavaScript", ("/Names", root_path)))
+                hit("javascript", "scripts.js", "named scripts",
+                    ("/JavaScript", names_path, None), True)
             if "/EmbeddedFiles" in names:
-                hit("embedded_files", "an embedded-files tree",
-                    ("/EmbeddedFiles", ("/Names", root_path)))
+                hit("embedded_files", "files.embedded", "an attachment list",
+                    ("/EmbeddedFiles", names_path, None), True)
         if isinstance(root.get("/Metadata"), pikepdf.Stream):
-            hit("metadata", "a metadata stream", ("/Metadata", root_path))
+            hit("metadata", "meta.xmp", "a metadata stream",
+                ("/Metadata", root_path, None), True)
         info = pdf.trailer.get("/Info")
         if isinstance(info, pikepdf.Dictionary) and len(info.keys()):
-            hit("metadata", f"a document-info dictionary with "
-                            f"{len(info.keys())} entries", ("/Info", trailer_path))
+            hit("metadata", "meta.docinfo",
+                f"document information with {len(info.keys())} entries",
+                ("/Info", trailer_path, None), True)
     except Exception as exc:
-        status.problems.append(f"could not read the document catalog: {exc}")
+        status.problems.append(f"could not read the document catalog ({type(exc).__name__})")
 
     # -- everything else, by what the object is -------------------------
     for path, obj in walk_objects(pdf, status):
@@ -967,38 +1144,51 @@ def _sweep(pdf, opts: dict) -> tuple[dict[str, list[str]], WalkStatus]:
                 js = obj.get("/JS")
                 if isinstance(js, pikepdf.String) or (
                         isinstance(js, pikepdf.Stream) and stype):
-                    hit("javascript", "a script (/JS)", path)
+                    hit("javascript", "scripts.js", "a script", path)
             if "/AA" in keys and "auto_actions" in hits:
                 aa = obj.get("/AA")
                 if isinstance(aa, pikepdf.Dictionary):
                     for trig in aa.keys():
                         entry = aa[trig] if str(trig) in _AA_TRIGGERS else None
                         if isinstance(entry, pikepdf.Dictionary) and typed(entry, "/S"):
-                            hit("auto_actions", f"an additional action ({trig})",
-                                ("/AA", path))
+                            hit("auto_actions", "actions.autorun",
+                                "an action that runs by itself",
+                                (str(trig), ("/AA", path, None), None))
             if "/EF" in keys and "embedded_files" in hits:
                 ef = obj.get("/EF")
                 if isinstance(ef, pikepdf.Dictionary) and any(
                         isinstance(ef.get(k), pikepdf.Stream) for k in _EF_KEYS):
-                    hit("embedded_files", "an embedded file", path)
+                    hit("embedded_files", "files.embedded", "an embedded file", path)
+            if "/Metadata" in keys and "metadata" in hits and typed(obj, "/Type"):
+                md = obj.get("/Metadata")
+                # A declared one is found below, as itself, wherever it is.
+                if isinstance(md, pikepdf.Stream) and not (
+                        typed(md, "/Type") == "/Metadata" or typed(md, "/Subtype") == "/XML"):
+                    hit("metadata", "meta.xmp", "a metadata stream",
+                        ("/Metadata", path, None))
             if isinstance(obj, pikepdf.Stream):
                 kind, subtype = typed(obj, "/Type"), typed(obj, "/Subtype")
                 if kind == "/Metadata" or subtype == "/XML":
-                    hit("metadata", "a metadata stream", path)
-                if kind == "/EmbeddedFile":
-                    hit("embedded_files", "an embedded file stream", path)
+                    hit("metadata", "meta.xmp", "a metadata stream", path)
+                # Asked of the object, not of the path: the walk reaches a
+                # stream by whichever reference it meets first.
+                if kind == "/EmbeddedFile" and tuple(obj.objgen) not in xfa_packets:
+                    hit("embedded_files", "files.embedded", "an embedded file's contents", path)
                 if kind == "/3D" and isinstance(obj.get("/OnInstantiate"), pikepdf.Stream):
-                    hit("javascript", "a 3D stream's /OnInstantiate script", path)
+                    hit("javascript", "scripts.js",
+                        "a script that runs when 3D artwork loads", path)
         except Exception as exc:
-            status.problems.append(f"could not inspect {render_path(path)}: {exc}")
+            status.problems.append(
+                f"could not inspect {render_path(path)} ({type(exc).__name__})")
     return hits, status
 
 
 def _sweep_checks(output_path: str, opts: dict) -> list[VerificationCheck]:
     """One check per enabled option: the sweep found nothing it removes.
 
-    Fail-closed twice over. A hit fails the option's check, with the object
-    path as evidence. And a sweep that did not cover the whole file — the
+    Fail-closed twice over. A hit fails the option's check; its evidence
+    says what was found and where in plain words, and the raw object path is
+    kept beside it. And a sweep that did not cover the whole file — the
     output would not open, an object could not be read, the walk was cut
     short — fails EVERY check: what it did not look at cannot be reported
     absent, so a partial walk never passes.
@@ -1011,69 +1201,137 @@ def _sweep_checks(output_path: str, opts: dict) -> list[VerificationCheck]:
             hits, status = _sweep(pdf, opts)
         problems = list(status.problems)
     except Exception as exc:
-        hits, problems = {}, [f"the output could not be opened: {exc}"]
+        hits, problems = {}, [f"the output could not be opened ({type(exc).__name__})"]
     incomplete = [f"the sweep did not cover the whole file ({p}); what it "
                   f"did not inspect cannot be reported absent (document-level)"
                   for p in problems[:5]]
     checks = []
     for opt in enabled:
-        ev = _dedupe(hits.get(opt, []))
-        if len(ev) > 20:
-            ev = ev[:20] + [f"... and {len(ev) - 20} more"]
-        ev += incomplete
+        found: dict[str, str] = {}                      # raw path -> plain evidence
+        for h in hits.get(opt, []):
+            found.setdefault(h.path, f"{h.what} {h.where}")
+        paths = list(found)[:20]
+        ev = [found[p] for p in paths]
+        if len(found) > 20:
+            ev.append(f"... and {len(found) - 20} more")
         checks.append(VerificationCheck(
             id=f"sanitize.sweep_{opt}",
             description=f"Whole-file sweep finds nothing option '{opt}' removes",
-            passed=not ev, evidence=ev))
+            passed=not (found or incomplete), evidence=ev + incomplete,
+            unevaluated=bool(incomplete) and not found, object_paths=paths))
     return checks
 
 
+#: What to call each category in a sentence. A site check and the sweep
+#: check for the same category share a name, so it is mentioned once.
+_CATEGORY_WORDS = {
+    "scripts_js": "JavaScript", "sweep_javascript": "JavaScript",
+    "actions_launch": "launch actions", "sweep_launch_actions": "launch actions",
+    "actions_autorun": "auto-run actions", "sweep_auto_actions": "auto-run actions",
+    "forms_submit": "form submit actions", "sweep_submit_actions": "form submit actions",
+    "files_embedded": "embedded files", "sweep_embedded_files": "embedded files",
+    "links_uri": "external links", "sweep_external_links": "external links",
+    "meta_docinfo": "document metadata", "meta_xmp": "document metadata",
+    "sweep_metadata": "document metadata",
+}
+
+
+def sanitize_refusal_message(report: VerificationReport) -> str:
+    """One sentence saying why a sanitize was refused, from its failed checks.
+
+    Three different things can have gone wrong, and the user needs to know
+    which: something the options promised to remove is still there (it is
+    named); something could not be checked at all (it is named, and said to
+    be unchecked, not present); or the output would still carry its source's
+    identifier. Where exactly, and the object paths, are on the report.
+    """
+    failed = report.failed_checks()
+
+    def words(checks) -> list[str]:
+        return _dedupe([_CATEGORY_WORDS.get(c.id.split(".", 1)[-1],
+                                            "content the selected options remove")
+                        for c in checks])
+
+    special = {"sanitize.file_id", "sanitization.readable"}
+    rest = [c for c in failed if c.id not in special]
+    survivors = words(c for c in rest if not c.unevaluated)
+    unchecked = [w for w in words(c for c in rest if c.unevaluated) if w not in survivors]
+    parts = []
+    if survivors:
+        parts.append(f"still present in the output: {', '.join(survivors)}")
+    if unchecked:
+        parts.append(f"{', '.join(unchecked)} could not be checked")
+    if any(c.id == "sanitization.readable" for c in failed):
+        parts.append("the cleaned file could not be read back")
+    if any(c.id == "sanitize.file_id" for c in failed):
+        parts.append("the output would still carry the source file's identifier")
+    return "Sanitize could not be verified: " + ("; ".join(parts) or "a check failed") + "."
+
+
 def verify_sanitization(output_path: str, options: Optional[dict] = None, *,
-                        input_path: str = "") -> VerificationReport:
+                        input_path: str = "",
+                        source_ids: Optional[list[str]] = None,
+                        source_sha256: Optional[str] = None) -> VerificationReport:
     """Re-audit a sanitized output and assert the promised removals held.
 
     *options* is the same dict passed to ``sanitize_pdf`` (missing keys
-    default via ``DEFAULT_SANITIZE``). For each ENABLED option, the mapped
-    finding id(s) must be absent from a fresh ``analyze_document`` run on
-    the output. Findings outside the promised set are returned in
-    ``residual_findings`` — honest residue, not a failure.
+    default via ``DEFAULT_SANITIZE``). For each ENABLED option:
+
+      * the mapped finding id(s) must be absent from a fresh
+        ``analyze_document`` run on the output, AND that run must have been
+        able to evaluate them — a finding the analyzer could not fully check
+        is a failed check, marked ``unevaluated``, never a pass;
+      * the whole-file sweep must find nothing the option removes, and must
+        have covered the whole file.
+
+    Findings outside the promised set are returned in ``residual_findings``
+    — honest residue, not a failure. Findings outside the promised set that
+    could not be evaluated go in ``unevaluated``, so the report never
+    implies they were checked.
+
+    *source_ids* (the source's trailer /ID elements, hex) and
+    *source_sha256* are plain values the caller captured while it had the
+    input open; this function never opens the input. When *source_ids* is
+    given, a ``sanitize.file_id`` check asserts the output shares none of
+    them — unless output and source are byte-identical, which is what
+    sanitizing an already-clean file produces (see :func:`_file_id_check`).
 
     Fail-closed: a locked or unreadable output yields a failed
     ``sanitization.readable`` check, never a pass (a locked file re-scans
     as a single info finding with nothing inspected — that must not count
     as clean).
-
-    Known limitation (documented, not silently ignored): the re-scan is the
-    oracle. ``analyze_document`` deliberately survives a crashing scanner by
-    logging a warning and continuing, and a scanner that crashed emits no
-    findings for its category — so this function is exactly as strong as
-    the analyzer run it consumes.
     """
     opts = {**DEFAULT_SANITIZE, **(options or {})}
     report = VerificationReport(input_path=input_path, output_path=output_path,
-                                tool="sanitization", timestamp=_now_iso())
+                                tool="sanitization", timestamp=_now_iso(),
+                                source_sha256=source_sha256)
+    if os.path.isfile(output_path):
+        report.output_sha256 = _output_sha256(output_path)
 
     readable = VerificationCheck(
         id="sanitization.readable",
         description="Output opens and re-scans for verification", passed=True)
     try:
-        scan = analyze_document(output_path)
+        # Without the analyzer's own whole-file step: the sweep below is that
+        # check, run against the promises made.
+        scan = analyze_document(output_path, unremovable=False)
     except FileNotFoundError:
         raise
     except Exception as exc:
-        readable.passed = False
-        readable.evidence = [f"output could not be re-scanned: {exc} "
-                             f"(document-level)"]
+        readable.passed, readable.unevaluated = False, True
+        readable.evidence = [f"output could not be re-scanned "
+                             f"({type(exc).__name__}) (document-level)"]
         report.checks.append(readable)
         return report
 
     findings = scan.get("findings", [])
+    unevaluated = scan.get("unevaluated", {})
     by_id: dict[str, dict] = {}
     for f in findings:
         by_id.setdefault(f["id"], f)
 
     if "encryption.locked" in by_id:
-        readable.passed = False
+        readable.passed, readable.unevaluated = False, True
         readable.evidence = ["output is password-protected; the re-scan could "
                              "not inspect its contents (document-level)"]
         report.checks.append(readable)
@@ -1087,21 +1345,34 @@ def verify_sanitization(output_path: str, options: Optional[dict] = None, *,
         promised.update(fids)
         for fid in fids:
             found = by_id.get(fid)
+            unread = unevaluated.get(fid)
             ev: list[str] = []
             if found is not None:
                 ev.append(f"'{found['title']}' still detected in the output")
                 ev.extend(str(item) for item in found.get("items", [])[:20])
+            if unread:
+                ev.append(f"'{fid}' could not be fully checked: "
+                          f"{'; '.join(unread[:3])} (document-level)")
             report.checks.append(VerificationCheck(
                 id="sanitize." + fid.replace(".", "_"),
                 description=f"Re-scan finds no '{fid}' finding "
                             f"(promised by option '{opt}')",
-                passed=found is None, evidence=ev))
+                passed=not ev, evidence=ev,
+                unevaluated=bool(unread) and found is None))
 
     # The second, independent look: every object in the output, judged by
     # what it is rather than by where the analyzer expects to find it.
     report.checks.extend(_sweep_checks(output_path, opts))
 
+    if source_ids is not None:
+        report.checks.append(_file_id_check(
+            "sanitize.file_id", output_path, source_ids, source_sha256,
+            report.output_sha256))
+
+    report.unevaluated = [{"id": fid, "reasons": list(why)}
+                          for fid, why in unevaluated.items() if fid not in promised]
     report.residual_findings = [
-        f for f in findings if f["id"] not in promised and f["id"] != "clean"
+        f for f in findings
+        if f["id"] not in promised and f["id"] not in ("clean", "audit.incomplete")
     ]
     return report
