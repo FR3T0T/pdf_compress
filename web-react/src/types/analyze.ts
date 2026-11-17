@@ -36,6 +36,9 @@ export interface AnalyzeReport {
   findings: Finding[];
   counts: SeverityCounts;
   overallRisk: Severity;
+  /** Finding id -> why it could not be fully checked. Not empty means the
+   *  report carries an `audit.incomplete` finding and never `clean`. */
+  unevaluated?: Record<string, string[]>;
 }
 
 export interface AnalyzeResponse {
@@ -55,13 +58,62 @@ export interface SanitizeOptions {
   metadata: boolean;
 }
 
+/** One check of pdf_verify.py's `VerificationReport.to_dict()`. */
+export interface VerificationCheck {
+  id: string;
+  description: string;
+  passed: boolean;
+  evidence: string[];
+  pages: number[];
+  isDocumentLevel: boolean;
+  /** Failed because it could not be carried out, not because it found something. */
+  unevaluated: boolean;
+  objectPaths: string[];
+}
+
+/** pdf_verify.py's `VerificationReport.to_dict()` as Sanitize returns it:
+ *  the report the cleaned copy passed before it was saved, or the one it
+ *  failed when the run was refused. */
+export interface SanitizeVerification {
+  inputPath: string;
+  outputPath: string;
+  tool: string;
+  timestamp: string;
+  checks: VerificationCheck[];
+  /** Findings no selected option promised to remove — not a failure. */
+  residualFindings: Finding[];
+  verified: boolean;
+  flattenTargetPages: number[] | null;
+  sourceSha256: string | null;
+  outputSha256: string | null;
+  /** Checks outside the selected options that could not be completed. */
+  unevaluated: Array<{ id: string; reasons: string[] }>;
+  diagnostics: string[];
+}
+
+/** pdf_verify.py's `sanitize_refusal_detail()`: a refusal as the short lists
+ *  a screen shows. The wording comes from Python; nothing here rephrases it. */
+export interface SanitizeRefusal {
+  stillPresent: string[];
+  notChecked: string[];
+  identifier: boolean;
+  unreadable: boolean;
+}
+
+/** pdf_analyze.py's `sanitize_payload()`. Three shapes: success (a PDF has
+ *  `verification`, an image has none); a refusal (`success: false` with
+ *  `verification` and `refusal` — nothing was written); a failure
+ *  (`success: false` with `error` and `errorType`). */
 export interface SanitizeResponse {
   success: boolean;
   removed?: Record<string, number>;
   total_removed?: number;
   output?: string;
   output_size?: number;
+  verification?: SanitizeVerification;
+  refusal?: SanitizeRefusal;
   error?: string;
+  errorType?: string;
 }
 
 export const SANITIZE_FIELDS: Array<[keyof SanitizeOptions, string]> = [

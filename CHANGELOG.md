@@ -26,8 +26,50 @@
   Analyze does on the same file: on a decompression-bomb test file that
   Analyze needs 74 s for (before and after this change), Sanitize went from
   0.02 s to 80 s.
-  The bridge and the UI do not show the report or the refusal detail yet;
-  that is the next change. Tests: `TestGate` in `tests/test_sanitize_gate.py`.
+  What the app shows of this is in the next bullet. Tests: `TestGate` in
+  `tests/test_sanitize_gate.py`.
+- **Sanitize says what it verified, and why it refused (#101).** The app now
+  shows the gate's result. `sanitizeDocument` (`ui/bridge.py`) answers through
+  the new Qt-free `pdf_analyze.sanitize_payload`, in one of three shapes:
+  success with `verification` (the report the output passed; an image has
+  none); a refusal with `error` (the one-sentence reason), `verification`
+  (the report) and `refusal`; or a failure with `error` and `errorType`.
+  `refusal` is the new `pdf_verify.sanitize_refusal_detail`: what is still
+  present (one line per category, with where, in the sweep's plain words;
+  three places at most), what could not be checked, whether it is the file
+  identifier, whether the output could not be read back. The wording is made
+  in Python, in one place, and tested there; the frontend only lays it out.
+  On the Analyze page (`AnalyzePage.tsx`, new `SanitizeOutcome.tsx`) a
+  verified run reads "Verified — nothing the selected options remove is left
+  in the clean copy", with the number and titles of the findings no selected
+  option removes, and any check outside the selected options that could not
+  be completed. A refused run reads "Sanitize refused — nothing was saved"
+  followed by those lists. `audit.incomplete` is listed first, whatever its
+  severity, and starts expanded. This is deliberately thin: the exportable
+  report and its panel are #100. `SanitizeResponse`, `AnalyzeReport` and the
+  mock data (`mockSanitizeResult`, which still used the old counter meanings)
+  are updated; the mock refuses when "External links" is ticked so the
+  refusal can be reviewed in `vite dev`. Nothing `sanitize_payload` logs
+  names a file: the slot used to log the input path, and an unexpected error
+  is now logged by its type and where in the code it happened. Frontend
+  rebuilt (`web-react/dist/`). Tests: `TestSanitizePayload` and
+  `TestRefusalDetail` in `tests/test_bridge.py`.
+- **Known limits of the sanitize gate (#101).** Three, each needing a file
+  built for the purpose. (1) `metadata` empties the `/Info` dictionary in
+  place when it is nothing but document information (see Fixed, below), so
+  that a second reference to it does not keep the entries. If the trailer
+  points `/Info` at a dictionary that holds only strings, names, numbers and
+  booleans, declares no `/Type`, `/Subtype` or `/S`, and has another job — a
+  graphics state written without `/Type`, say — that object is emptied too,
+  and whatever used it loses it. (2) The other way round: an `/Info` that is
+  also held under a second key and is not plain — it declares a `/Type`, or
+  one of its values is an array or a dictionary — is only unhooked from the
+  trailer. Its entries stay in the file under the other key and the output
+  verifies, because once the trailer no longer names it nothing marks it as
+  document information. Narrowing either rule widens the other. (3) The
+  identifier check compares the elements of the two files' trailer `/ID`. A
+  source whose `/ID` holds the output's future identifier inside a nested
+  array shares no element with the output, and is not refused.
 - **"Could not check" is no longer "nothing there" (#101).** Analyze's
   scanners and walkers are tolerant — one structure they cannot read must not
   end the audit — but they used to swallow the exception and report whatever
@@ -204,7 +246,14 @@
   and `field_aa` (an `/AA` entry removed only because it fires by itself) and
   `instantiate_script`. Scripts, launches, submits and links removed from
   bookmarks, fields and a link's `/PA` use the existing `annot_javascript`,
-  `launch_action`, `submit_action` and `external_link`.
+  `launch_action`, `submit_action` and `external_link`. Two removals that
+  were not counted now are: an `/AA` that is not a dictionary (an array, a
+  string, a number, a stream), deleted under `auto_actions`, is one count
+  under its owner's `/AA` counter; and an `/Info` that is not a dictionary
+  counts as `doc_info` like any other — a number already did, a string, an
+  array or a name did not. Analyze lists neither, so the count can be the
+  only sign they were there. Tests: `TestCounters` in
+  `tests/test_sanitize_gate.py`.
 - **Sanitized output is a fixed point with a content-derived `/ID` (#117,
   #101).** `sanitize_pdf` writes through `save_with_content_id`, so the
   output no longer carries the source's trailer `/ID` (the gate's
@@ -271,159 +320,6 @@
   from an adversarial review — cross-line case-sensitive terms, multi-page
   attribution, multi-term aggregation, non-stream `/Contents`, unsupported
   annotation subtypes, custom docinfo keys).
-
-### Removed
-- **Dead legacy text-extraction helpers in `pdf_ops.py`.** Deleted
-  `_page_text`, `_extract_text_from_stream`, and `_extract_text_pymupdf`
-  (~70 lines) — leftovers from the pre-PyMuPDF regex-era redaction/compare
-  code with no remaining callers.
-
-### Fixed
-- **Sanitize: shapes that verified with content still in the file, or were
-  refused over something Analyze had not listed (#101).** Found by trying to
-  break the gate. (1) An `/Info` dictionary also referenced from another key
-  was only unhooked from the trailer, so its entries were still written; it
-  is now emptied as well — when it is nothing but document information: a
-  dictionary, not a stream, with no `/Type`, `/Subtype` or `/S`, whose every
-  value is a string, a name, a number or a boolean. A trailer can point
-  `/Info` at an object with another job (one real file has `/Info` and the
-  page tree root as the same object); there only the trailer's entry is
-  removed and the object is left as it is. (2) An untyped stream in a page's `/Metadata` slot
-  was neither reported nor removed (see "metadata by presence" above). (3) An
-  `/AA` entry holding an array of actions went whole under `auto_actions` but
-  was invisible to the other options, so Analyze said `clean` and
-  `javascript` alone was refused; each action in such an array is now a site
-  like a lone one, reported, removed and counted. (4) An action chained after
-  a named script, or stored in place of one, went with the tree under
-  `javascript` but stayed under `launch_actions`, `submit_actions` or
-  `external_links` alone; with `javascript` off the named scripts are now
-  cleaned entry by entry. (5) A re-saved copy of an already-sanitized file
-  read `clean` and was then refused for carrying its source's identifier
-  (see the content-derived `/ID` bullet above). Still refused, and listed by
-  Analyze beforehand: a script nested under a private key inside an `/AA`
-  entry, or an `/AA` that is not a dictionary, when `javascript` is on and
-  `auto_actions` is off. Tests: `TestMetadataHeldTwoWays`, `TestOneOptionAlone`,
-  `TestIdentifierTheSourceAlreadyCarries`, `TestInfoThatIsAnotherObject`.
-- **Analyze: the search for photos inside a PDF did not finish on forms that
-  share their contents, and stopped 8 forms deep (#101).** The walk behind
-  `location.embedded_image` and `metadata.embedded_image` remembered the
-  images it had seen but not the form XObjects, so forms that draw the same
-  other forms were walked again for every path that leads to them: on one
-  real two-page file with 270 forms Analyze did not finish, and through the
-  gate — which audits the output — neither would Sanitize. Each form is now
-  entered once per document, by object number. The walk is iterative and has
-  no depth limit, so a photo more than 8 forms down is found, where it was
-  silently skipped. What it does with an image it cannot read is unchanged
-  (#111). Tests: `TestEmbeddedImageWalk`.
-- **Sanitize and Analyze missed actions on bookmarks and in the form-field
-  tree (#101).** JavaScript on a bookmark, or on a form field that no page
-  lists as an annotation (a parent field whose widget is a kid, a field with
-  no widget), was neither reported nor removed, and the output verified. A
-  button widget with a JavaScript `/A` was taken off its page and counted as
-  removed while the same dictionary, script included, stayed reachable
-  through `/AcroForm`. Both sides now walk one definition of where an action
-  can hang (`_action_owners` / `_owner_sites` in `pdf_analyze.py`): the
-  catalog, pages, annotations (their `/A`, their `/AA`, and `/PA` — the URI
-  action a link keeps from before it was retargeted), bookmarks and form
-  fields, each through its `/Next` chain. Outlines and the field tree are
-  walked iteratively and cycle-safe. Under `javascript`, Sanitize also
-  deletes the `/OnInstantiate` script of a 3D stream, which is JavaScript
-  but not an action and so sits at none of those sites. The sanitizer's annotation loop keeps its own page walk because
-  it rewrites `/Annots`; a test holds it to the same annotations as the
-  shared walk, including an indirect `/Annots` array, a null entry and an
-  annotation listed on two pages (dropped from both, counted once). Tests:
-  `TestActionSites`, `TestAnnotationWalkParity`, `TestOpenActionDestination`
-  in `tests/test_pdf_analyze.py`.
-- **Sanitize: metadata removal deleted nothing it could not parse (#101).**
-  It cleared pikepdf's parsed view of the XMP and saved, which wrote a
-  malformed packet's recovered tree back with its contents, never touched a
-  metadata stream on a page or other object, and invented a packet and an
-  `/Info` in files that had neither. It now deletes every metadata stream
-  outright, by what the stream says it is (`/Type /Metadata` or `/Subtype
-  /XML`) wherever it is referenced, never by a key that happens to be called
-  `/Metadata`. And `sanitize_pdf` raised `PdfError: While trying to update
-  XMP metadata` under any options on a file whose XMP stream could not be
-  decoded, because saving with `fix_metadata_version` parses the packet;
-  that file now sanitizes. Tests: `TestMetadataPresence` in
-  `tests/test_pdf_analyze.py`, `TestVerifySanitizationMetadata` in
-  `tests/test_pdf_verify.py`.
-- **Sanitize: embedded files outside the name tree, `/AF` and
-  `/FileAttachment` annotations survived (#101).** A payload on any other
-  holder was reported and kept; one in an inline file specification was not
-  even reported, and the output verified with it intact. After the
-  structural removals, any dictionary still reachable whose `/EF` holds a
-  stream is emptied in place — the payload, and the file name, description
-  and every other key that describes it. Tests: `TestEmbeddedFileRule` in
-  `tests/test_pdf_analyze.py`.
-- **A refused redaction no longer destroys the destination (#116).**
-  `redact_pdf` renamed its output onto `output_path`, verified it there, and
-  deleted it on refusal. Redacting in place (`output_path == input_path`) and
-  being refused therefore deleted the user's only copy, and a refusal with a
-  separate destination destroyed whatever file was already at that path. It
-  now verifies, then commits: the candidate is written to a temp file in the
-  destination's directory, verified there, and `os.replace`d onto the
-  destination only if verification passes. A refused run never creates,
-  replaces, or deletes `output_path`. The report names the real destination,
-  never the temp (`VerificationReport.retarget`, which also rewrites the temp
-  name in evidence text). The flatten offer (D1) is unchanged. Tests:
-  `TestRedactVerifyThenCommit` in `tests/test_pdf_ops.py`, `TestReportRetarget`
-  in `tests/test_pdf_verify.py`.
-- **Redacted output no longer carries its source's file identifier (#117).**
-  PyMuPDF and qpdf both preserve the trailer `/ID[0]` across a save, so a
-  redacted copy could be matched to its original by identifier on the
-  search-term and box-only paths (for an encrypted source, both elements
-  survived). Every path — search terms, boxes only, flatten — now ends with
-  one shared write, `pdf_analyze.save_with_content_id`, which drops the
-  trailer `/ID` and has qpdf derive a new one from the output's own content
-  (`deterministic_id`; available at the existing `pikepdf>=8.0.0` floor).
-  Deleting `/ID` alone would not do: qpdf then mints one from the clock. New
-  `redaction.file_id` check: `redact_pdf` captures the source's `/ID`
-  elements and SHA-256 while it has the input open and hands them to
-  `verify_redaction` as plain values (`source_ids`, `source_sha256`) — the
-  verifier still never opens the input and never needs its password. An
-  output sharing any element with its source is refused as a document-level
-  failure (so flatten is never offered for it), unless it is byte-identical
-  to the source. Every shape of `/ID` is captured and none is refused: a
-  bare string instead of an array (which MuPDF carries through a save as it
-  is) counts as one element, and an element that is not a string is compared
-  by its PDF serialization (`pdf_analyze.id_elements`, used on both sides).
-  The report's `to_dict()` gains `sourceSha256` and
-  `outputSha256`. Sanitize gets the same treatment with #101. Tests:
-  `TestRedactFileId` and `TestSourceFileIds` in `tests/test_pdf_ops.py`,
-  `TestRedactionFileId` in `tests/test_pdf_verify.py`.
-- **The redaction scrub deletes a matching XMP packet instead of clearing and
-  re-saving it (#101).** The scrub cleared pikepdf's parsed view of the
-  packet and let pikepdf write it back. pikepdf's recovering parser accepts
-  malformed XML it cannot then edit, so for a malformed packet the recovered
-  tree was re-emitted with the term still in it and the redaction ended in a
-  refusal; for a packet that is not XML at all the parsed view was empty, and
-  a term living only there was reported as "No matching content found". The
-  scrub now reads the stream itself (as UTF-8, as UTF-16, and through
-  pikepdf's parsed view — all read-only) and deletes the `/Metadata` stream
-  outright on a match. Tests: `TestRedactXmpRemoval` in
-  `tests/test_pdf_ops.py`.
-- **Pillow 14 deprecation in the test suite.** The images-to-PDF lossless
-  round-trip test compared pixels via `Image.getdata()` (removed in
-  Pillow 14, 2027); it now compares `tobytes()` — equivalent and faster.
-- **Windows installer + real app icon.** New `installer.iss` (Inno Setup
-  6.3+, documented in the README) packages the PyInstaller one-dir build
-  into `dist/PDFToolkit-Setup-<version>.exe`: all-users install to
-  `Program Files\PDF Toolkit` (admin), Start Menu + optional Desktop
-  shortcut, automatic uninstaller (per-user data — settings/logs, the
-  on-demand translation runtime, Argos language packs — is deliberately
-  left in place for upgrades), lzma2/max compression. New
-  `build_installer.bat` chains the PyInstaller build and the Inno compile
-  (finds `iscc.exe` on PATH or at the default install location). The
-  finished `pdf_toolkit.ico` (16–256 px) is now wired everywhere: embedded
-  in the built .exe (`pdf_toolkit.spec` `EXE(icon=...)`, for
-  Explorer/taskbar/Alt-Tab), bundled as a data file and loaded as the
-  window icon at runtime in both source and frozen modes (`app.py`
-  `_app_icon()`, replacing the old programmatically-painted placeholder
-  icon), and used by the installer for its setup icon and shortcuts. The
-  version string now also lives in `installer.iss` (see CLAUDE.md's
-  version-bump list, now five places).
-
-### Changed
 - **UI polish: branded sidebar mark + sane Translate default.** The
   sidebar's placeholder "P" chip is now the same file-lock motif as the
   app's window/taskbar icon (lucide-react's `FileLock`, tree-shaken into
@@ -532,7 +428,197 @@
   sliders, preset selection, tabs, and the progress fill. Frontend rebuilt
   (`web-react/dist/`).
 
+### Removed
+- **Dead legacy text-extraction helpers in `pdf_ops.py`.** Deleted
+  `_page_text`, `_extract_text_from_stream`, and `_extract_text_pymupdf`
+  (~70 lines) — leftovers from the pre-PyMuPDF regex-era redaction/compare
+  code with no remaining callers.
+
 ### Fixed
+- **Sanitize: shapes that verified with content still in the file, or were
+  refused over something Analyze had not listed (#101).** Found by trying to
+  break the gate. (1) An `/Info` dictionary also referenced from another key
+  was only unhooked from the trailer, so its entries were still written; it
+  is now emptied as well — when it is nothing but document information: a
+  dictionary, not a stream, with no `/Type`, `/Subtype` or `/S`, whose every
+  value is a string, a name, a number or a boolean. A trailer can point
+  `/Info` at an object with another job (one real file has `/Info` and the
+  page tree root as the same object); there only the trailer's entry is
+  removed and the object is left as it is. (2) An untyped stream in a page's `/Metadata` slot
+  was neither reported nor removed (see "metadata by presence" above). (3) An
+  `/AA` entry holding an array of actions went whole under `auto_actions` but
+  was invisible to the other options, so Analyze said `clean` and
+  `javascript` alone was refused; each action in such an array is now a site
+  like a lone one, reported, removed and counted. (4) An action chained after
+  a named script, or stored in place of one, went with the tree under
+  `javascript` but stayed under `launch_actions`, `submit_actions` or
+  `external_links` alone; with `javascript` off the named scripts are now
+  cleaned entry by entry. (5) A re-saved copy of an already-sanitized file
+  read `clean` and was then refused for carrying its source's identifier
+  (see the content-derived `/ID` bullet above). Still refused, and listed by
+  Analyze beforehand: a script nested under a private key inside an `/AA`
+  entry, or an `/AA` that is not a dictionary, when `javascript` is on and
+  `auto_actions` is off. Tests: `TestMetadataHeldTwoWays`, `TestOneOptionAlone`,
+  `TestIdentifierTheSourceAlreadyCarries`, `TestInfoThatIsAnotherObject`.
+- **Analyze: the search for photos inside a PDF did not finish on forms that
+  share their contents, and stopped 8 forms deep (#101).** The walk behind
+  `location.embedded_image` and `metadata.embedded_image` remembered the
+  images it had seen but not the form XObjects, so forms that draw the same
+  other forms were walked again for every path that leads to them: on one
+  real two-page file with 270 forms Analyze did not finish, and through the
+  gate — which audits the output — neither would Sanitize. Each form is now
+  entered once per document, by object number. The walk is iterative and has
+  no depth limit, so a photo more than 8 forms down is found, where it was
+  silently skipped. What it does with an image it cannot read is unchanged
+  (#111). Tests: `TestEmbeddedImageWalk`.
+- **Sanitize: a damaged source could not be sanitized at all (#101).** A file
+  that opens only by being repaired — no cross-reference table, a trailer cut
+  off part-way — is given a rebuilt trailer by qpdf, and that trailer can
+  lack `/Size`. qpdf writes the true `/Size` over whatever the key holds, but
+  only if the key exists; a file written with object streams and no `/Size`
+  cannot be opened again, by qpdf or anything else. Sanitize wrote such a
+  candidate, failed to read it back, and raised the library's error, naming
+  its temp file. Analyze read the same source as `clean` or listed its
+  findings as usual, so nothing warned of it. `sanitize_pdf` now gives the
+  trailer the key before it writes; those sources sanitize, verify, and the
+  output opens with no warnings. Tests: `TestDamagedSource`.
+- **Sanitize: a copy that cannot be saved says so in plain words (#101).**
+  Writing the cleaned candidate, reading it back and moving it into place can
+  each fail for reasons that have nothing to do with the document: the
+  destination folder is not there, the disk is full, the destination file is
+  open in another program. The library and operating-system errors for these
+  quote the path of the temp file. `sanitize_pdf` now raises
+  `pdf_analyze.SanitizationOutputError` (a `RuntimeError`) saying which of
+  the three it was and that nothing was saved, with no path in it; the
+  original error's type is kept in `cause` (and reaches the app as
+  `errorType`), its text is not, and it is not chained. As with a refusal,
+  the destination is not created, replaced or deleted and no temp file is
+  left. Tests: `TestCopyThatCannotBeSaved`.
+- **Analyze: the form and layer checks passed over what they could not read
+  (#101).** `_scan_forms` and `_scan_optional_content` were the last two
+  scanners that swallowed an exception and reported nothing. They now record
+  it like the others, so `forms.xfa`, `forms.acro` and `content.ocg` show as
+  not checked (`audit.incomplete`) instead of absent; none of the three is
+  promised by a Sanitize option, so this refuses nothing — a sanitize report
+  lists them under `unevaluated`. A catalog entry that is not a dictionary is
+  not a form or a layer list and is not recorded as an unread one. One real
+  miss went with it: an XFA form whose `/Fields` was not an array was not
+  reported at all, because counting the fields raised and the same handler
+  discarded the XFA flag. Tests: `TestFormsAndLayersAreNotSilent`.
+- **Redact page: a refusal over the identifier alone no longer says content
+  was found (#116, #117).** When the only failed check is
+  `redaction.file_id`, the redaction held and the copy was refused because it
+  would still carry its source's identifier. The page said "Sensitive content
+  was still detectable" for every refusal. It now says which of the two it
+  was. A code comment there still said the refused output "was deleted";
+  since #116 nothing is written to the destination in the first place.
+- **Sanitize and Analyze missed actions on bookmarks and in the form-field
+  tree (#101).** JavaScript on a bookmark, or on a form field that no page
+  lists as an annotation (a parent field whose widget is a kid, a field with
+  no widget), was neither reported nor removed, and the output verified. A
+  button widget with a JavaScript `/A` was taken off its page and counted as
+  removed while the same dictionary, script included, stayed reachable
+  through `/AcroForm`. Both sides now walk one definition of where an action
+  can hang (`_action_owners` / `_owner_sites` in `pdf_analyze.py`): the
+  catalog, pages, annotations (their `/A`, their `/AA`, and `/PA` — the URI
+  action a link keeps from before it was retargeted), bookmarks and form
+  fields, each through its `/Next` chain. Outlines and the field tree are
+  walked iteratively and cycle-safe. Under `javascript`, Sanitize also
+  deletes the `/OnInstantiate` script of a 3D stream, which is JavaScript
+  but not an action and so sits at none of those sites. The sanitizer's annotation loop keeps its own page walk because
+  it rewrites `/Annots`; a test holds it to the same annotations as the
+  shared walk, including an indirect `/Annots` array, a null entry and an
+  annotation listed on two pages (dropped from both, counted once). Tests:
+  `TestActionSites`, `TestAnnotationWalkParity`, `TestOpenActionDestination`
+  in `tests/test_pdf_analyze.py`.
+- **Sanitize: metadata removal deleted nothing it could not parse (#101).**
+  It cleared pikepdf's parsed view of the XMP and saved, which wrote a
+  malformed packet's recovered tree back with its contents, never touched a
+  metadata stream on a page or other object, and invented a packet and an
+  `/Info` in files that had neither. It now deletes every metadata stream
+  outright, by what the stream says it is (`/Type /Metadata` or `/Subtype
+  /XML`) wherever it is referenced, never by a key that happens to be called
+  `/Metadata`. And `sanitize_pdf` raised `PdfError: While trying to update
+  XMP metadata` under any options on a file whose XMP stream could not be
+  decoded, because saving with `fix_metadata_version` parses the packet;
+  that file now sanitizes. Tests: `TestMetadataPresence` in
+  `tests/test_pdf_analyze.py`, `TestVerifySanitizationMetadata` in
+  `tests/test_pdf_verify.py`.
+- **Sanitize: embedded files outside the name tree, `/AF` and
+  `/FileAttachment` annotations survived (#101).** A payload on any other
+  holder was reported and kept; one in an inline file specification was not
+  even reported, and the output verified with it intact. After the
+  structural removals, any dictionary still reachable whose `/EF` holds a
+  stream is emptied in place — the payload, and the file name, description
+  and every other key that describes it. Tests: `TestEmbeddedFileRule` in
+  `tests/test_pdf_analyze.py`.
+- **A refused redaction no longer destroys the destination (#116).**
+  `redact_pdf` renamed its output onto `output_path`, verified it there, and
+  deleted it on refusal. Redacting in place (`output_path == input_path`) and
+  being refused therefore deleted the user's only copy, and a refusal with a
+  separate destination destroyed whatever file was already at that path. It
+  now verifies, then commits: the candidate is written to a temp file in the
+  destination's directory, verified there, and `os.replace`d onto the
+  destination only if verification passes. A refused run never creates,
+  replaces, or deletes `output_path`. The report names the real destination,
+  never the temp (`VerificationReport.retarget`, which also rewrites the temp
+  name in evidence text). The flatten offer (D1) is unchanged. Tests:
+  `TestRedactVerifyThenCommit` in `tests/test_pdf_ops.py`, `TestReportRetarget`
+  in `tests/test_pdf_verify.py`.
+- **Redacted output no longer carries its source's file identifier (#117).**
+  PyMuPDF and qpdf both preserve the trailer `/ID[0]` across a save, so a
+  redacted copy could be matched to its original by identifier on the
+  search-term and box-only paths (for an encrypted source, both elements
+  survived). Every path — search terms, boxes only, flatten — now ends with
+  one shared write, `pdf_analyze.save_with_content_id`, which drops the
+  trailer `/ID` and has qpdf derive a new one from the output's own content
+  (`deterministic_id`; available at the existing `pikepdf>=8.0.0` floor).
+  Deleting `/ID` alone would not do: qpdf then mints one from the clock. New
+  `redaction.file_id` check: `redact_pdf` captures the source's `/ID`
+  elements and SHA-256 while it has the input open and hands them to
+  `verify_redaction` as plain values (`source_ids`, `source_sha256`) — the
+  verifier still never opens the input and never needs its password. An
+  output sharing any element with its source is refused as a document-level
+  failure (so flatten is never offered for it), unless it is byte-identical
+  to the source. Every shape of `/ID` is captured and none is refused: a
+  bare string instead of an array (which MuPDF carries through a save as it
+  is) counts as one element, and an element that is not a string is compared
+  by its PDF serialization (`pdf_analyze.id_elements`, used on both sides).
+  The report's `to_dict()` gains `sourceSha256` and
+  `outputSha256`. Sanitize gets the same treatment with #101. Tests:
+  `TestRedactFileId` and `TestSourceFileIds` in `tests/test_pdf_ops.py`,
+  `TestRedactionFileId` in `tests/test_pdf_verify.py`.
+- **The redaction scrub deletes a matching XMP packet instead of clearing and
+  re-saving it (#101).** The scrub cleared pikepdf's parsed view of the
+  packet and let pikepdf write it back. pikepdf's recovering parser accepts
+  malformed XML it cannot then edit, so for a malformed packet the recovered
+  tree was re-emitted with the term still in it and the redaction ended in a
+  refusal; for a packet that is not XML at all the parsed view was empty, and
+  a term living only there was reported as "No matching content found". The
+  scrub now reads the stream itself (as UTF-8, as UTF-16, and through
+  pikepdf's parsed view — all read-only) and deletes the `/Metadata` stream
+  outright on a match. Tests: `TestRedactXmpRemoval` in
+  `tests/test_pdf_ops.py`.
+- **Pillow 14 deprecation in the test suite.** The images-to-PDF lossless
+  round-trip test compared pixels via `Image.getdata()` (removed in
+  Pillow 14, 2027); it now compares `tobytes()` — equivalent and faster.
+- **Windows installer + real app icon.** New `installer.iss` (Inno Setup
+  6.3+, documented in the README) packages the PyInstaller one-dir build
+  into `dist/PDFToolkit-Setup-<version>.exe`: all-users install to
+  `Program Files\PDF Toolkit` (admin), Start Menu + optional Desktop
+  shortcut, automatic uninstaller (per-user data — settings/logs, the
+  on-demand translation runtime, Argos language packs — is deliberately
+  left in place for upgrades), lzma2/max compression. New
+  `build_installer.bat` chains the PyInstaller build and the Inno compile
+  (finds `iscc.exe` on PATH or at the default install location). The
+  finished `pdf_toolkit.ico` (16–256 px) is now wired everywhere: embedded
+  in the built .exe (`pdf_toolkit.spec` `EXE(icon=...)`, for
+  Explorer/taskbar/Alt-Tab), bundled as a data file and loaded as the
+  window icon at runtime in both source and frozen modes (`app.py`
+  `_app_icon()`, replacing the old programmatically-painted placeholder
+  icon), and used by the installer for its setup icon and shortcuts. The
+  version string now also lives in `installer.iss` (see CLAUDE.md's
+  version-bump list, now five places).
 - **Protect/Unlock: fix the "where did my file go?" flow — Save-As
   destination + reveal-in-folder, and no more workspace temp-file round-trip.**
   Two problems, one fix. (1) When a workspace document was loaded, Protect and

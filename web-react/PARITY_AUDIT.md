@@ -176,5 +176,43 @@ No slot was renamed or reshaped; the payloads carry new values:
 - **No frontend change.** `AnalyzePage.tsx` renders findings generically;
   `SANITIZE_FIELDS` labels ("Embedded JavaScript", "Auto-run actions
   (/OpenAction, /AA)") still describe what the options do. `web-react/dist/`
-  was not rebuilt. The verification payload on `sanitizeDocument` arrives
-  with the #101 gate.
+  was not rebuilt. The verification payload on `sanitizeDocument` is the next
+  section.
+
+### #101 — Sanitize answers with its verification; a refusal carries the report (2026-11-16)
+
+Sanitize verifies its cleaned copy before saving it and refuses one it
+cannot prove clean. `sanitizeDocument` keeps its name and arguments; its
+answer is now built by the Qt-free `pdf_analyze.sanitize_payload` and has
+three shapes (`SanitizeResponse` in `src/types/analyze.ts`):
+
+- **Success.** As before (`removed`, `total_removed`, `output`,
+  `output_size`), plus `verification` for a PDF: the `verify_sanitization`
+  report the output passed — `verified`, `checks[]` (each with `unevaluated`
+  and `objectPaths`), `residualFindings[]` (what no ticked option promised to
+  remove), `unevaluated[]` (checks outside the ticked options that could not
+  be completed), `sourceSha256`, `outputSha256`, `diagnostics[]`. An image
+  has no `verification`; nothing may assume it is present.
+- **Refusal.** `success:false` with `error` (one sentence), `verification`
+  (the failed report) and the **new top-level `refusal`**:
+  `{stillPresent: string[], notChecked: string[], identifier: boolean,
+  unreadable: boolean}` — the same refusal as the lists a screen shows, worded
+  in Python (`pdf_verify.sanitize_refusal_detail`). Nothing was written to
+  `outputPath`. The old contract sent only `error`.
+- **Failure.** `success:false` with `error` and the new `errorType` (the
+  exception's type name). A cleaned copy that could not be written, read back
+  or moved into place arrives this way, in plain words and with no path.
+- **`analyzeDocument` report** gains `unevaluated` (`{finding id:
+  string[]}`) and may carry the finding `audit.incomplete` (category `audit`,
+  severity `medium`) in place of `clean`.
+- **Frontend.** `AnalyzePage.tsx` keeps the last answer and renders it under
+  the Sanitize panel through the new `components/SanitizeOutcome.tsx`: a
+  verified run with its residual count and titles, or a refusal with the
+  three lists. The toast says the same in one line. `audit.incomplete` sorts
+  first and `FindingRow` opens it by default. Deliberately thin — the
+  exportable report and its panel are #100. `mockSanitizeResult` returns the
+  new shapes and refuses when "External links" is ticked.
+- **`RedactPage.tsx`** now words a refusal whose only failed check is
+  `redaction.file_id` as what it is (the copy would still be linked to the
+  original) instead of "Sensitive content was still detectable". No contract
+  change. `web-react/dist/` rebuilt.

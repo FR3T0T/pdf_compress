@@ -5,7 +5,9 @@ import { SEVERITY_META } from './severityMeta';
 export function FindingRow({ finding }: { finding: Finding }) {
   const sev = SEVERITY_META[finding.severity];
   const hasDetail = Boolean(finding.detail) || Boolean(finding.items && finding.items.length > 0);
-  const [open, setOpen] = useState(false);
+  // "Audit incomplete" starts open: which checks did not finish is the
+  // finding, and it should not take a click to learn it.
+  const [open, setOpen] = useState(finding.id === 'audit.incomplete');
 
   return (
     <div

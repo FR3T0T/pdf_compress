@@ -1,4 +1,9 @@
-import type { AnalyzeReport, SanitizeOptions, SanitizeResponse } from '../types/analyze';
+import type {
+  AnalyzeReport,
+  SanitizeOptions,
+  SanitizeResponse,
+  SanitizeVerification,
+} from '../types/analyze';
 import type { ToolRegistry, PresetsResponse } from '../types/bridge';
 
 /**
@@ -107,25 +112,110 @@ export const MOCK_SANITIZE_DEFAULTS: SanitizeOptions = {
   metadata: false,
 };
 
+const MOCK_SANITIZE_OUTPUT = 'C:\\Users\\demo\\Documents\\client_intake_scan_clean.pdf';
+
+/** Which findings each option promises to remove — `_SANITIZE_PROMISES` in
+ *  pdf_verify.py. Whatever no enabled option promises is a residual. */
+const MOCK_PROMISES: Record<keyof SanitizeOptions, string[]> = {
+  javascript: ['scripts.js'],
+  launch_actions: ['actions.launch'],
+  auto_actions: ['actions.autorun'],
+  embedded_files: ['files.embedded'],
+  submit_actions: ['forms.submit'],
+  external_links: ['links.uri'],
+  metadata: ['meta.docinfo', 'meta.xmp'],
+};
+
+/** A verification report in the shape of `VerificationReport.to_dict()`.
+ *  *failing* is the option whose whole-file sweep found something left. */
+function mockVerification(
+  options: SanitizeOptions,
+  failing: keyof SanitizeOptions | null
+): SanitizeVerification {
+  const enabled = (Object.keys(MOCK_PROMISES) as Array<keyof SanitizeOptions>).filter((k) => options[k]);
+  const promised = new Set(enabled.flatMap((k) => MOCK_PROMISES[k]));
+  const passing = (id: string, description: string) => ({
+    id,
+    description,
+    passed: true,
+    evidence: [],
+    pages: [],
+    isDocumentLevel: false,
+    unevaluated: false,
+    objectPaths: [],
+  });
+  return {
+    inputPath: MOCK_REPORT.filePath,
+    outputPath: MOCK_SANITIZE_OUTPUT,
+    tool: 'sanitization',
+    timestamp: '2025-03-11T14:21:07+00:00',
+    checks: [
+      passing('sanitization.readable', 'Output opens and re-scans for verification'),
+      ...enabled.map((k) =>
+        k === failing
+          ? {
+              ...passing(`sanitize.sweep_${k}`, `Whole-file sweep finds nothing option '${k}' removes`),
+              passed: false,
+              evidence: ['a link to a web address on page 3, annotation 2, under /Stash'],
+              pages: [3],
+              objectPaths: ['trailer/Root/Pages/Kids[2]/Annots[1]/Stash'],
+            }
+          : passing(`sanitize.sweep_${k}`, `Whole-file sweep finds nothing option '${k}' removes`)
+      ),
+      passing('sanitize.file_id', "Output does not carry the source file's identifier (/ID)"),
+    ],
+    residualFindings: MOCK_REPORT.findings.filter((f) => !promised.has(f.id)),
+    verified: failing === null,
+    flattenTargetPages: null,
+    sourceSha256: null,
+    outputSha256: null,
+    unevaluated: [],
+    diagnostics: [],
+  };
+}
+
+/**
+ * What `sanitizeDocument` answers, for the mock document above. Counters as
+ * pdf_analyze.py writes them: one exists only for something that was
+ * removed, and one thing is counted once (the mock's open action is a
+ * script, so either of two options removes it).
+ *
+ * To make the refusal reviewable without the app, the mock refuses when
+ * "External links" is ticked: one of its six links sits where Sanitize has
+ * no way to remove it. Every other combination succeeds and is verified,
+ * with whatever the ticked options do not cover listed as residuals.
+ */
 export function mockSanitizeResult(options: SanitizeOptions): SanitizeResponse {
-  const removed: Record<string, number> = {};
-  if (options.javascript) removed.named_javascript = 2;
-  if (options.launch_actions) removed.launch_action = 1;
-  if (options.auto_actions) removed.open_action = 1;
-  if (options.embedded_files) removed.embedded_files = 0;
-  if (options.submit_actions) removed.submit_action = 0;
-  if (options.external_links) removed.external_link = 6;
-  if (options.metadata) {
-    removed.xmp_metadata = 1;
-    removed.doc_info = 1;
+  if (options.external_links) {
+    return {
+      success: false,
+      error: 'Sanitize could not be verified: still present in the output: external links.',
+      verification: mockVerification(options, 'external_links'),
+      refusal: {
+        stillPresent: ['External links: a link to a web address on page 3, annotation 2, under /Stash'],
+        notChecked: [],
+        identifier: false,
+        unreadable: false,
+      },
+    };
   }
+  const removed: Record<string, number> = {};
+  if (options.javascript) removed.named_javascript = 1;
+  if (options.javascript || options.auto_actions) removed.open_action = 1;
+  if (options.launch_actions) removed.launch_action = 1;
+  if (options.auto_actions) {
+    removed.document_aa = 1;
+    removed.page_aa = 1;
+  }
+  if (options.metadata) removed.doc_info = 1;
   const total_removed = Object.values(removed).reduce((a, b) => a + b, 0);
   return {
     success: true,
     removed,
     total_removed,
-    output: 'C:\\Users\\demo\\Documents\\client_intake_scan_clean.pdf',
+    output: MOCK_SANITIZE_OUTPUT,
     output_size: 4611200,
+    verification: mockVerification(options, null),
   };
 }
 

@@ -1131,6 +1131,293 @@ class TestEmbeddedImageWalk:
             f["id"] for f in res["verification"]["residualFindings"]}
 
 
+# ── What the review of the gate left to do ───────────────────────────────
+
+
+class _NoSuchError(Exception):
+    """Stands in for an exception class the tree under test does not have, so
+    a test expecting it fails with whatever was raised instead."""
+
+
+def _not_saved():
+    return getattr(pdf_analyze, "SanitizationOutputError", _NoSuchError)
+
+
+def _unreadable(monkeypatch, key: str) -> None:
+    """Make every read of *key* fail, as a structure the library cannot
+    parse does."""
+    real = pikepdf.Object.get
+
+    def get(self, name, *default):
+        if str(name) == key:
+            raise RuntimeError(f"simulated unreadable {key}")
+        return real(self, name, *default)
+
+    monkeypatch.setattr(pikepdf.Object, "get", get)
+
+
+def _one_field(pdf) -> None:
+    pdf.Root["/AcroForm"] = Dictionary(Fields=Array([pdf.make_indirect(
+        Dictionary(T=String("f"), FT=Name.Tx))]))
+
+
+def _one_layer(pdf) -> None:
+    pdf.Root["/OCProperties"] = Dictionary(OCGs=Array([pdf.make_indirect(
+        Dictionary(Type=Name.OCG, Name=String("Layer")))]))
+
+
+@pytest.mark.integration
+class TestFormsAndLayersAreNotSilent:
+    """The form and layer checks used to pass over what they could not read,
+    and report nothing. Not read is not the same as not there."""
+
+    @pytest.mark.parametrize("key", ["/AcroForm", "/Fields"])
+    def test_a_form_that_cannot_be_read_is_recorded(self, tmp_path, monkeypatch, key):
+        src = _pdf(tmp_path / "src.pdf", _one_field)
+        assert _ids(src) == {"forms.acro"}
+        _unreadable(monkeypatch, key)
+        report = analyze_document(src)
+        assert {"forms.xfa", "forms.acro"} <= set(report["unevaluated"])
+        ids = {f["id"] for f in report["findings"]}
+        assert "audit.incomplete" in ids and "clean" not in ids
+
+    @pytest.mark.parametrize("key", ["/OCProperties", "/OCGs"])
+    def test_layers_that_cannot_be_read_are_recorded(self, tmp_path, monkeypatch, key):
+        src = _pdf(tmp_path / "src.pdf", _one_layer)
+        assert _ids(src) == {"content.ocg"}
+        _unreadable(monkeypatch, key)
+        report = analyze_document(src)
+        assert set(report["unevaluated"]) == {"content.ocg"}
+        assert {f["id"] for f in report["findings"]} == {"audit.incomplete"}
+        assert _finding(report, "audit.incomplete")["items"] == [
+            "Optional-content layers: the layer list could not be read (RuntimeError)"]
+
+    def test_unread_layers_are_listed_on_a_sanitize_report_and_refuse_nothing(self, tmp_path,
+                                                                             monkeypatch):
+        def build(pdf):
+            pdf.Root["/OpenAction"] = _js()
+            _one_layer(pdf)
+        src, out = _pdf(tmp_path / "src.pdf", build), str(tmp_path / "out.pdf")
+        _unreadable(monkeypatch, "/OCProperties")
+        report = sanitize_pdf(src, out)["verification"]
+        assert report["verified"] is True
+        assert [u["id"] for u in report["unevaluated"]] == ["content.ocg"]
+
+    def test_an_xfa_form_is_reported_whatever_its_field_list_is(self, tmp_path):
+        """A field list that was not a list used to make the whole form
+        disappear from the report, XFA and all."""
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: pdf.Root.__setitem__(
+            "/AcroForm", Dictionary(XFA=pdf.make_stream(b"<xdp>marker-xfa</xdp>"), Fields=5)))
+        report = analyze_document(src)
+        assert {f["id"] for f in report["findings"]} == {"forms.xfa"}
+        assert report["unevaluated"] == {}
+
+    @pytest.mark.parametrize("build", [
+        lambda pdf: pdf.Root.__setitem__("/AcroForm", 5),
+        lambda pdf: pdf.Root.__setitem__("/AcroForm", Dictionary(Fields=Name.Nothing)),
+        lambda pdf: pdf.Root.__setitem__("/OCProperties", Name.Nothing),
+        lambda pdf: pdf.Root.__setitem__("/OCProperties", Dictionary(OCGs=5)),
+    ], ids=["form is a number", "field list is a name", "layers are a name",
+            "layer list is a number"])
+    def test_what_is_not_a_form_or_a_layer_list_is_not_an_unread_one(self, tmp_path, build):
+        src = _pdf(tmp_path / "src.pdf", build)
+        report = analyze_document(src)
+        assert {f["id"] for f in report["findings"]} == {"clean"}
+        assert report["unevaluated"] == {}
+
+
+_AA_HOLDERS = {
+    "document": lambda pdf: pdf.Root,
+    "page": lambda pdf: pdf.pages[0].obj,
+    "annotation": lambda pdf: pdf.pages[0].obj["/Annots"][0],
+    "field": lambda pdf: pdf.Root["/AcroForm"]["/Fields"][0],
+}
+
+
+def _odd_value(pdf, shape: str):
+    return {"array": lambda: Array([1, 2]), "string": lambda: String("marker-odd"),
+            "name": lambda: Name("/MarkerOdd"), "number": lambda: 7,
+            "stream": lambda: pdf.make_stream(b"marker-odd")}[shape]()
+
+
+@pytest.mark.integration
+class TestCounters:
+    """What Sanitize removes, it counts — whatever shape it had."""
+
+    @pytest.mark.parametrize("shape", ["array", "string", "number", "stream"])
+    @pytest.mark.parametrize("owner, counter", [
+        ("document", "document_aa"), ("page", "page_aa"),
+        ("annotation", "annot_aa"), ("field", "field_aa")])
+    def test_an_aa_that_is_not_a_dictionary_is_counted_when_it_goes(self, tmp_path, owner,
+                                                                    counter, shape):
+        def build(pdf):
+            pdf.pages[0].obj["/Annots"] = Array([_link(pdf)])
+            _one_field(pdf)
+            _AA_HOLDERS[owner](pdf)["/AA"] = _odd_value(pdf, shape)
+        src, out = _pdf(tmp_path / "src.pdf", build), str(tmp_path / "out.pdf")
+
+        res = sanitize_pdf(src, out, _only("auto_actions"))
+        assert res["removed"] == {counter: 1}
+        assert res["verification"]["verified"] is True
+        with pikepdf.open(out) as pdf:
+            assert "/AA" not in _AA_HOLDERS[owner](pdf)
+
+        # With the option off it is not Sanitize's to remove, or to count.
+        kept = str(tmp_path / "kept.pdf")
+        assert sanitize_pdf(src, kept, _only("javascript"))["removed"] == {}
+        with pikepdf.open(kept) as pdf:
+            assert "/AA" in _AA_HOLDERS[owner](pdf)
+
+    def test_an_aa_dictionary_is_still_counted_by_its_actions(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: pdf.pages[0].obj.__setitem__(
+            "/AA", Dictionary(O=_js(), C=_harmless(), Junk=5)))
+        res = sanitize_pdf(src, str(tmp_path / "out.pdf"), _only("auto_actions"))
+        assert res["removed"] == {"page_aa": 2}
+
+    @pytest.mark.parametrize("shape", ["string", "array", "name", "number"])
+    def test_an_info_that_is_not_a_dictionary_is_counted_when_it_goes(self, tmp_path, shape):
+        src = _pdf(tmp_path / "src.pdf",
+                   lambda pdf: pdf.trailer.__setitem__("/Info", _odd_value(pdf, shape)),
+                   fix_metadata_version=False)
+        with pikepdf.open(src) as pdf:
+            assert "/Info" in pdf.trailer                  # the fixture is what it claims
+        out = str(tmp_path / "out.pdf")
+        res = sanitize_pdf(src, out, _only("metadata"))
+        assert res["removed"] == {"doc_info": 1}
+        assert res["verification"]["verified"] is True
+        with pikepdf.open(out) as pdf:
+            assert "/Info" not in pdf.trailer
+
+    def test_an_empty_info_dictionary_is_removed_without_a_count(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf",
+                   lambda pdf: pdf.trailer.__setitem__("/Info", pdf.make_indirect(Dictionary())),
+                   fix_metadata_version=False)
+        out = str(tmp_path / "out.pdf")
+        assert sanitize_pdf(src, out, _only("metadata"))["removed"] == {}
+        with pikepdf.open(out) as pdf:
+            assert "/Info" not in pdf.trailer
+
+
+def _objects_only(path, *, tail: bytes = b"%%EOF\n") -> str:
+    """A damaged file, written byte by byte: four objects and no
+    cross-reference table (and, unless *tail* supplies one, no trailer). A
+    reader has to rebuild both, and the trailer it rebuilds has no /Size.
+    (Something has to follow the last object: qpdf drops an object the file
+    ends on.)"""
+    body = (b"%PDF-1.7\n"
+            b"1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n"
+            b"2 0 obj\n<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n"
+            b"3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/AA<</O 4 0 R>>>>\nendobj\n"
+            b"4 0 obj\n<</S/JavaScript/JS(marker-js)>>\nendobj\n")
+    with open(path, "wb") as f:
+        f.write(body + tail)
+    return str(path)
+
+
+@pytest.mark.integration
+class TestDamagedSource:
+    """A file that opens only by being repaired has a rebuilt trailer, and a
+    rebuilt trailer can lack /Size. Written out with object streams and no
+    /Size, the cleaned copy could not be opened again — by anything."""
+
+    @pytest.mark.parametrize("tail", [
+        b"%%EOF\n", b"trailer\n<</Root 1 0 R>>\n",
+        b"trailer\n<</Root 1 0 R/Size 5/ID[<904e5a16"],
+        ids=["no trailer", "a trailer with no /Size", "a trailer cut off mid-way"])
+    def test_it_sanitizes_and_the_output_opens_cleanly(self, tmp_path, tail):
+        src, out = _objects_only(tmp_path / "src.pdf", tail=tail), str(tmp_path / "out.pdf")
+        with pikepdf.open(src) as pdf:
+            assert pdf.get_warnings()                      # the fixture needs repairing
+        assert "scripts.js" in _ids(src)
+
+        res = sanitize_pdf(src, out)
+        assert res["verification"]["verified"] is True
+        assert res["removed"] == {"page_aa": 1}
+        with pikepdf.open(out) as pdf:
+            assert pdf.get_warnings() == []
+            assert len(pdf.pages) == 1 and "/Size" in pdf.trailer
+        assert b"marker-js" not in _all_strings(out)
+        assert sorted(os.listdir(tmp_path)) == ["out.pdf", "src.pdf"]
+
+    def test_in_place(self, tmp_path):
+        src = _objects_only(tmp_path / "only_copy.pdf")
+        assert sanitize_pdf(src, src)["verification"]["verified"] is True
+        assert _ids(src) == {"clean"} and os.listdir(tmp_path) == ["only_copy.pdf"]
+
+
+@pytest.mark.integration
+class TestCopyThatCannotBeSaved:
+    """Writing the cleaned copy, reading it back and moving it into place can
+    each fail for reasons that have nothing to do with what is in the
+    document. The error then says, in plain words, that nothing was saved —
+    and names no file: the library's own message quotes the temp file."""
+
+    def _plain(self, exc, tmp_path) -> str:
+        import traceback
+        text = str(exc)
+        assert "nothing was saved" in text
+        for leak in (str(tmp_path), os.sep, "/", ".pdf"):
+            assert leak not in text, text
+        # Nor may the original error ride along where a log would print it.
+        assert str(tmp_path) not in "".join(traceback.format_exception(exc))
+        return text
+
+    def test_a_destination_folder_that_does_not_exist(self, tmp_path):
+        src = _dirty(tmp_path / "src.pdf")
+        before = _read(src)
+        with pytest.raises(_not_saved()) as ei:
+            sanitize_pdf(src, str(tmp_path / "no-such-folder" / "out.pdf"))
+        assert "could not be written" in self._plain(ei.value, tmp_path)
+        assert ei.value.cause == "FileNotFoundError"
+        assert _read(src) == before and os.listdir(tmp_path) == ["src.pdf"]
+
+    def test_a_copy_that_cannot_be_read_back(self, tmp_path, monkeypatch):
+        src, out = _dirty(tmp_path / "src.pdf"), str(tmp_path / "out.pdf")
+
+        def garbage(pdf, path, **kw):
+            with open(path, "wb") as f:
+                f.write(b"%PDF-1.7\nnot a document\n")
+
+        monkeypatch.setattr(pdf_analyze, "save_with_content_id", garbage)
+        with pytest.raises(_not_saved()) as ei:
+            sanitize_pdf(src, out)
+        assert "could not be read back" in self._plain(ei.value, tmp_path)
+        assert ei.value.cause == "PdfError"
+        assert os.listdir(tmp_path) == ["src.pdf"]
+
+    def test_a_failed_write_keeps_its_type_and_drops_its_text(self, tmp_path, monkeypatch):
+        src, out = _dirty(tmp_path / "src.pdf"), str(tmp_path / "out.pdf")
+
+        def boom(self, filename, *a, **k):
+            raise RuntimeError(f"simulated failure writing {filename}")
+
+        monkeypatch.setattr(pikepdf.Pdf, "save", boom)
+        with pytest.raises(_not_saved()) as ei:
+            sanitize_pdf(src, out)
+        assert "could not be written" in self._plain(ei.value, tmp_path)
+        assert ei.value.cause == "RuntimeError"
+        assert os.listdir(tmp_path) == ["src.pdf"]
+
+    def test_a_destination_that_cannot_be_replaced(self, tmp_path):
+        src = _dirty(tmp_path / "src.pdf")
+        taken = tmp_path / "taken"
+        taken.mkdir()
+        (taken / "keep.txt").write_text("still here")
+        with pytest.raises(_not_saved()) as ei:
+            sanitize_pdf(src, str(taken))                  # a folder is in the way
+        assert "could not be moved into place" in self._plain(ei.value, tmp_path)
+        assert ei.value.cause.endswith("Error")
+        assert sorted(os.listdir(tmp_path)) == ["src.pdf", "taken"]
+        assert os.listdir(taken) == ["keep.txt"]
+
+    def test_it_is_not_a_refusal(self, tmp_path):
+        """Nothing was found wrong with the output: there is no report."""
+        with pytest.raises(_not_saved()) as ei:
+            sanitize_pdf(_dirty(tmp_path / "src.pdf"), str(tmp_path / "gone" / "out.pdf"))
+        assert not isinstance(ei.value, _refused())
+        assert not hasattr(ei.value, "report")
+
+
 # ── No import cycle ──────────────────────────────────────────────────────
 
 

@@ -69,8 +69,9 @@ alone. If a change makes a doc wrong, fixing the doc is part of that change.
   PySide6 GUI stack (`ui/__init__` → `web_shell` → QtWebEngine), which can't load
   on a headless CI runner (`libEGL.so.1`) and kills the test job at collection.
   Keep pure, unit-testable logic in **top-level Qt-free modules** (e.g.
-  `compress_paths.py`) and import it there from tests — never reach through
-  `ui.bridge`. (This already broke Linux CI once.)
+  `compress_paths.py`, or `pdf_analyze.sanitize_payload`, which builds what
+  the `sanitizeDocument` slot returns) and import it there from tests — never
+  reach through `ui.bridge`. (This already broke Linux CI once.)
 
 - **Offline is a hard invariant.** The app must never make a network request
   on its own. `ui/net_guard.py` blocks every non-local web-view request and
@@ -104,5 +105,5 @@ alone. If a change makes a doc wrong, fixing the doc is part of that change.
 ## Releasing
 
 - Rename the top `CHANGELOG.md` section from its working heading to `vX.Y`, and
-  bump the version in all four places (see *Keep the docs current*).
+  bump the version in all five places (see *Keep the docs current*).
 - Tag the release commit with an annotated tag: `git tag -a vX.Y` (as of v4.22).

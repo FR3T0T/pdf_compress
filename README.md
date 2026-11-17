@@ -77,7 +77,8 @@ ruff check .                           # lint (import order, unused code, bugbea
 ```
 
 Pure, unit-testable logic is kept in **top-level modules that import no Qt/PySide6**
-(e.g. `compress_paths.py`), so the suite runs headless without a graphics stack.
+(e.g. `compress_paths.py`, or `pdf_analyze.sanitize_payload` for what the Sanitize
+slot answers), so the suite runs headless without a graphics stack.
 Importing anything under `ui/` pulls in the Qt GUI stack (`ui/__init__` → `web_shell`
 → QtWebEngine), which a headless CI runner can't load — so tests import the pure
 helpers directly instead of through `ui.bridge`.
@@ -141,7 +142,7 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 ### Repair & Analysis
 - **Repair PDF** — fix corrupted PDF files
 - **Compare PDFs** — find differences between two PDFs
-- **Analyze Document** — offline privacy & security audit; finds embedded JavaScript (including scripts on bookmarks and form fields), auto-run/launch actions, external trackers, embedded files and references to external files, hidden layers, invisible text, and identifying metadata (document, page or object level), with one-click sanitizing
+- **Analyze Document** — offline privacy & security audit; finds embedded JavaScript (including scripts on bookmarks and form fields), auto-run/launch actions, external trackers, embedded files and references to external files, hidden layers, invisible text, and identifying metadata (document, page or object level), and says so when part of a file could not be checked. One-click sanitizing writes a clean copy that is verified before it is saved: it reports what it removed and what the ticked options left alone, or refuses and says what is still there
 
 ---
 
@@ -254,7 +255,10 @@ Text and vector graphics are never modified.
 - **Encrypted PDF handling** — password-protected files prompt for credentials; passwords are cleared from memory after use
 - **Atomic file I/O** — temp file + `os.replace()`; original file is never corrupted on failure
 - **Verify, then commit (Redact)** — the redacted candidate is written to a temp file beside the destination, verified there, and renamed into place only if verification passes. A refused redaction never creates, replaces, or deletes the destination
-- **No identifier carry-over (Redact)** — PDF libraries preserve the trailer `/ID` across saves so revisions of a document can be recognised; for a redacted copy that is a link back to the original. Redact drops it and writes a new one derived from the output's own content as its last step, and verification refuses an output that still shares an identifier with its source. The verification report records the SHA-256 of both files
+- **No identifier carry-over (Redact, Sanitize)** — PDF libraries preserve the trailer `/ID` across saves so revisions of a document can be recognised; for a redacted or sanitized copy that is a link back to the original. Both tools drop it and write a new one derived from the output's own content as their last step, and verification refuses an output that still shares an identifier with its source. The verification report records the SHA-256 of both files
+- **Verify, then commit (Sanitize)** — the cleaned copy is written to a temp file beside the destination and audited again there, twice over: by the analyzer, and by an independent sweep of every object in the file. It is renamed into place only if everything the ticked options promise to remove is gone, every one of those checks could be carried out, and the copy shares no identifier with its source. Otherwise Sanitize refuses, says what is still present or what could not be checked, and has not created, replaced, or deleted the destination. What the ticked options do not cover is listed as remaining, not hidden
+- **"Could not check" is not "clean" (Analyze)** — a structure the audit cannot read does not end it, and does not pass silently either: the findings it could have produced are reported as not checked (`audit.incomplete`), and Analyze never answers "no concerns" for a file it could not fully read
+- **Known limits (Sanitize)** — three, each needing a file built for the purpose. A trailer `/Info` that points at a dictionary with another job and nothing but strings, names, numbers and booleans in it (and no `/Type`, `/Subtype` or `/S`) is emptied by the metadata option, taking that other job's entries with it. An `/Info` dictionary that is also held under a second key and declares a `/Type`, or holds an array or a dictionary, is only unhooked from the trailer: its entries stay in the file under the other key and the copy still verifies. And the identifier check compares the elements of the two trailer `/ID`s, so an identifier hidden inside a nested array in the source's `/ID` is not seen
 - **Backup system** — optional `.backup` copy with rotation before overwriting originals
 - **Thread-safe cancellation** — cancel at any point without leaving partial output files
 - **Diagnostic logging** — rotating file logs (5 MB, 3 backups) to platform-appropriate directories
@@ -273,7 +277,7 @@ Text and vector graphics are never modified.
 | `compress_paths.py` | Pure compression output-path resolution (Qt-free; unit-tested by `tests/test_bridge.py`) |
 | `pdf_ops.py` | PDF operations (merge, split, protect, watermark, etc.) |
 | `epdf_crypto.py` | Enhanced encryption engine (.epdf format — ChaCha20, AES-256, Camellia; header-authenticated v2) |
-| `pdf_analyze.py` | Offline privacy/security audit + sanitizer engine |
+| `pdf_analyze.py` | Offline privacy/security audit + sanitizer engine (verify, then commit); also `sanitize_payload`, the Qt-free answer the bridge gives the Sanitize panel |
 | `pdf_verify.py` | Post-operation verification loop — independently re-checks redacted/sanitized output and reports proof of removal (Qt-free) |
 | `pdf_translate.py` | Offline translation + OCR engine (Argos + Tesseract) |
 | `translate_runtime.py` | On-demand provisioning of the translation ML runtime (frozen builds exclude torch & friends; this downloads pinned wheels into a user dir once) |
