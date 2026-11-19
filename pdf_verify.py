@@ -23,7 +23,15 @@ transform raises, with the report, having touched nothing at the destination:
     leak invisible to one library is still caught by the other. When the
     caller supplies the source's trailer /ID elements it also asserts the
     output carries none of them (``redaction.file_id``): a cleaned copy that
-    keeps its source's identifier is still linkable to it.
+    keeps its source's identifier is still linkable to it. And it takes a
+    second, whole-file look for the terms (``redaction.term_sweep``, #119):
+    every string in the output and the decoded bytes of every stream,
+    wherever it hangs, read in every encoding text has in a PDF
+    (:class:`TermFinder`). That is what finds a term in a place the surface
+    checks have no name for — structure-tree text, an application's private
+    data, a layer's name, a form no page paints. It does not read images,
+    the internals of fonts and colour profiles, or PDF names (see the note
+    above :func:`_term_sweep_check` for why, and for what that leaves).
   - :func:`verify_sanitization` — re-runs the ``pdf_analyze`` audit on the
     output and asserts absent exactly the finding categories the enabled
     sanitize options promised to remove (expectations-based — anything else
@@ -339,6 +347,105 @@ def _bytes_contain(raw: bytes, term: str, case_sensitive: bool) -> bool:
     if case_sensitive:
         return needle in raw
     return needle.lower() in raw.lower()
+
+
+def _pdfdoc_table() -> dict:
+    """Latin-1 code point -> what that byte is in PDFDocEncoding, for the
+    bytes where the two differ (typographic quotes and dashes, the bullet,
+    the euro, the fi and fl ligatures). From pikepdf's codec; empty if this
+    pikepdf has none, which leaves the Latin-1 reading alone."""
+    table = {}
+    for i in range(256):
+        try:
+            ch = bytes([i]).decode("pdfdoc")
+        except Exception:
+            continue
+        if ch != chr(i):
+            table[i] = ch
+    return table
+
+
+_PDFDOC = _pdfdoc_table()
+
+
+class TermFinder:
+    """Finds target terms in raw bytes: a string object's, or a stream's
+    decoded data.
+
+    A PDF has no one text encoding, so the bytes are read every way text is
+    written in one: Latin-1 and PDFDocEncoding (the same for ASCII), Windows
+    code page 1252 (what most page content uses), UTF-8, and UTF-16 in both
+    byte orders and at either alignment. Whitespace in a term matches any
+    run of whitespace, a line break or a no-break space included; nothing
+    else is bridged, so a term broken in the middle of a word is not found
+    here (that is the page-text matcher's work). Case is folded unless
+    *case_sensitive*.
+
+    Shared by the verifier's sweep and by the scrub in pdf_ops, so the scrub
+    removes by the same test it will be checked with.
+    """
+
+    def __init__(self, terms, case_sensitive: bool = False):
+        self.terms = [t for t in (terms or []) if t and t.strip()]
+        self._case = case_sensitive
+        self._tests = []
+        for term in self.terms:
+            words = self._fold(term).split()
+            if len(words) == 1:
+                self._tests.append((term, words[0], None))
+            else:
+                self._tests.append((term, None, re.compile(r"\s+".join(map(re.escape, words)))))
+        joined = "".join(self.terms)
+        self._ascii = joined.isascii()
+        self._latin1 = all(ord(c) < 256 for c in joined)
+        # An ASCII word is the same bytes in UTF-8 as in Latin-1; only a term
+        # of several words needs the UTF-8 reading, for the whitespace.
+        self._utf8 = not (self._ascii and all(rx is None for _t, _w, rx in self._tests))
+
+    def _fold(self, text: str) -> str:
+        return text if self._case else text.casefold()
+
+    def _readings(self, raw: bytes):
+        latin = raw.decode("latin-1")
+        yield latin
+        if not self._ascii:
+            if _PDFDOC:
+                yield latin.translate(_PDFDOC)
+            yield raw.decode("cp1252", "replace")
+        if self._utf8:
+            yield raw.decode("utf-8", "replace")
+        if self._latin1:
+            # UTF-16 of Latin-1 text is that text with a zero byte beside
+            # every character: dropping the zeros reads it in either byte
+            # order and at either alignment.
+            if b"\x00" in raw:
+                yield raw.replace(b"\x00", b"").decode("latin-1")
+        else:
+            for encoding in ("utf-16-be", "utf-16-le"):
+                yield raw.decode(encoding, "replace")
+                yield raw[1:].decode(encoding, "replace")
+
+    def find(self, raw) -> list[str]:
+        """The terms found in *raw*, in the order they were given."""
+        raw = bytes(raw)
+        if not raw or not self._tests:
+            return []
+        pending, found = list(self._tests), set()
+        for reading in self._readings(raw):
+            text = self._fold(reading)
+            left = []
+            for term, word, rx in pending:
+                if (word in text) if rx is None else (rx.search(text) is not None):
+                    found.add(term)
+                else:
+                    left.append((term, word, rx))
+            pending = left
+            if not pending:
+                break
+        return [t for t in self.terms if t in found]
+
+    def __call__(self, raw) -> bool:
+        return bool(self.find(raw))
 
 
 def _term_in_page_text(page, text: str, term: str,
@@ -765,6 +872,8 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
         if terms:
             report.checks.extend(_term_surface_checks(
                 doc, output_path, terms, case_sensitive, password))
+            report.checks.append(_term_sweep_check(
+                output_path, terms, case_sensitive, password))
         if rects:
             report.checks.append(_rect_region_check(doc, rects))
     finally:
@@ -891,7 +1000,9 @@ def walk_objects(pdf, status: WalkStatus, *, strings: bool = False,
                 children = [(f"[{i}]", v) for i, v in enumerate(obj)]
             else:
                 yield path, obj
-                children = [(str(k), obj[k]) for k in obj.keys()]
+                # In key order: keys() is a set, and an object reachable two
+                # ways must be reported under the same path on every run.
+                children = [(str(k), obj[k]) for k in sorted(obj.keys())]
             for seg, child in reversed(children):
                 if isinstance(child, containers):
                     stack.append((seg, path, child))
@@ -936,6 +1047,12 @@ def plain_location(segments: list[str], page: Optional[int] = None) -> str:
         where = "in the document's named scripts"
     elif names == "/EmbeddedFiles":
         where = "in the document's attachment list"
+    elif names == "/Dests":
+        where = "in the document's named destinations"
+    elif segments[1:3] == ["/Root", "/StructTreeRoot"]:
+        where = "in the document's structure tree"
+    elif segments[1:3] == ["/Root", "/OCProperties"]:
+        where = "in the document's layer list"
     elif "/Outlines" in segments:
         where = "in a bookmark"
     elif "/AcroForm" in segments:
@@ -971,6 +1088,252 @@ def plain_location(segments: list[str], page: Optional[int] = None) -> str:
     if steps:
         parts.append(f"{steps} step{'' if steps == 1 else 's'} down a chain of actions")
     return ", ".join(parts)
+
+
+# ── Whole-file term sweep (redaction, #119) ──────────────────────────
+#
+#  The surface checks look where redaction knows a term can be: page text,
+#  annotations, form values, links, document information, bookmarks. The
+#  term sweep is the second look, as the sanitization sweep is: every
+#  string in the file and the decoded bytes of every stream, wherever it
+#  hangs. A term in a place nobody thought of is still bytes in the file.
+#
+#  What it does not read, and why:
+#    * images — pixels, not text (finding a word in pixels is OCR, #128);
+#    * the internals of fonts and colour profiles. An embedded font program
+#      carries its name, its foundry and a copyright line; a character map
+#      says "Adobe" and "Identity" (in nearly half of real files); a colour
+#      profile says "Copyright" and names its maker. None of that is the
+#      document's text, and searching it would refuse those words in every
+#      file that has such a font;
+#    * names. A font's name, a style name, a layer's intent are PDF names,
+#      not strings.
+#  So a term that is, or is part of, a font's or a profile's own name stays
+#  in the output. That is the known limit of this check.
+
+#: /Type of a font object -> the entries under it that are streams of font
+#: machinery: embedded programs and binary tables, character maps.
+_FONT_STREAM_KEYS = {
+    "/FontDescriptor": ("/FontFile", "/FontFile2", "/FontFile3", "/CIDSet"),
+    "/Font": ("/ToUnicode", "/Encoding", "/CIDToGIDMap"),
+    "/CMap": ("/UseCMap",),
+}
+
+#: ... and the entries that are strings a font carries about itself.
+_FONT_STRING_KEYS = {"/FontDescriptor": ("/FontFamily", "/CharSet")}
+
+
+def _type_name(obj) -> str:
+    kind = obj.get("/Type")
+    return str(kind) if isinstance(kind, pikepdf.Name) else ""
+
+
+def _font_streams(obj) -> list:
+    """The streams that are font machinery because of what *obj* is: a font
+    descriptor's programs, a font's character maps, a character map itself.
+    Judged by the /Type the holder declares, never by a key name alone —
+    a /FontFile entry on anything else is just a stream."""
+    kind = _type_name(obj)
+    found = [obj] if kind == "/CMap" and isinstance(obj, pikepdf.Stream) else []
+    for key in _FONT_STREAM_KEYS.get(kind, ()):
+        value = obj.get(key)
+        if isinstance(value, pikepdf.Stream):
+            found.append(value)
+    return found
+
+
+def _is_font_string(path) -> bool:
+    """True for a string a font carries about itself: a font descriptor's
+    /FontFamily or /CharSet, or the /Registry and /Ordering of a character
+    collection (a dictionary that has both, as strings)."""
+    holder = path[1][2] if path[1] is not None else None
+    if not isinstance(holder, (pikepdf.Dictionary, pikepdf.Stream)):
+        return False
+    key = path[0]
+    if key in _FONT_STRING_KEYS.get(_type_name(holder), ()):
+        return True
+    return (key in ("/Registry", "/Ordering")
+            and isinstance(holder.get("/Registry"), pikepdf.String)
+            and isinstance(holder.get("/Ordering"), pikepdf.String))
+
+
+def _is_image(stream) -> bool:
+    """An image XObject, or a thumbnail (an image that need not say so)."""
+    subtype = stream.get("/Subtype")
+    if isinstance(subtype, pikepdf.Name):
+        return str(subtype) == "/Image"
+    return ("/Width" in stream and "/Height" in stream
+            and ("/BitsPerComponent" in stream or "/ImageMask" in stream))
+
+
+def _owner_id(path) -> Optional[tuple]:
+    """(num, gen) of the nearest indirect dictionary, stream or array at or
+    above *path*: the object a hit belongs to."""
+    containers = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
+    while path is not None:
+        obj = path[2]
+        try:
+            if isinstance(obj, containers) and obj.is_indirect:
+                return tuple(obj.objgen)
+        except Exception:
+            return None
+        path = path[1]
+    return None
+
+
+def _pages_reaching(pdf, wanted: set) -> dict:
+    """{object id: [page numbers]} — the pages each of *wanted* can be
+    reached from.
+
+    This decides whether flattening can remove a hit. Flattening rebuilds
+    the document from its pages, the flattened ones as plain images, so an
+    object survives it only if a page that was kept still leads to it. A
+    hit reachable from pages is therefore fixed by flattening all of them;
+    one no page leads to (the catalog's own entries, the structure tree) is
+    document-level.
+
+    The walk from a page stops at other pages and at the page tree, and
+    takes the resources a page inherits from above it. Only run when there
+    is a hit to place.
+    """
+    containers = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
+    found: dict = {key: [] for key in wanted}
+    for number, page in enumerate(pdf.pages, 1):
+        start = page.obj
+        stack = [start]
+        try:
+            node, hops = start, 0
+            while "/Resources" not in node and hops < 64:
+                node = node.get("/Parent")
+                if not isinstance(node, pikepdf.Dictionary):
+                    break
+                hops += 1
+            if hops and isinstance(node, pikepdf.Dictionary) and "/Resources" in node:
+                stack.append(node["/Resources"])
+        except Exception:
+            pass
+        seen: set = set()
+        try:
+            start_key = tuple(start.objgen) if start.is_indirect else None
+        except Exception:
+            start_key = None
+        while stack:
+            cur = stack.pop()
+            try:
+                if not isinstance(cur, containers):
+                    continue
+                key = tuple(cur.objgen) if cur.is_indirect else None
+                if key is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if key in found:
+                        found[key].append(number)
+                if isinstance(cur, pikepdf.Array):
+                    stack.extend(v for v in cur if isinstance(v, containers))
+                    continue
+                is_start = cur is start or (key is not None and key == start_key)
+                if not is_start and _type_name(cur) in ("/Page", "/Pages", "/Catalog"):
+                    continue
+                skip = ("/Parent",) if is_start else ()
+                stack.extend(cur[k] for k in cur.keys()
+                             if k not in skip and isinstance(cur[k], containers))
+            except Exception:
+                continue
+    return found
+
+
+def _term_sweep_check(output_path: str, terms: list[str], case_sensitive: bool,
+                      password: Optional[str] = None) -> VerificationCheck:
+    """No target term is left in any string or stream of the output.
+
+    Fail-closed twice over, like the sanitization sweep. A hit fails the
+    check, with where it is in plain words (the raw object path is kept
+    beside it). And a search that did not cover the whole file — the output
+    would not open, an object or a stream could not be read — fails it too:
+    what was not read cannot be reported free of the terms.
+
+    A hit on an object some page leads to names the page (and offers the
+    flatten, which removes it); any other is document-level.
+    """
+    desc = "No target term appears in any string or stream of the file"
+    finder = TermFinder(terms, case_sensitive)
+    hits: list = []            # (term, what, path)
+    problems: list[str] = []
+    lines: list[str] = []
+    paths: list[str] = []
+    pages: set = set()
+    kwargs = {"password": password} if password else {}
+    try:
+        with pikepdf.open(output_path, **kwargs) as pdf:
+            # Font machinery by identity first: a character map two fonts
+            # share is one wherever the walk happens to reach it from.
+            machinery: set = set()
+            for obj in pdf.objects:
+                try:
+                    if isinstance(obj, (pikepdf.Dictionary, pikepdf.Stream)):
+                        machinery.update(tuple(s.objgen) for s in _font_streams(obj))
+                except Exception:
+                    continue           # the walk below meets it too, and says so
+            status = WalkStatus()
+            for path, obj in walk_objects(pdf, status, strings=True):
+                try:
+                    if isinstance(obj, pikepdf.String):
+                        if _is_font_string(path):
+                            continue
+                        found, what = finder.find(bytes(obj)), "a text string"
+                    else:
+                        # An inline font dictionary is in no object list.
+                        machinery.update(tuple(s.objgen) for s in _font_streams(obj))
+                        if not isinstance(obj, pikepdf.Stream):
+                            continue
+                        if tuple(obj.objgen) in machinery or _is_image(obj):
+                            continue
+                        data = obj.read_bytes()
+                        if data[36:40] == b"acsp":       # an ICC colour profile
+                            continue
+                        found, what = finder.find(data), "a stream"
+                except Exception as exc:
+                    # The type only: library messages quote the file's path.
+                    problems.append(
+                        f"could not read {render_path(path)} ({type(exc).__name__})")
+                    continue
+                hits.extend((term, what, path) for term in found)
+            problems = status.problems + problems
+
+            owners = {id(h): _owner_id(h[2]) for h in hits}
+            reach = _pages_reaching(pdf, {o for o in owners.values() if o}) if hits else {}
+            placed = [(h, reach.get(owners[id(h)]) or []) for h in hits]
+            seen: set = set()
+            # Document-level hits first: the list is cut at twenty lines, and
+            # the one that rules out the flatten must not be what is cut.
+            for (term, what, path), on in sorted(placed, key=lambda p: bool(p[1])):
+                raw = render_path(path)
+                if (term, raw) in seen:
+                    continue
+                seen.add((term, raw))
+                segments = _segments(path)
+                if on:
+                    pages.update(on)
+                    more = (f", and on {len(on) - 1} more page{'' if len(on) == 2 else 's'}"
+                            if len(on) > 1 else "")
+                    lines.append(f"term '{term}' found in {what} "
+                                 f"{plain_location(segments, on[0])}{more}")
+                else:
+                    lines.append(f"term '{term}' found in {what} "
+                                 f"{plain_location(segments)} (document-level)")
+                paths.append(raw)
+    except Exception as exc:
+        problems.append(f"the output could not be opened ({type(exc).__name__})")
+    incomplete = [f"the whole-file search did not cover the whole file ({p}); what it "
+                  f"did not read cannot be reported free of the terms (document-level)"
+                  for p in problems[:5]]
+    evidence = lines[:20] + ([f"... and {len(lines) - 20} more"] if len(lines) > 20 else [])
+    return VerificationCheck(
+        id="redaction.term_sweep", description=desc,
+        passed=not (lines or incomplete), evidence=evidence + incomplete,
+        pages=sorted(pages), unevaluated=bool(incomplete) and not lines,
+        object_paths=paths[:20])
 
 
 class SweepHit(NamedTuple):

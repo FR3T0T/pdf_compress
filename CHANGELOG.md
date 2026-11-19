@@ -2,6 +2,41 @@
 ## Unreleased
 
 ### Added
+- **Redaction: a whole-file search for every target term (#119).** A term
+  redaction could finish verified with the term still in the file, in a
+  place the verifier's surface checks have no name for: structure-tree
+  `/Alt` and `/ActualText`, an application's private data (`/PieceInfo`), a
+  layer's name, a named destination, a script in `/Names /JavaScript`, a
+  metadata stream on a page, a form XObject no page paints. `verify_redaction`
+  now takes a second look, `redaction.term_sweep`: every string in the output
+  and the decoded bytes of every stream, wherever it hangs, using the
+  whole-file walker the sanitize sweep uses. Bytes are read every way text is
+  written in a PDF — Latin-1, PDFDocEncoding, code page 1252, UTF-8, UTF-16
+  in both byte orders and at either alignment — and whitespace in a term
+  matches any run of whitespace (`pdf_verify.TermFinder`). A hit fails the
+  check, with where it is in plain words and the raw object path beside it.
+  A search that could not cover the whole file — an object or a stream that
+  cannot be read — fails it too, and the refusal then says so instead of
+  "still present". A hit on an object a page leads to names the page and
+  offers the flatten (which rebuilds the document from its pages, so it
+  removes it); any other is document-level. Boxes-only redactions are not
+  swept. Not read, and why: images (pixels; that is #128); PDF names; and the
+  internals of fonts and colour profiles — embedded font programs, character
+  maps, a font descriptor's `/FontFamily`, a character collection's
+  `/Registry` and `/Ordering`, ICC profiles. In 521 real PDFs that redact
+  today, the word "Adobe" is in a character map or a `/Registry` string in
+  249 and "Identity" in 219, and "Copyright" is in a colour profile in 46:
+  searching those would refuse the words in every such file. They are exempt
+  by what the holder declares itself to be, never by a key name alone. Known
+  limits, each needing a file built for it: a term that is (part of) a font's
+  or profile's own name, or a PDF name; text behind an object that declares
+  itself an image, a font descriptor's program or an ICC profile; a term
+  written as a hex string or split across strings inside a stream no page
+  paints; and a very short term can be refused because its bytes occur by
+  chance in binary data. Cost on the real-file run (554 files with a word to
+  redact): 60 s → 72 s in total.
+  Tests: `TestTermSweep`, `TestWhatTheSweepLeavesAlone`,
+  `TestSweepNeverPassesOnAPartialLook` in `tests/test_redact_completeness.py`.
 - **Sanitize proves its output before it commits it (#101).** `sanitize_pdf`
   (`pdf_analyze.py`) writes the cleaned candidate to a temp file beside the
   destination, runs `verify_sanitization` on those exact bytes, and renames
@@ -189,6 +224,42 @@
   save-failure) and `tests/test_pdf_verify.py` (D1 flatten targeting).
 
 ### Changed
+- **Redaction scrubs six more surfaces, and refuses what it has no rule for
+  (#119).** So that an ordinary file passes the whole-file search above, a
+  term redaction now also: replaces structure-tree text holding a term
+  (`/Alt`, `/ActualText`, a title, an attribute) with `[redacted]`, as it
+  does a bookmark title; does the same to a layer's name; deletes an
+  application's `/PieceInfo` entry that holds a term anywhere under it;
+  deletes a metadata stream that holds a term in any encoding wherever it
+  hangs, not only the catalog's (one that cannot be decoded is deleted too,
+  since it cannot be shown free of the term); removes a script whose text
+  holds a term, by the sanitizer's own code and so from every place Sanitize
+  removes scripts; and renames a named destination whose name holds a term,
+  together with the links, actions and bookmarks that use it, writing the
+  name tree back sorted. Each is counted in `surface_counts` under
+  `structure`, `layers`, `piece_info`, `metadata` (`xmp` is still the
+  catalog's packet), `scripts` and `destinations`, and a term found only
+  there is a redaction, not "No matching content". All the document-level
+  scrubs now match the way the verifier does, so a term of two words is
+  found in a note that breaks the line between them. **A term anywhere else
+  is not scrubbed: the run is refused.** Of 524 real PDFs whose redaction of
+  one word of their own text used to finish verified, 41 are now refused,
+  every one because the word is still in the file: in annotation rich text
+  (`/RC`), form-field tooltips, names, captions and option lists, XFA form
+  data, pdfTeX's record of an included file's name, an attachment's contents
+  or name, and in annotations and forms that redaction took off the page but
+  the structure tree still points to. 24 of the 41 come with the flatten
+  offer. Tests: `TestScrubRules`, `TestWhatHasNoRuleIsRefused`.
+- **`pdf_analyze`: the sanitizer's removals can be asked for selectively
+  (#119).** New `remove_scripts(pdf, wanted)` and
+  `remove_metadata_streams(pdf, wanted=None)`, and `_name_tree_items` is now
+  the public `name_tree_items`. Sanitize itself goes through the same
+  functions; its behaviour is unchanged.
+- **Sweep evidence names the same path on every run (#119).**
+  `pdf_verify.walk_objects` visits a dictionary's entries in key order. An
+  object reachable two ways used to be reported under whichever path the
+  hash seed put first. `plain_location` also names the structure tree, the
+  layer list and the named destinations.
 - **Default Sanitize now removes every additional action (`/AA`) on
   annotations and form fields (#101).** Analyze has always reported any `/AA`
   entry as an auto-run action, whatever it does, but with `auto_actions` on
@@ -435,6 +506,18 @@
   code with no remaining callers.
 
 ### Fixed
+- **A page's content streams were loaded once per reference instead of once
+  (#119).** `pdf_analyze.page_content_blobs` — behind Analyze's
+  invisible-text check and the redaction verifier's raw-content check —
+  loaded a form XObject's stream for every place that draws it, and forms
+  draw each other. One real two-page file with 270 forms made 73,172 stream
+  loads and handed 157 MB per page to the search; it now makes 542 (each
+  stream once per page) and hands over 1 MB, and Analyze on that file goes
+  from 11 s to under 2 s. A stream that cannot be read used to be skipped
+  when reading it raised, so the verifier could not know it was there; it is
+  now returned as `None` in its place, once, and
+  `redaction.raw_content` fails on it and counts it once. No size budget is
+  added here (#120). Tests: `TestContentStreamsAreReadOnce`.
 - **Sanitize: shapes that verified with content still in the file, or were
   refused over something Analyze had not listed (#101).** Found by trying to
   break the gate. (1) An `/Info` dictionary also referenced from another key

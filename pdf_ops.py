@@ -14,8 +14,16 @@ from typing import Callable
 import fitz  # PyMuPDF
 import pikepdf
 
-from pdf_analyze import file_sha256, id_elements, save_with_content_id, trailer_ids
-from pdf_verify import verify_redaction
+from pdf_analyze import (
+    file_sha256,
+    id_elements,
+    name_tree_items,
+    remove_metadata_streams,
+    remove_scripts,
+    save_with_content_id,
+    trailer_ids,
+)
+from pdf_verify import TermFinder, WalkStatus, verify_redaction, walk_objects
 
 log = logging.getLogger(__name__)
 
@@ -1566,17 +1574,196 @@ _REDACTED_MARKER = "[redacted]"
 
 
 def _make_term_matcher(terms: list[str], case_sensitive: bool):
-    """Return match(value) -> bool for whole-value (D2) surface scrubbing."""
-    if case_sensitive:
-        needles = [t for t in terms if t]
-        def match(value: str) -> bool:
-            return any(n in value for n in needles)
-    else:
-        folded = [t.casefold() for t in terms if t]
-        def match(value: str) -> bool:
-            v = value.casefold()
-            return any(n in v for n in folded)
+    """Return match(value) -> bool for whole-value (D2) surface scrubbing.
+
+    *value* is text, or a pikepdf string. The test is the verifier's own
+    (pdf_verify.TermFinder), so the scrub removes what the whole-file sweep
+    would otherwise find: a string object is read as its raw bytes in every
+    encoding as well as in its decoded form, and whitespace in a term
+    matches any run of whitespace — a term of two words is found in a note
+    that breaks the line between them.
+    """
+    finder = TermFinder(terms, case_sensitive)
+
+    def match(value) -> bool:
+        try:
+            if isinstance(value, pikepdf.String) and finder(bytes(value)):
+                return True
+            return finder(str(value).encode("utf-8", "replace"))
+        except Exception:
+            return False
     return match
+
+
+#: Keys that lead out of the structure tree: to a page, to an annotation or
+#: XObject, to a content stream. Structure text is scrubbed; those are not
+#: the structure tree's to touch.
+_STRUCTURE_WAYS_OUT = ("/Pg", "/Obj", "/Stm", "/StmOwn")
+
+_CONTAINERS = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
+
+
+def _redact_strings(root, match, skip: tuple = ()) -> int:
+    """Replace every string under *root* that holds a term with the whole-
+    value marker (D2), as bookmark titles are; returns how many.
+
+    Walks dictionaries and arrays, direct or indirect, each object once,
+    without following the keys in *skip*. Iterative: a structure tree is as
+    deep as the document's nesting and as long as its content.
+    """
+    n, seen, stack = 0, set(), [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            if cur.is_indirect:
+                ident = tuple(cur.objgen)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            slots = (range(len(cur)) if isinstance(cur, pikepdf.Array)
+                     else [k for k in cur.keys() if k not in skip])
+            for slot in slots:
+                value = cur[slot]
+                if isinstance(value, pikepdf.String):
+                    if match(value):
+                        cur[slot] = pikepdf.String(_REDACTED_MARKER)
+                        n += 1
+                elif isinstance(value, _CONTAINERS):
+                    stack.append(value)
+        except Exception:
+            continue
+    return n
+
+
+def _holds_term(obj, finder) -> bool:
+    """True if a term is anywhere under *obj*: in a string, or in the data
+    of a stream. A stream that cannot be read counts — it cannot be shown
+    free of the term. Does not follow a reference back into the document
+    (a page, the page tree, the catalog)."""
+    seen, stack = set(), [obj]
+    while stack:
+        cur = stack.pop()
+        try:
+            if isinstance(cur, pikepdf.String):
+                if finder(bytes(cur)):
+                    return True
+                continue
+            if not isinstance(cur, _CONTAINERS):
+                continue
+            if cur.is_indirect:
+                ident = tuple(cur.objgen)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            if isinstance(cur, pikepdf.Array):
+                stack.extend(cur)
+                continue
+            if str(cur.get("/Type")) in ("/Page", "/Pages", "/Catalog"):
+                continue
+            if isinstance(cur, pikepdf.Stream):
+                try:
+                    data = cur.read_bytes()
+                except Exception:
+                    return True
+                if finder(data):
+                    return True
+            stack.extend(cur[k] for k in cur.keys())
+        except Exception:
+            continue
+    return False
+
+
+def _scrub_piece_info(pdf, finder) -> int:
+    """Delete every application's entry in a /PieceInfo dictionary — on the
+    catalog, a page, a form XObject — that holds a term anywhere under it.
+    It is private data of the program that wrote it; nothing can be redacted
+    inside it, so it goes whole. Returns the number of entries deleted."""
+    holders = []
+    for _path, obj in walk_objects(pdf, WalkStatus()):
+        try:
+            if "/PieceInfo" in obj:
+                holders.append(obj)
+        except Exception:
+            continue
+    n = 0
+    for holder in holders:
+        try:
+            info = holder["/PieceInfo"]
+            if isinstance(info, pikepdf.Dictionary):
+                for app in list(info.keys()):
+                    if _holds_term(info[app], finder):
+                        del info[app]
+                        n += 1
+                if not len(info.keys()):
+                    del holder["/PieceInfo"]
+            elif _holds_term(info, finder):
+                del holder["/PieceInfo"]
+                n += 1
+        except Exception:
+            continue
+    return n
+
+
+def _rename_destinations(pdf, finder) -> int:
+    """Rename every named destination whose name holds a term, and every
+    use of it, so the links that point there still work. Returns how many.
+
+    The names are the keys of the catalog's /Names /Dests tree. A name tree
+    is sorted, so a tree with a renamed key is written back as one sorted
+    leaf rather than patched in place. The uses are the /Dest and /D strings
+    of links, actions and bookmarks, found by walking the file.
+    """
+    try:
+        names = pdf.Root.get("/Names")
+        tree = names.get("/Dests") if isinstance(names, pikepdf.Dictionary) else None
+        if not isinstance(tree, pikepdf.Dictionary):
+            return 0
+        items = list(name_tree_items(tree))
+    except Exception:
+        return 0
+    taken = {bytes(k) for k, _v in items if isinstance(k, pikepdf.String)}
+    renames: dict[bytes, bytes] = {}
+    serial = 0
+    for key, _value in items:
+        if not isinstance(key, pikepdf.String):
+            continue
+        old = bytes(key)
+        if old in renames or not finder(old):
+            continue
+        while True:
+            serial += 1
+            new = f"redacted-{serial}".encode()
+            if new not in taken:
+                break
+        taken.add(new)
+        renames[old] = new
+    if not renames:
+        return 0
+
+    named = sorted(((renames.get(bytes(k), bytes(k)), v) for k, v in items
+                    if isinstance(k, pikepdf.String)), key=lambda kv: kv[0])
+    flat = pikepdf.Array()
+    for key, value in named:
+        flat.append(pikepdf.String(key))
+        flat.append(value)
+    for key, value in items:                 # anything that was not a name: as found
+        if not isinstance(key, pikepdf.String):
+            flat.append(key)
+            flat.append(value)
+    tree["/Names"] = flat
+    for stale in ("/Kids", "/Limits"):
+        if stale in tree:
+            del tree[stale]
+
+    for _path, obj in list(walk_objects(pdf, WalkStatus())):
+        for key in ("/Dest", "/D"):
+            try:
+                value = obj.get(key)
+                if isinstance(value, pikepdf.String) and bytes(value) in renames:
+                    obj[key] = pikepdf.String(renames[bytes(value)])
+            except Exception:
+                continue
+    return len(renames)
 
 
 def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
@@ -1591,10 +1778,30 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
     Metadata that carries no term is left exactly as found. Mirrors
     pdf_verify._pikepdf_scan's surface set so the scrub cleans exactly where
     verification looks.
+
+    Beyond those, the rules that let an ordinary file pass the verifier's
+    whole-file term sweep (#119), each counted under its own key:
+
+      * ``structure`` — structure-tree text (/Alt, /ActualText, a title)
+        holding a term becomes the marker, as a bookmark title does;
+      * ``layers`` — so does a layer's name;
+      * ``piece_info`` — an application's private data (/PieceInfo) with a
+        term anywhere under it is deleted whole;
+      * ``xmp`` / ``metadata`` — a metadata stream holding a term in any
+        encoding is deleted, on the catalog or anywhere else. One that
+        cannot be read is deleted too: it cannot be shown free of the term;
+      * ``scripts`` — a script whose text holds a term is removed, the way
+        Sanitize removes scripts (pdf_analyze.remove_scripts);
+      * ``destinations`` — a named destination whose name holds a term is
+        renamed, and the links that use it follow.
+
+    There is no rule for anything else. A term left anywhere else is found
+    by the sweep, and the redaction is refused.
     """
     if not terms:
         return {}
     match = _make_term_matcher(terms, case_sensitive)
+    finder = TermFinder(terms, case_sensitive)
     counts: dict[str, int] = {}
 
     def bump(key: str, n: int = 1):
@@ -1608,14 +1815,14 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
             info = pdf.trailer.get("/Info")
             if info is not None:
                 hit = sum(1 for k in info.keys()
-                          if match(str(info[k])))
+                          if match(info[k]))
                 if hit:
                     del pdf.trailer["/Info"]
                     bump("docinfo", hit)
         except Exception:
             pass
 
-        # -- XMP (D3 wholesale) ----------------------------------------
+        # -- metadata streams, wherever they hang (D3 wholesale) --------
         # Delete the stream itself. Never clear a parsed view and let
         # pikepdf write it back: its recovering parser accepts malformed
         # packets it cannot edit, so clear()-then-save re-emits the
@@ -1623,10 +1830,24 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
         # metadata context is a write too — it invents a packet where the
         # file had none and rewrites docinfo from it.
         try:
-            md = pdf.Root.get("/Metadata")
-            if md is not None and any(match(v) for v in _xmp_text_views(pdf, md)):
-                del pdf.Root["/Metadata"]
-                bump("xmp")
+            catalog_md = pdf.Root.get("/Metadata")
+            catalog_id = (tuple(catalog_md.objgen)
+                          if isinstance(catalog_md, pikepdf.Stream) else None)
+
+            def metadata_hit(stream) -> bool:
+                # The catalog packet is also read the ways XMP is: decoded,
+                # and through pikepdf's parser, which resolves entities.
+                if (tuple(stream.objgen) == catalog_id
+                        and any(match(v) for v in _xmp_text_views(pdf, stream))):
+                    return True
+                try:
+                    return finder(stream.read_bytes())
+                except Exception:
+                    return True      # unreadable: cannot be shown free of it
+
+            gone = remove_metadata_streams(pdf, metadata_hit)
+            bump("xmp", int(catalog_id in gone))
+            bump("metadata", len(gone) - int(catalog_id in gone))
         except Exception:
             pass
 
@@ -1642,6 +1863,41 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
             bump_map = _scrub_objects(pdf, match)
             for k, v in bump_map.items():
                 bump(k, v)
+        except Exception:
+            pass
+
+        # -- structure text and layer names (D2 whole value) -----------
+        try:
+            tree = pdf.Root.get("/StructTreeRoot")
+            if isinstance(tree, pikepdf.Dictionary):
+                bump("structure", _redact_strings(tree, match, _STRUCTURE_WAYS_OUT))
+        except Exception:
+            pass
+        try:
+            layers = pdf.Root.get("/OCProperties")
+            if isinstance(layers, pikepdf.Dictionary):
+                bump("layers", _redact_strings(layers, match))
+        except Exception:
+            pass
+
+        # -- private application data, scripts, named destinations -----
+        try:
+            bump("piece_info", _scrub_piece_info(pdf, finder))
+        except Exception:
+            pass
+        try:
+            def script_hit(js) -> bool:
+                if isinstance(js, pikepdf.String):
+                    return finder(bytes(js))
+                try:
+                    return finder(js.read_bytes())
+                except Exception:
+                    return True      # unreadable: cannot be shown free of it
+            bump("scripts", remove_scripts(pdf, script_hit))
+        except Exception:
+            pass
+        try:
+            bump("destinations", _rename_destinations(pdf, finder))
         except Exception:
             pass
 
@@ -1741,7 +1997,7 @@ def _scrub_objects(pdf, match) -> dict[str, int]:
                 continue
             for key in ("/Contents", "/T", "/Subj"):
                 try:
-                    if key in annot and match(str(annot[key])):
+                    if key in annot and match(annot[key]):
                         del annot[key]
                         bump("annotations")
                 except Exception:
@@ -1760,7 +2016,7 @@ def _scrub_objects(pdf, match) -> dict[str, int]:
         except Exception:
             continue
         try:
-            if "/V" in obj and match(str(obj["/V"])):
+            if "/V" in obj and match(obj["/V"]):
                 obj["/V"] = pikepdf.String("")
                 if "/AP" in obj:
                     del obj["/AP"]      # drop stale appearance stream
@@ -1783,7 +2039,7 @@ def _scrub_action_uri(action, match, depth: int = 0) -> int:
     n = 0
     for key in ("/URI", "/F"):
         try:
-            if key in action and match(str(action[key])):
+            if key in action and match(action[key]):
                 del action[key]
                 n += 1
         except Exception:
@@ -1913,6 +2169,11 @@ def _refusal_message(failed) -> str:
     if failed and all(c.id == "redaction.file_id" for c in failed):
         return ("Redaction could not be verified: the output would still "
                 "carry the source file's identifier.")
+    if failed and all(c.unevaluated for c in failed):
+        # Nothing was found: something could not be read, which is a
+        # different thing to tell the user (#119).
+        return ("Redaction could not be verified: part of the output could "
+                "not be read, so it could not be checked.")
     return ("Redaction could not be verified: sensitive content is still "
             "present in the output.")
 
@@ -1954,6 +2215,12 @@ def redact_pdf(
     -- docinfo, XMP, bookmark titles, annotation text, form-field values,
     link URIs, embedded-file names (#99) -- so a term surviving only in the
     /Title (never on any page) is still removed and still counts as a hit.
+    So are structure-tree text, layer names, an application's private data,
+    metadata streams on any object, scripts and named destinations (#119;
+    see _scrub_document_surfaces). A term anywhere else in the file -- an
+    attachment's contents, XFA form data, a stream held by a private key --
+    has no rule: the verifier's whole-file sweep finds it and the run is
+    refused, never passed.
 
     Verify, then commit. The redacted candidate is written to a temp file
     beside output_path, given a fresh content-derived trailer /ID as its last
