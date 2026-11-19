@@ -631,6 +631,597 @@ class TestWhatHasNoRuleIsRefused:
         assert ei.value.flatten_pages is None and not os.path.exists(out)
 
 
+# ── R1b: the places real files keep a term ───────────────────────────────
+#
+#  Each of these was a real file that R1 refused: the term was still in it,
+#  somewhere the scrub had no rule for. The fixtures are built by hand to
+#  the same shape.
+
+
+def _annot(pdf, subtype=Name.Text, **entries):
+    """An annotation well away from the page's text, so the page search
+    never meets it."""
+    return pdf.make_indirect(Dictionary(Type=Name.Annot, Subtype=subtype,
+                                        Rect=[300, 300, 320, 320], **entries))
+
+
+def _on_page(pdf, *annots) -> None:
+    page = pdf.pages[0].obj
+    if "/Annots" not in page:
+        page["/Annots"] = Array()
+    for a in annots:
+        page["/Annots"].append(a)
+
+
+def _field_with_kid(pdf, *, hidden: bool = False, **parent_entries):
+    """A text field that has no widget of its own, with one child widget on
+    page 1. Nothing of the parent is drawn anywhere: it is reached through
+    the field tree only. *hidden* makes the widget hidden and zero-size, for
+    a field with a value: PyMuPDF 2 draws a visible widget's value where
+    1.27 does not, and the page search then finds it and removes the widget
+    before the scrub ever sees the field."""
+    page = pdf.pages[0].obj
+    parent = pdf.make_indirect(Dictionary(FT=Name.Tx, T=String("person"), **parent_entries))
+    kid = pdf.make_indirect(Dictionary(Type=Name.Annot, Subtype=Name.Widget, T=String("first"),
+                                       Rect=[0, 0, 0, 0] if hidden else [300, 500, 400, 520],
+                                       P=page, Parent=parent))
+    if hidden:
+        kid["/F"] = 2
+    parent["/Kids"] = Array([kid])
+    _on_page(pdf, kid)
+    if "/AcroForm" not in pdf.Root:
+        pdf.Root["/AcroForm"] = Dictionary(Fields=Array())
+    pdf.Root["/AcroForm"]["/Fields"].append(parent)
+    return parent, kid
+
+
+def _fields(pdf) -> dict:
+    """{partial name: field dictionary} for the whole field tree of *pdf*."""
+    found, stack = {}, list(pdf.Root["/AcroForm"]["/Fields"])
+    while stack:
+        f = stack.pop()
+        found[str(f.get("/T"))] = f
+        stack.extend(f.get("/Kids", []))
+    return found
+
+
+def _held_by_structure(pdf, obj) -> None:
+    """Reference *obj* from the structure tree and from nowhere else — the
+    state an annotation is left in when redaction takes it off its page."""
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    elem = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Link, P=root))
+    elem["/K"] = Array([Dictionary(Type=Name.OBJR, Obj=obj)])
+    root["/K"] = Array([elem])
+    pdf.Root["/StructTreeRoot"] = root
+
+
+@pytest.mark.integration
+class TestRichText:
+    """(a) The rich-text twin of a note's or a field's plain text."""
+
+    @pytest.mark.parametrize("as_stream", [False, True], ids=["a string", "a stream"])
+    def test_a_notes_rich_text_goes_with_its_plain_text(self, tmp_path, as_stream):
+        def plant(pdf):
+            rich = f"<body><p>ask {TERM} first</p></body>"
+            _on_page(pdf, _annot(pdf, Contents=String(f"ask {TERM} first"),
+                                 RC=pdf.make_stream(rich.encode()) if as_stream else String(rich)))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("rich_text") == 1
+        with pikepdf.open(out) as pdf:
+            note = pdf.pages[0].obj["/Annots"][0]                # the note itself stays
+            assert "/RC" not in note and "/Contents" not in note
+
+    def test_a_fields_rich_value_goes_with_its_value(self, tmp_path):
+        res, out = _redact(tmp_path, lambda pdf: _field_with_kid(
+            pdf, hidden=True, V=String(f"{TERM} Ltd"),
+            RV=String(f"<body><p>{TERM} Ltd</p></body>")))
+        assert res.surface_counts.get("rich_text") == 1
+        assert res.surface_counts.get("form_fields") == 1
+        with pikepdf.open(out) as pdf:
+            assert "/RV" not in _fields(pdf)["person"]
+
+    def test_rich_text_without_the_term_is_kept(self, tmp_path):
+        res, out = _redact(tmp_path, lambda pdf: _on_page(pdf, _annot(
+            pdf, Contents=String("see page 4"), RC=String("<body><p>see page 4</p></body>"))))
+        assert "rich_text" not in res.surface_counts
+        with pikepdf.open(out) as pdf:
+            assert "/RC" in pdf.pages[0].obj["/Annots"][0]
+
+
+@pytest.mark.integration
+class TestFormFieldText:
+    """(b) What a form field says about itself, wherever the field sits in
+    the field tree — not only what a page's widget shows."""
+
+    def test_tooltip_mapping_name_default_options_and_caption_become_the_marker(self, tmp_path):
+        def plant(pdf):
+            _parent, kid = _field_with_kid(
+                pdf, TU=String(f"Name of the {TERM} contact"), TM=String(f"{TERM}_export"),
+                DV=String(f"{TERM} default"),
+                Opt=Array([String("one"), Array([String("x"), String(f"{TERM} two")])]))
+            kid["/MK"] = Dictionary(CA=String(f"Ask {TERM}"), R=90)
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("field_text") == 5
+        with pikepdf.open(out) as pdf:
+            parent, kid = _fields(pdf)["person"], _fields(pdf)["first"]
+            assert [str(parent[k]) for k in ("/TU", "/TM", "/DV")] == [MARKER] * 3
+            assert str(parent["/Opt"][0]) == "one" and str(parent["/Opt"][1][0]) == "x"
+            assert str(parent["/Opt"][1][1]) == MARKER
+            assert str(kid["/MK"]["/CA"]) == MARKER and kid["/MK"]["/R"] == 90
+
+    def test_a_field_named_for_the_term_is_renamed_to_something_neutral(self, tmp_path):
+        def plant(pdf):
+            parent, _kid = _field_with_kid(pdf)
+            parent["/T"] = String(f"{TERM}_form")
+            pdf.Root["/AcroForm"]["/Fields"].append(pdf.make_indirect(
+                Dictionary(FT=Name.Tx, T=String("field-1"))))        # the obvious name is taken
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("field_names") == 1
+        with pikepdf.open(out) as pdf:
+            names = sorted(_fields(pdf))
+            assert len(names) == len(set(names)) == 3
+            assert "field-1" in names and "first" in names          # the others keep theirs
+            assert not any(TERM.lower() in n.lower() for n in names)
+
+    def test_an_appearance_that_draws_what_was_redacted_goes_too(self, tmp_path):
+        """A hidden button: its caption is in /MK and drawn by its /AP. The
+        page search never sees it; the caption is redacted, and the stale
+        appearance must not keep it."""
+        def plant(pdf):
+            _on_page(pdf, pdf.make_indirect(Dictionary(
+                Type=Name.Annot, Subtype=Name.Widget, FT=Name.Btn, Ff=65536, T=String("go"),
+                Rect=[0, 0, 0, 0], F=2, MK=Dictionary(CA=String(f"Mail {TERM}")),
+                AP=Dictionary(N=_form(pdf, f"Mail {TERM}")))))
+            pdf.Root["/AcroForm"] = Dictionary(Fields=Array([pdf.pages[0].obj["/Annots"][0]]))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("field_text") == 1
+        with pikepdf.open(out) as pdf:
+            button = _fields(pdf)["go"]
+            assert str(button["/MK"]["/CA"]) == MARKER and "/AP" not in button
+
+    def test_a_parents_value_takes_its_widgets_appearances_with_it(self, tmp_path):
+        def plant(pdf):
+            _parent, kid = _field_with_kid(pdf, hidden=True, V=String(f"{TERM} Ltd"))
+            kid["/AP"] = Dictionary(N=_form(pdf, f"{TERM} Ltd"))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("form_fields") == 1
+        with pikepdf.open(out) as pdf:
+            assert "/AP" not in _fields(pdf)["first"]
+
+    def test_field_text_without_the_term_is_left_alone(self, tmp_path):
+        res, out = _redact(tmp_path, lambda pdf: _field_with_kid(
+            pdf, TU=String("Your full name"), Opt=Array([String("one"), String("two")])))
+        assert set(res.surface_counts) == {"page_content"}
+        with pikepdf.open(out) as pdf:
+            assert str(_fields(pdf)["person"]["/TU"]) == "Your full name"
+
+
+def _figure(pdf, **ptex):
+    """A form XObject painted on page 1, with pdfTeX's record of the file it
+    was included from."""
+    page = pdf.pages[0].obj
+    figure = _form(pdf, "an included figure")
+    for key, value in ptex.items():
+        figure[f"/PTEX.{key}"] = value
+    page["/Resources"]["/XObject"] = Dictionary(Fig=figure)
+    page["/Contents"] = pdf.make_stream(
+        page["/Contents"].read_bytes() + b"\nq 1 0 0 1 72 400 cm /Fig Do Q")
+
+
+def _painted_forms(pdf) -> list:
+    xobjects = pdf.pages[0].obj["/Resources"].get("/XObject", {})
+    return [xobjects[k] for k in xobjects.keys()]
+
+
+@pytest.mark.integration
+class TestPdfTexEntries:
+    """(c) pdfTeX records, on every figure it includes, the name of the file
+    it came from and that file's own document information."""
+
+    def test_entries_holding_the_term_are_deleted_and_the_figure_stays(self, tmp_path):
+        def plant(pdf):
+            info = pdf.make_indirect(Dictionary(Title=String(f"{TERM} site plan"),
+                                                Producer=String("pdfTeX-1.40")))
+            _figure(pdf, FileName=String(f"./figures/{TERM}-plan.pdf"), PageNumber=1,
+                    InfoDict=info)
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("pdftex") == 2
+        with pikepdf.open(out) as pdf:
+            (figure,) = _painted_forms(pdf)
+            assert sorted(k for k in figure.keys() if k.startswith("/PTEX.")) == [
+                "/PTEX.PageNumber"]
+        with fitz.open(out) as doc:
+            assert "an included figure" in doc[0].get_text()
+
+    def test_entries_without_the_term_are_kept(self, tmp_path):
+        res, out = _redact(tmp_path, lambda pdf: _figure(
+            pdf, FileName=String("./figures/plan.pdf"), PageNumber=1))
+        assert "pdftex" not in res.surface_counts
+        with pikepdf.open(out) as pdf:
+            assert "/PTEX.FileName" in _painted_forms(pdf)[0]
+
+
+@pytest.mark.integration
+class TestOffThePage:
+    """(d) Redaction takes an annotation under a box off its page, but a
+    tagged file's structure tree still points at it — and at everything it
+    says. Such a dictionary is scrubbed like one that is on a page."""
+
+    @pytest.mark.parametrize("what", ["a link", "a note", "a form field", "a scripted link"])
+    def test_what_the_structure_tree_still_points_to_is_scrubbed(self, tmp_path, what):
+        def plant(pdf):
+            if what == "a link":
+                stale = _annot(pdf, Name.Link, A=Dictionary(
+                    S=Name.URI, URI=String(f"https://{TERM}.example/about")))
+            elif what == "a note":
+                stale = _annot(pdf, Contents=String(f"ask {TERM}"), Subj=String(f"re {TERM}"),
+                               RC=String(f"<body><p>ask {TERM}</p></body>"))
+            elif what == "a form field":
+                stale = _annot(pdf, Name.Widget, FT=Name.Tx, T=String(f"{TERM}_id"),
+                               TU=String(f"id of {TERM}"), V=String(f"{TERM}-0001"))
+            else:
+                stale = _annot(pdf, Name.Link, A=Dictionary(
+                    S=Name.JavaScript, JS=String(f"app.launchURL('https://{TERM}.example');")))
+            _held_by_structure(pdf, stale)
+        res, out = _redact(tmp_path, plant)
+        assert sum(n for key, n in res.surface_counts.items() if key != "page_content") >= 1
+
+    def test_a_link_under_the_redacted_text_itself(self, tmp_path):
+        """The whole chain as it happens: the link sits over the text, the
+        box takes it off the page, the structure tree keeps it alive."""
+        def plant(pdf):
+            link = pdf.make_indirect(Dictionary(
+                Type=Name.Annot, Subtype=Name.Link, Rect=[60, 705, 420, 745],
+                A=Dictionary(S=Name.URI, URI=String(f"https://{TERM}.example/"))))
+            _on_page(pdf, link)
+            _held_by_structure(pdf, link)
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("links", 0) >= 1
+
+
+@pytest.mark.integration
+class TestLinksEverywhere:
+    """(e) A web address holding a term is removed wherever its action
+    hangs, the way Sanitize removes that one action."""
+
+    @pytest.mark.parametrize("home", ["a page link", "a bookmark", "the open action",
+                                      "after a harmless action", "a form field"])
+    def test_the_action_is_removed(self, tmp_path, home):
+        def plant(pdf):
+            uri = Dictionary(S=Name.URI, URI=String(f"https://{TERM}.example/pricing"))
+            if home == "a page link":
+                _on_page(pdf, _annot(pdf, Name.Link, A=uri),
+                         _annot(pdf, Name.Link, A=Dictionary(
+                             S=Name.URI, URI=String("https://other.example/"))))
+            elif home == "a bookmark":
+                outlines = pdf.make_indirect(Dictionary(Count=1))
+                item = pdf.make_indirect(Dictionary(Title=String("Prices"), Parent=outlines,
+                                                    A=uri))
+                outlines["/First"] = outlines["/Last"] = item
+                pdf.Root["/Outlines"] = outlines
+            elif home == "the open action":
+                pdf.Root["/OpenAction"] = uri
+            elif home == "after a harmless action":
+                pdf.Root["/OpenAction"] = Dictionary(S=Name.Named, N=Name.NextPage, Next=uri)
+            else:
+                pdf.Root["/AcroForm"] = Dictionary(Fields=Array([pdf.make_indirect(Dictionary(
+                    T=String("site"), FT=Name.Btn, Ff=65536, A=uri))]))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("links") == 1
+        with pikepdf.open(out) as pdf:
+            if home == "a page link":
+                # The link whose action went is off the page, as Sanitize leaves it.
+                annots = pdf.pages[0].obj["/Annots"]
+                assert [str(a["/A"]["/URI"]) for a in annots] == ["https://other.example/"]
+            elif home == "after a harmless action":
+                assert str(pdf.Root["/OpenAction"]["/N"]) == "/NextPage"
+                assert "/Next" not in pdf.Root["/OpenAction"]
+            elif home == "a bookmark":
+                assert "/A" not in pdf.Root["/Outlines"]["/First"]
+
+
+@pytest.mark.integration
+class TestPageLabels:
+    """(f) A page label's prefix is text a viewer shows beside the page."""
+
+    def test_a_prefix_holding_the_term_becomes_the_marker(self, tmp_path):
+        def plant(pdf):
+            pdf.Root["/PageLabels"] = Dictionary(Kids=Array([pdf.make_indirect(Dictionary(
+                Limits=Array([0, 0]),
+                Nums=Array([0, Dictionary(S=Name.D, P=String(f"{TERM}-"), St=1)])))]))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("page_labels") == 1
+        with pikepdf.open(out) as pdf:
+            label = pdf.Root["/PageLabels"]["/Kids"][0]["/Nums"][1]
+            assert str(label["/P"]) == MARKER and str(label["/S"]) == "/D"
+
+    def test_a_prefix_without_the_term_is_kept(self, tmp_path):
+        res, out = _redact(tmp_path, lambda pdf: pdf.Root.__setitem__(
+            "/PageLabels", Dictionary(Nums=Array([0, Dictionary(P=String("A-"))]))))
+        assert "page_labels" not in res.surface_counts
+        with pikepdf.open(out) as pdf:
+            assert str(pdf.Root["/PageLabels"]["/Nums"][1]["/P"]) == "A-"
+
+
+def _xfa(pdf, *, single: bool = False, data: str = f"<name>{TERM}</name>", fields: int = 1):
+    packets = [pdf.make_stream(b"<template>layout</template>"),
+               pdf.make_stream(f"<datasets>{data}</datasets>".encode())]
+    xfa = packets[1] if single else Array(
+        [String("template"), packets[0], String("datasets"), packets[1]])
+    pdf.Root["/AcroForm"] = Dictionary(XFA=xfa, Fields=Array([
+        pdf.make_indirect(Dictionary(FT=Name.Tx, T=String(f"f{n}"))) for n in range(fields)]))
+
+
+@pytest.mark.integration
+class TestXfa:
+    """(g) XFA form data cannot be redacted inside its packets. Where the
+    form also exists as ordinary fields, the XFA entry is dropped and the
+    form falls back to them."""
+
+    @pytest.mark.parametrize("single", [False, True], ids=["an array of packets", "one stream"])
+    def test_a_form_with_fields_loses_its_xfa(self, tmp_path, single):
+        res, out = _redact(tmp_path, lambda pdf: _xfa(pdf, single=single))
+        assert res.surface_counts.get("xfa") == 1
+        with pikepdf.open(out) as pdf:
+            form = pdf.Root["/AcroForm"]
+            assert "/XFA" not in form and len(form["/Fields"]) == 1
+
+    def test_a_form_that_is_only_xfa_is_refused_in_plain_words(self, tmp_path):
+        src = _with_term_on_page(tmp_path / "src.pdf", lambda pdf: _xfa(pdf, fields=0))
+        out = str(tmp_path / "out.pdf")
+        with pytest.raises(ValueError, match="XFA") as ei:
+            redact_pdf(src, out, search_terms=[TERM])
+        assert "cannot be term-redacted" in str(ei.value)
+        assert str(tmp_path) not in str(ei.value)
+        assert not os.path.exists(out) and os.listdir(tmp_path) == ["src.pdf"]
+
+    def test_xfa_without_the_term_is_kept(self, tmp_path):
+        res, out = _redact(tmp_path, lambda pdf: _xfa(pdf, data="<name>nobody</name>"))
+        assert "xfa" not in res.surface_counts
+        with pikepdf.open(out) as pdf:
+            assert len(pdf.Root["/AcroForm"]["/XFA"]) == 4
+
+
+def _filespec(pdf, name: str, data: bytes, desc: str = ""):
+    payload = pdf.make_stream(data)
+    payload["/Type"] = Name.EmbeddedFile
+    spec = Dictionary(Type=Name.Filespec, F=String(name), UF=String(name),
+                      EF=Dictionary(F=payload))
+    if desc:
+        spec["/Desc"] = String(desc)
+    return pdf.make_indirect(spec)
+
+
+def _attach(pdf, *specs) -> None:
+    """List *specs* in the catalog's attachment name tree, sorted."""
+    entries = Array()
+    for spec in sorted(specs, key=lambda s: bytes(s["/F"])):
+        entries.append(String(bytes(spec["/F"])))
+        entries.append(spec)
+    names = pdf.Root.get("/Names")
+    if names is None:
+        names = pdf.Root["/Names"] = Dictionary()
+    names["/EmbeddedFiles"] = Dictionary(Names=entries)
+
+
+def _attached(pdf) -> list:
+    tree = pdf.Root.get("/Names", {}).get("/EmbeddedFiles")
+    return [] if tree is None else [str(k) for k, _v in pdf_analyze.name_tree_items(tree)]
+
+
+@pytest.mark.integration
+class TestAttachments:
+    """(h) An attachment whose name, description or bytes hold a term is
+    removed whole. The others stay."""
+
+    @pytest.mark.parametrize("where", ["its contents", "its description", "its name"])
+    def test_an_attachment_holding_the_term_is_removed_whole(self, tmp_path, where):
+        def plant(pdf):
+            _attach(pdf, _filespec(pdf, "budget.csv", b"a,b\n1,2\n"), _filespec(
+                pdf, f"{TERM}-minutes.txt" if where == "its name" else "minutes.txt",
+                f"minutes mention {TERM}".encode() if where == "its contents" else b"minutes",
+                f"notes for {TERM}" if where == "its description" else ""))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("embedded_files") == 1
+        with pikepdf.open(out) as pdf:
+            assert _attached(pdf) == ["budget.csv"]
+
+    def test_one_listed_only_as_an_associated_file(self, tmp_path):
+        def plant(pdf):
+            pdf.Root["/AF"] = Array([_filespec(pdf, f"{TERM}-source.xml", b"<data/>"),
+                                     _filespec(pdf, "schema.xsd", b"<xs/>")])
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("embedded_files") == 1
+        with pikepdf.open(out) as pdf:
+            assert [str(s["/F"]) for s in pdf.Root["/AF"]] == ["schema.xsd"]
+
+    def test_one_carried_by_a_file_attachment_annotation(self, tmp_path):
+        def plant(pdf):
+            _on_page(pdf, _annot(pdf, Name.FileAttachment, FS=_filespec(
+                pdf, "scan.txt", f"scan of the {TERM} contract".encode())),
+                     _annot(pdf, Contents=String("unrelated note")))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("embedded_files") == 1
+        with pikepdf.open(out) as pdf:
+            assert [str(a["/Subtype"]) for a in pdf.pages[0].obj["/Annots"]] == ["/Text"]
+
+    def test_a_name_tree_with_limits_keeps_no_trace_of_the_name(self, tmp_path):
+        def plant(pdf):
+            def leaf(*specs):
+                entries = Array()
+                for spec in specs:
+                    entries.append(String(bytes(spec["/F"])))
+                    entries.append(spec)
+                return pdf.make_indirect(Dictionary(Names=entries, Limits=Array(
+                    [String(bytes(specs[0]["/F"])), String(bytes(specs[-1]["/F"]))])))
+            first = leaf(_filespec(pdf, f"{TERM}-a.txt", b"x"), _filespec(pdf, "b.txt", b"x"))
+            second = leaf(_filespec(pdf, "c.txt", b"x"),
+                          _filespec(pdf, "d.txt", f"about {TERM}".encode()))
+            pdf.Root["/Names"] = Dictionary(EmbeddedFiles=Dictionary(Kids=Array([first, second])))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("embedded_files") == 2
+        with pikepdf.open(out) as pdf:
+            assert _attached(pdf) == ["b.txt", "c.txt"]
+
+    def test_a_compressed_attachment_is_not_opened(self, tmp_path):
+        """The limit, on the record: an attachment is searched as its raw
+        bytes. A term inside a zip, a docx or an xlsx is compressed there
+        and is not found; the attachment stays."""
+        import io
+        import zipfile
+        packed = io.BytesIO()
+        with zipfile.ZipFile(packed, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("notes.txt", f"minutes mention {TERM} " * 40)
+        assert TERM.encode() not in packed.getvalue()     # the fixture is what it claims
+        src = _with_term_on_page(tmp_path / "src.pdf", lambda pdf: _attach(
+            pdf, _filespec(pdf, "archive.zip", packed.getvalue())))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[TERM])
+        assert res.verification["verified"] is True and "embedded_files" not in res.surface_counts
+        with pikepdf.open(out) as pdf:
+            assert _attached(pdf) == ["archive.zip"]
+
+
+def _signed(pdf, *, signer: str = "A. Example", cert: bytes = b"CN=A. Example", draws: str = ""):
+    """An invisible signature field on page 1; returns (field, signature)."""
+    page = pdf.pages[0].obj
+    signature = pdf.make_indirect(Dictionary(
+        Type=Name.Sig, Filter=Name("/Adobe.PPKLite"), SubFilter=Name("/adbe.pkcs7.detached"),
+        Name=String(signer), Reason=String("approved"), Location=String("head office"),
+        M=String("D:20250101000000Z"), ByteRange=Array([0, 10, 20, 30]),
+        Contents=String(b"\x30\x82\x01\x00" + cert + b"\x00" * 16)))
+    field = pdf.make_indirect(Dictionary(
+        Type=Name.Annot, Subtype=Name.Widget, FT=Name.Sig, T=String("Signature1"),
+        Rect=[0, 0, 0, 0], F=2, P=page, V=signature))
+    if draws:
+        field["/AP"] = Dictionary(N=_form(pdf, draws))
+    _on_page(pdf, field)
+    pdf.Root["/AcroForm"] = Dictionary(Fields=Array([field]), SigFlags=3)
+    return field, signature
+
+
+@pytest.mark.integration
+class TestSignatures:
+    """(i) A signature that names the term cannot keep it: its value is
+    removed and the field is left unsigned. Redaction invalidates a
+    signature in any case."""
+
+    @pytest.mark.parametrize("where", ["the signer's name", "the certificate bytes"])
+    def test_a_signature_holding_the_term_is_removed_and_the_field_stays(self, tmp_path, where):
+        def plant(pdf):
+            if where == "the signer's name":
+                _signed(pdf, signer=f"{TERM} Legal", draws=f"Digitally signed by {TERM} Legal")
+            else:
+                _signed(pdf, cert=f"CN={TERM} Legal, O=Example".encode())
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("signatures") == 1
+        with pikepdf.open(out) as pdf:
+            field = _fields(pdf)["Signature1"]
+            assert "/V" not in field and "/AP" not in field
+            assert str(field["/FT"]) == "/Sig"                   # the field is still there
+
+    def test_a_usage_rights_signature(self, tmp_path):
+        def plant(pdf):
+            pdf.Root["/Perms"] = Dictionary(UR3=pdf.make_indirect(Dictionary(
+                Type=Name.Sig, Filter=Name("/Adobe.PPKLite"), Name=String(f"{TERM} Reader Rights"),
+                Contents=String(b"\x30\x82" + b"\x00" * 16), ByteRange=Array([0, 1, 2, 3]))))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("signatures") == 1
+        with pikepdf.open(out) as pdf:
+            assert "/Perms" not in pdf.Root
+
+    def test_a_signature_without_the_term_is_left_alone(self, tmp_path):
+        res, out = _redact(tmp_path, lambda pdf: _signed(pdf))
+        assert "signatures" not in res.surface_counts
+        with pikepdf.open(out) as pdf:
+            assert str(_fields(pdf)["Signature1"]["/V"]["/Name"]) == "A. Example"
+
+
+@pytest.mark.integration
+class TestStillRefused:
+    """The known limits, on the record: places with no rule. The run is
+    refused, never passed."""
+
+    @pytest.mark.parametrize("plant", [
+        lambda pdf: pdf.Root.__setitem__("/Names", Dictionary(URLS=Dictionary(Names=Array(
+            [String(f"http://{TERM}.example/"), Dictionary(Note=String("captured"))])))),
+        lambda pdf: pdf.Root.__setitem__("/OutputIntents", Array([Dictionary(
+            Type=Name.OutputIntent, S=Name.GTS_PDFA1,
+            OutputConditionIdentifier=String(f"{TERM} press profile"))])),
+        lambda pdf: pdf.Root.__setitem__("/Names", Dictionary(EmbeddedFiles=Dictionary(
+            Names=Array([String("broken.bin"), _undecodable_attachment(pdf)])))),
+    ], ids=["a web-capture name", "an output intent's string", "an attachment that cannot be read"])
+    def test_it_is_refused_and_nothing_is_written(self, tmp_path, plant):
+        src = _with_term_on_page(tmp_path / "src.pdf", plant)
+        out = str(tmp_path / "out.pdf")
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, out, search_terms=[TERM])
+        assert ei.value.flatten_pages is None and not os.path.exists(out)
+
+
+@pytest.mark.integration
+class TestReplacementTextNeverHoldsTheTerm:
+    """What the scrub writes in a term's place must not hold a term itself.
+    "Ted" is inside "[redacted]"; and a real file whose fields are called
+    "Field 1" and "Field 2" was renamed, for the word "Field", to field-1."""
+
+    def test_a_term_inside_the_marker_gets_another_marker(self, tmp_path):
+        def plant(pdf):
+            page = pdf.pages[0].obj
+            root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+            root["/K"] = Array([pdf.make_indirect(Dictionary(
+                Type=Name.StructElem, S=Name.Figure, P=root, Pg=page, Alt=String("photo of Ted")))])
+            pdf.Root["/StructTreeRoot"] = root
+            outlines = pdf.make_indirect(Dictionary(Count=1))
+            item = pdf.make_indirect(Dictionary(Title=String("Ted's report"), Parent=outlines,
+                                                Dest=Array([page, Name.Fit])))
+            outlines["/First"] = outlines["/Last"] = item
+            pdf.Root["/Outlines"] = outlines
+        src = _pdf(tmp_path / "src.pdf", plant, body="a line about Ted here")
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=["Ted"])
+        assert res.verification["verified"] is True
+        assert res.surface_counts.get("bookmarks") == 1 and res.surface_counts.get("structure") == 1
+        with pikepdf.open(out) as pdf:
+            assert str(pdf.Root["/Outlines"]["/First"]["/Title"]) == "[removed]"
+            assert str(pdf.Root["/StructTreeRoot"]["/K"][0]["/Alt"]) == "[removed]"
+
+    def test_a_field_is_not_renamed_to_a_name_holding_the_term(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: pdf.Root.__setitem__(
+            "/AcroForm", Dictionary(Fields=Array([pdf.make_indirect(Dictionary(
+                FT=Name.Tx, T=String(f"Field {n}"))) for n in (1, 2)]))),
+            body="a line about the Field here")
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=["Field"])
+        assert res.verification["verified"] is True and res.surface_counts.get("field_names") == 2
+        with pikepdf.open(out) as pdf:
+            names = sorted(_fields(pdf))
+            assert len(set(names)) == 2 and not any("field" in n.lower() for n in names)
+
+    def test_a_destination_is_not_renamed_to_a_name_holding_the_term(self, tmp_path):
+        def plant(pdf):
+            page = pdf.pages[0].obj
+            pdf.Root["/Names"] = Dictionary(Dests=pdf.make_indirect(Dictionary(Names=Array(
+                [String("redacted-notes"), Array([page, Name.Fit])]))))
+            _on_page(pdf, _annot(pdf, Name.Link, Dest=String("redacted-notes")))
+        src = _pdf(tmp_path / "src.pdf", plant, body="a redacted line here")
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=["redacted"])
+        assert res.verification["verified"] is True and res.surface_counts.get("destinations") == 1
+        with pikepdf.open(out) as pdf:
+            key = bytes(pdf.Root["/Names"]["/Dests"]["/Names"][0])
+            assert b"redacted" not in key
+            assert bytes(pdf.pages[0].obj["/Annots"][0]["/Dest"]) == key
+
+
+def _undecodable_attachment(pdf):
+    payload = pdf.make_stream(b"placeholder")
+    payload.write(b"this is not deflate data", filter=Name.FlateDecode)
+    payload["/Type"] = Name.EmbeddedFile
+    return pdf.make_indirect(Dictionary(Type=Name.Filespec, F=String("broken.bin"),
+                                        EF=Dictionary(F=payload)))
+
+
 # ── D6: each stream of a page is read once ───────────────────────────────
 
 

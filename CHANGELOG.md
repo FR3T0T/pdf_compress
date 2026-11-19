@@ -243,13 +243,64 @@
   scrubs now match the way the verifier does, so a term of two words is
   found in a note that breaks the line between them. **A term anywhere else
   is not scrubbed: the run is refused.** Of 524 real PDFs whose redaction of
-  one word of their own text used to finish verified, 41 are now refused,
-  every one because the word is still in the file: in annotation rich text
-  (`/RC`), form-field tooltips, names, captions and option lists, XFA form
-  data, pdfTeX's record of an included file's name, an attachment's contents
-  or name, and in annotations and forms that redaction took off the page but
-  the structure tree still points to. 24 of the 41 come with the flatten
-  offer. Tests: `TestScrubRules`, `TestWhatHasNoRuleIsRefused`.
+  one word of their own text used to finish verified, 41 were then refused,
+  every one because the word was still in the file; the next entry has the
+  rules for the places it was. Tests: `TestScrubRules`,
+  `TestWhatHasNoRuleIsRefused`.
+- **Redaction: rules for the places real files keep a term (#119).** They
+  apply to every annotation and form-field dictionary in the file, not only
+  the ones a page lists: redaction takes an annotation under a box off its
+  page, but a tagged file's structure tree goes on pointing at it, with its
+  text and its link address, and that used to verify. Each rule has its own
+  key in `surface_counts`.
+  `rich_text`: a rich-text entry holding a term (`/RC` on an annotation,
+  `/RV` on a field) is deleted; it is the styled twin of the plain text
+  beside it. `field_text`: a field's tooltip (`/TU`), mapping name (`/TM`),
+  default value (`/DV`), option list (`/Opt`) and captions (under `/MK`)
+  become the marker, wherever the field sits in the field tree.
+  `field_names`: a field whose own name (`/T`) holds a term is renamed to a
+  neutral name no other field has; on a page widget it used to be deleted,
+  which left a field with no name. The appearance streams that drew a
+  redacted value, default, option or caption are dropped on the field and on
+  every widget below it. `pdftex`: a `/PTEX.*` entry holding a term — the
+  name of an included figure's file, or anything under that file's
+  `/PTEX.InfoDict` — is deleted. `links`: a URI action whose address holds a
+  term is removed the way Sanitize removes that action, wherever it hangs (a
+  bookmark, the open action, a field, a chain); **a link annotation whose
+  own address held the term now leaves its page, where it used to stay with
+  the address deleted.** `page_labels`: a page-label prefix becomes the
+  marker. `xfa`: when an XFA packet holds a term the form's `/XFA` entry is
+  dropped, so the form falls back to its AcroForm fields; a form that has
+  none is refused with a plain message that an XFA-only form cannot be
+  term-redacted (`RedactionNotPossibleError`, a `ValueError`; nothing written). `embedded_files`: an
+  attachment whose name, description or bytes hold a term is removed whole —
+  from the attachment list (written back as one sorted leaf, so no `/Limits`
+  keeps the name), from every `/AF` array, and with its `/FileAttachment`
+  annotation. **Attachments are searched as their stored bytes only: a zip,
+  a docx or an xlsx is compressed inside and is not opened.** One that
+  cannot be read is left alone, and the run is then refused. `signatures`: a
+  signature holding a term anywhere in it — signer, reason, place,
+  certificate bytes — has its value removed, on a signature field or in the
+  catalog's `/Perms`, so the field is left unsigned; redaction voids a
+  signature in any case. New in `pdf_analyze`, shared with the sanitizer's
+  code: `remove_links`, `remove_embedded_files`, `write_name_tree`, and
+  `remove_scripts(..., also=)` for objects off the page.
+  Still refused, as known limits: web-capture names (`/Names /URLS`), an
+  output intent's standard strings, certificates in the document security
+  store, a GoToE action that names a removed attachment, an appearance
+  stream or a form that is off the page but still referenced (a free-text
+  note redaction took off its page keeps its appearance through the
+  structure tree), and anything else the sweep finds. On 1,139 real PDFs,
+  one word of its own text redacted from each: 524 finished verified before
+  any of this, 53 of them with the word still in the file; 483 with the
+  sweep and its first rules; 520 now, with 12 refused and 2 XFA-only forms
+  refused in plain words. Nine of the 12 fail the page-text or raw-content
+  checks, as before; three are the sweep (web-capture names, a GoToE target
+  naming a removed attachment, a form stream only the structure tree still
+  references).
+  Tests: `TestRichText`, `TestFormFieldText`, `TestPdfTexEntries`,
+  `TestOffThePage`, `TestLinksEverywhere`, `TestPageLabels`, `TestXfa`,
+  `TestAttachments`, `TestSignatures`, `TestStillRefused`.
 - **`pdf_analyze`: the sanitizer's removals can be asked for selectively
   (#119).** New `remove_scripts(pdf, wanted)` and
   `remove_metadata_streams(pdf, wanted=None)`, and `_name_tree_items` is now
@@ -506,6 +557,16 @@
   code with no remaining callers.
 
 ### Fixed
+- **Redaction: the text written in a term's place could hold the term
+  (#119).** Bookmark titles, and now structure text, layer names and field
+  text, are replaced with `[redacted]` — which contains "Ted", "Red" and
+  "act". A title replaced by it for one of those terms was then found by the
+  verifier, and the redaction was refused (since #99). The marker is now the
+  first of `[redacted]`, `[removed]`, `[hidden]`, `[...]` or nothing that
+  holds no term, and the neutral names given to renamed fields and
+  destinations are chosen the same way: a real file whose fields are called
+  "Field 1" and "Field 2" was being renamed, for the word "Field", to
+  `field-1`. Tests: `TestReplacementTextNeverHoldsTheTerm`.
 - **A page's content streams were loaded once per reference instead of once
   (#119).** `pdf_analyze.page_content_blobs` — behind Analyze's
   invisible-text check and the redaction verifier's raw-content check —

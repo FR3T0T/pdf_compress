@@ -2331,29 +2331,25 @@ def remove_metadata_streams(pdf: pikepdf.Pdf, wanted=None) -> dict:
     return chosen
 
 
-def remove_scripts(pdf: pikepdf.Pdf, wanted) -> int:
-    """Remove every script *wanted* picks, the way Sanitize removes scripts,
-    and return how many went.
+def _remove_actions(pdf: pikepdf.Pdf, judge, also=()) -> int:
+    """Remove every action *judge* picks, the way Sanitize removes actions,
+    and return how many went. The body of remove_scripts and remove_links.
 
-    *wanted(js)* is asked about the /JS value of each JavaScript action — a
-    string or a stream — and answers True for one that must go. Unlike
-    Sanitize's `javascript` option this is selective: redaction removes the
-    scripts that hold a term and leaves the rest (#119). Everything else is
-    the sanitizer's own code and so its own rules: the named scripts, the
-    catalog, pages in and out of the page tree, annotations (one whose own
-    action goes is dropped from its page), bookmarks, form fields, each down
-    its /Next chain, and a 3D stream's /OnInstantiate script. A script kept
-    somewhere none of those reach is not removed here either.
+    *judge(action)* returns a counter key for an action that must go, else
+    None (see _action_head_drop). The places are the sanitizer's own, by its
+    own code and so its own rules: the catalog, the named scripts, pages in
+    and out of the page tree, annotations (one whose own action goes is
+    dropped from its page), bookmarks and form fields, each down its /Next
+    chain.
+
+    *also* are annotation or field dictionaries the document's structure no
+    longer leads to — an annotation redaction took off its page, which a
+    tagged file's structure tree still references. Each is cleaned like an
+    annotation on a page; there is no page to take it off.
 
     Tolerant, like the sanitizer: what cannot be processed is passed over,
     and whoever verifies the result decides what that means.
     """
-    def is_wanted(js) -> bool:
-        return isinstance(js, (pikepdf.String, pikepdf.Stream)) and bool(wanted(js))
-
-    def judge(action) -> Optional[str]:
-        return "script" if is_wanted(action.get("/JS")) else None
-
     removed = 0
 
     def bump(_key: str, n: int = 1) -> None:
@@ -2373,14 +2369,185 @@ def remove_scripts(pdf: pikepdf.Pdf, wanted) -> int:
     except Exception as exc:
         _trouble("the document's named scripts could not be cleaned", exc)
     _scrub_action_owners(pdf, opts, bump)
+    for owner in also:
+        try:
+            if isinstance(owner, pikepdf.Dictionary):
+                _scrub_owner_actions("annot", "An object off the page", owner, opts, bump)
+        except Exception as exc:
+            _trouble("an object off the page could not be cleaned", exc)
+    return removed
+
+
+def remove_scripts(pdf: pikepdf.Pdf, wanted, also=()) -> int:
+    """Remove every script *wanted* picks, the way Sanitize removes scripts,
+    and return how many went.
+
+    *wanted(js)* is asked about the /JS value of each JavaScript action — a
+    string or a stream — and answers True for one that must go. Unlike
+    Sanitize's `javascript` option this is selective: redaction removes the
+    scripts that hold a term and leaves the rest (#119). Where it looks, and
+    what *also* is for, is _remove_actions; a 3D stream's /OnInstantiate
+    script is covered as well. A script kept somewhere none of those reach
+    is not removed here either.
+    """
+    def is_wanted(js) -> bool:
+        return isinstance(js, (pikepdf.String, pikepdf.Stream)) and bool(wanted(js))
+
+    def judge(action) -> Optional[str]:
+        return "script" if is_wanted(action.get("/JS")) else None
+
+    removed = _remove_actions(pdf, judge, also)
     for stream in list(_instantiate_scripts(pdf)):
         try:
             if is_wanted(stream.get("/OnInstantiate")):
                 del stream["/OnInstantiate"]
-                bump("script")
+                removed += 1
         except Exception as exc:
             _trouble("a 3D artwork script could not be removed", exc)
     return removed
+
+
+def remove_links(pdf: pikepdf.Pdf, wanted, also=()) -> int:
+    """Remove every URI action whose address *wanted* picks, the way
+    Sanitize's `external_links` removes a link, and return how many went.
+
+    *wanted(uri)* is asked about the /URI value of each action of type
+    /URI. Selective, where the option is all or nothing (#119): the action
+    is deleted from where it is stored — a link annotation whose own action
+    it was leaves its page, one further down a chain is cut out and the
+    chain rejoined. See _remove_actions for the places and for *also*.
+    """
+    def judge(action) -> Optional[str]:
+        if _as_str(action.get("/S")) != "/URI":
+            return None
+        uri = action.get("/URI")
+        return "link" if uri is not None and wanted(uri) else None
+
+    return _remove_actions(pdf, judge, also)
+
+
+def write_name_tree(tree, items) -> None:
+    """Replace what name tree *tree* holds with *items* — ``(key, value)``
+    pairs, the key a pikepdf string or bytes — as a single sorted leaf.
+
+    A name tree is sorted by key and its inner nodes record the first and
+    last key below them (/Limits). Changing or removing a key in place
+    would leave both wrong, and would leave the old key in a /Limits; a tree
+    whose root holds every entry is valid at any size and has neither
+    problem. Entries whose key is not a string are kept, after the others.
+    """
+    named, other = [], []
+    for key, value in items:
+        if isinstance(key, (bytes, pikepdf.String)):
+            named.append((bytes(key), value))
+        else:
+            other.append((key, value))
+    flat = pikepdf.Array()
+    for key, value in sorted(named, key=lambda kv: kv[0]):
+        flat.append(pikepdf.String(key))
+        flat.append(value)
+    for key, value in other:
+        flat.append(key)
+        flat.append(value)
+    tree["/Names"] = flat
+    for stale in ("/Kids", "/Limits"):
+        if stale in tree:
+            del tree[stale]
+
+
+def remove_embedded_files(pdf: pikepdf.Pdf, wanted) -> int:
+    """Remove whole every embedded file *wanted* picks — its file
+    specification and its payload — and return how many went.
+
+    *wanted* is asked about each file specification that carries a payload,
+    and about each name the attachment list files one under. Selective,
+    where Sanitize's `embedded_files` is all or nothing (#119).
+
+    A chosen file specification is emptied in place, as the sanitizer
+    empties one it finds on a holder it has no rule for: whatever still
+    refers to it is left with no payload, no name and no description. Then
+    the places that list files are tidied. Its entry leaves the attachment
+    name tree, which is written back as one sorted leaf so that no /Limits
+    keeps the name. It leaves every /AF array. And a /FileAttachment
+    annotation whose file it was leaves its page.
+    """
+    def emptied(d) -> bool:
+        return isinstance(d, pikepdf.Dictionary) and not (set(d.keys()) - {"/Type"})
+
+    chosen, seen = [], set()
+
+    def choose(d) -> None:
+        if d.is_indirect:
+            key = tuple(d.objgen)
+            if key in seen:
+                return
+            seen.add(key)
+        chosen.append(d)
+
+    for d in list(_filespec_dicts(pdf)):
+        try:
+            if _has_payload(d) and wanted(d):
+                choose(d)
+        except Exception as exc:
+            _trouble("a file specification could not be examined", exc)
+    names, tree, items = None, None, []
+    try:
+        names = pdf.Root.get("/Names")
+        tree = names.get("/EmbeddedFiles") if isinstance(names, pikepdf.Dictionary) else None
+        if isinstance(tree, pikepdf.Dictionary):
+            items = list(name_tree_items(tree))
+            for key, value in items:
+                if isinstance(value, pikepdf.Dictionary) and wanted(key):
+                    choose(value)
+    except Exception as exc:
+        _trouble("the document's attachment list could not be read", exc)
+    if not chosen:
+        return 0
+
+    for d in chosen:
+        try:
+            for k in list(d.keys()):
+                if k != "/Type":
+                    del d[k]
+        except Exception as exc:
+            _trouble("an embedded file could not be removed", exc)
+
+    try:
+        left = [(key, value) for key, value in items if not emptied(value)]
+        if len(left) != len(items):
+            if left:
+                write_name_tree(tree, left)
+            else:
+                del names["/EmbeddedFiles"]
+    except Exception as exc:
+        _trouble("the document's attachment list could not be rewritten", exc)
+    for obj in list(_reachable(pdf)):
+        try:
+            af = obj.get("/AF")
+            if isinstance(af, pikepdf.Array):
+                keep = [x for x in af if not emptied(x)]
+                if not keep:
+                    del obj["/AF"]
+                elif len(keep) != len(af):
+                    obj["/AF"] = pikepdf.Array(keep)
+            elif af is not None and emptied(af):
+                del obj["/AF"]
+        except Exception as exc:
+            _trouble("an associated-files list could not be rewritten", exc)
+    for label, page in _all_pages(pdf):
+        try:
+            annots = page.get("/Annots")
+            if not isinstance(annots, pikepdf.Array):
+                continue
+            keep = [a for a in annots
+                    if not (isinstance(a, pikepdf.Dictionary)
+                            and _as_str(a.get("/Subtype")) == "/FileAttachment"
+                            and emptied(a.get("/FS")))]
+            if len(keep) != len(annots):
+                page["/Annots"] = pikepdf.Array(keep)
+        except Exception as exc:
+            _trouble(f"the annotation list of {_plain_owner(label)} could not be rewritten", exc)
+    return len(chosen)
 
 
 def _reachable(pdf: pikepdf.Pdf):

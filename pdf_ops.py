@@ -18,10 +18,13 @@ from pdf_analyze import (
     file_sha256,
     id_elements,
     name_tree_items,
+    remove_embedded_files,
+    remove_links,
     remove_metadata_streams,
     remove_scripts,
     save_with_content_id,
     trailer_ids,
+    write_name_tree,
 )
 from pdf_verify import TermFinder, WalkStatus, verify_redaction, walk_objects
 
@@ -1572,6 +1575,34 @@ class RedactionVerificationError(Exception):
 # looks broken and leaks context.
 _REDACTED_MARKER = "[redacted]"
 
+#: What the marker falls back to when it would itself hold a term: "Ted",
+#: "Red" and "act" are all inside "[redacted]", and a scrubbed title that
+#: still holds the term is a refused redaction. The last one holds nothing.
+_MARKERS = (_REDACTED_MARKER, "[removed]", "[hidden]", "[...]", "")
+
+
+def _marker_for(finder) -> str:
+    """The first marker text that holds none of the terms."""
+    for text in _MARKERS:
+        if not finder(text.encode()):
+            return text
+    return ""
+
+
+def _neutral_name(stems: tuple, taken: set, finder) -> bytes:
+    """A name for something that has to keep one — a form field, a named
+    destination — that is not in *taken* and holds none of the terms:
+    ``field-1``, ``field-2``, ... or, when the term is "field", the same
+    with the next stem. Adds the name to *taken*."""
+    for serial in range(1, 100000):
+        for stem in stems:
+            for name in (f"{stem}-{serial}", f"{stem}{serial}"):
+                raw = name.encode()
+                if raw not in taken and not finder(raw):
+                    taken.add(raw)
+                    return raw
+    raise ValueError("no neutral name is free of the search terms")
+
 
 def _make_term_matcher(terms: list[str], case_sensitive: bool):
     """Return match(value) -> bool for whole-value (D2) surface scrubbing.
@@ -1603,9 +1634,9 @@ _STRUCTURE_WAYS_OUT = ("/Pg", "/Obj", "/Stm", "/StmOwn")
 _CONTAINERS = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
 
 
-def _redact_strings(root, match, skip: tuple = ()) -> int:
+def _redact_strings(root, match, skip: tuple = (), marker: str = _REDACTED_MARKER) -> int:
     """Replace every string under *root* that holds a term with the whole-
-    value marker (D2), as bookmark titles are; returns how many.
+    value *marker* (D2), as bookmark titles are; returns how many.
 
     Walks dictionaries and arrays, direct or indirect, each object once,
     without following the keys in *skip*. Iterative: a structure tree is as
@@ -1626,7 +1657,7 @@ def _redact_strings(root, match, skip: tuple = ()) -> int:
                 value = cur[slot]
                 if isinstance(value, pikepdf.String):
                     if match(value):
-                        cur[slot] = pikepdf.String(_REDACTED_MARKER)
+                        cur[slot] = pikepdf.String(marker)
                         n += 1
                 elif isinstance(value, _CONTAINERS):
                     stack.append(value)
@@ -1635,11 +1666,17 @@ def _redact_strings(root, match, skip: tuple = ()) -> int:
     return n
 
 
-def _holds_term(obj, finder) -> bool:
+def _holds_term(obj, finder, *, skip: tuple = (), unreadable: bool = True) -> bool:
     """True if a term is anywhere under *obj*: in a string, or in the data
-    of a stream. A stream that cannot be read counts — it cannot be shown
-    free of the term. Does not follow a reference back into the document
-    (a page, the page tree, the catalog)."""
+    of a stream. Does not follow the keys in *skip*, or a reference back
+    into the document (a page, the page tree, the catalog).
+
+    A stream that cannot be read counts as *unreadable* says. True where
+    the thing is expendable and cannot be shown free of the term (private
+    data, a form's XFA packets); False where it is the user's own content
+    and is removed only for what was found in it (an attachment) — the
+    verifier then refuses the run for what it could not read.
+    """
     seen, stack = set(), [obj]
     while stack:
         cur = stack.pop()
@@ -1664,22 +1701,24 @@ def _holds_term(obj, finder) -> bool:
                 try:
                     data = cur.read_bytes()
                 except Exception:
-                    return True
+                    if unreadable:
+                        return True
+                    data = b""
                 if finder(data):
                     return True
-            stack.extend(cur[k] for k in cur.keys())
+            stack.extend(cur[k] for k in cur.keys() if k not in skip)
         except Exception:
             continue
     return False
 
 
-def _scrub_piece_info(pdf, finder) -> int:
+def _scrub_piece_info(objects, finder) -> int:
     """Delete every application's entry in a /PieceInfo dictionary — on the
     catalog, a page, a form XObject — that holds a term anywhere under it.
     It is private data of the program that wrote it; nothing can be redacted
     inside it, so it goes whole. Returns the number of entries deleted."""
     holders = []
-    for _path, obj in walk_objects(pdf, WalkStatus()):
+    for obj in objects:
         try:
             if "/PieceInfo" in obj:
                 holders.append(obj)
@@ -1704,14 +1743,15 @@ def _scrub_piece_info(pdf, finder) -> int:
     return n
 
 
-def _rename_destinations(pdf, finder) -> int:
+def _rename_destinations(pdf, objects, finder) -> int:
     """Rename every named destination whose name holds a term, and every
     use of it, so the links that point there still work. Returns how many.
 
     The names are the keys of the catalog's /Names /Dests tree. A name tree
     is sorted, so a tree with a renamed key is written back as one sorted
-    leaf rather than patched in place. The uses are the /Dest and /D strings
-    of links, actions and bookmarks, found by walking the file.
+    leaf rather than patched in place (pdf_analyze.write_name_tree). The uses
+    are the /Dest and /D strings of links, actions and bookmarks, among
+    *objects* — every dictionary and stream in the file.
     """
     try:
         names = pdf.Root.get("/Names")
@@ -1723,39 +1763,21 @@ def _rename_destinations(pdf, finder) -> int:
         return 0
     taken = {bytes(k) for k, _v in items if isinstance(k, pikepdf.String)}
     renames: dict[bytes, bytes] = {}
-    serial = 0
     for key, _value in items:
         if not isinstance(key, pikepdf.String):
             continue
         old = bytes(key)
         if old in renames or not finder(old):
             continue
-        while True:
-            serial += 1
-            new = f"redacted-{serial}".encode()
-            if new not in taken:
-                break
-        taken.add(new)
-        renames[old] = new
+        renames[old] = _neutral_name(("redacted", "dest", "d"), taken, finder)
     if not renames:
         return 0
 
-    named = sorted(((renames.get(bytes(k), bytes(k)), v) for k, v in items
-                    if isinstance(k, pikepdf.String)), key=lambda kv: kv[0])
-    flat = pikepdf.Array()
-    for key, value in named:
-        flat.append(pikepdf.String(key))
-        flat.append(value)
-    for key, value in items:                 # anything that was not a name: as found
-        if not isinstance(key, pikepdf.String):
-            flat.append(key)
-            flat.append(value)
-    tree["/Names"] = flat
-    for stale in ("/Kids", "/Limits"):
-        if stale in tree:
-            del tree[stale]
+    write_name_tree(tree, [
+        (renames.get(bytes(k), bytes(k)) if isinstance(k, pikepdf.String) else k, v)
+        for k, v in items])
 
-    for _path, obj in list(walk_objects(pdf, WalkStatus())):
+    for obj in objects:
         for key in ("/Dest", "/D"):
             try:
                 value = obj.get(key)
@@ -1764,6 +1786,254 @@ def _rename_destinations(pdf, finder) -> int:
             except Exception:
                 continue
     return len(renames)
+
+
+# ── The places real files keep a term (#119, R1b) ────────────────────
+#
+#  Found by redacting one word out of each of a thousand real PDFs and
+#  looking at what the whole-file sweep still found. Each rule below is one
+#  of those places. They work on every dictionary in the file, not only on
+#  what a page lists: redaction takes an annotation under a box off its
+#  page, but a tagged file's structure tree goes on pointing at it, and at
+#  everything it says.
+
+_XFA_ONLY = ("This form exists only as XFA data, and that data holds a search "
+             "term. An XFA-only form cannot be term-redacted. Nothing was saved.")
+
+
+class RedactionNotPossibleError(ValueError):
+    """The document cannot be term-redacted at all, for a reason the message
+    gives in plain words — not a candidate that failed verification, so
+    there is no report. A ValueError, like the other reasons a redaction
+    does not start ("No matching content found"): callers that show those
+    show this. Nothing was written."""
+
+
+def _all_objects(pdf) -> list:
+    """Every dictionary and stream reachable from the trailer, inline ones
+    included, each once: what the output will be written from. Collected up
+    front, because the rules that use it delete and rewrite as they go."""
+    return [obj for _path, obj in walk_objects(pdf, WalkStatus())]
+
+
+def _name_of(obj, key: str) -> str:
+    try:
+        value = obj.get(key)
+    except Exception:
+        return ""
+    return str(value) if isinstance(value, pikepdf.Name) else ""
+
+
+def _is_annotation(obj) -> bool:
+    """An annotation, by what it is: it says so, or it has a /Subtype and a
+    /Rect. Not by where it is listed — one that is off its page is still
+    one."""
+    return (isinstance(obj, pikepdf.Dictionary)
+            and (_name_of(obj, "/Type") == "/Annot"
+                 or (bool(_name_of(obj, "/Subtype")) and "/Rect" in obj)))
+
+
+def _field_tree(pdf) -> list:
+    """Every field dictionary in the AcroForm tree, through /Kids, once."""
+    try:
+        acro = pdf.Root.get("/AcroForm")
+        fields = acro.get("/Fields") if isinstance(acro, pikepdf.Dictionary) else None
+        return _with_descendants(list(fields) if isinstance(fields, pikepdf.Array) else [])
+    except Exception:
+        return []
+
+
+def _with_descendants(fields: list) -> list:
+    """*fields* and every field below them through /Kids, each once."""
+    found, seen, stack = [], set(), list(fields)[::-1]
+    while stack:
+        fld = stack.pop()
+        try:
+            if not isinstance(fld, pikepdf.Dictionary):
+                continue
+            if fld.is_indirect:
+                ident = tuple(fld.objgen)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            found.append(fld)
+            kids = fld.get("/Kids")
+            if isinstance(kids, pikepdf.Array):
+                stack.extend(list(kids)[::-1])
+        except Exception:
+            continue
+    return found
+
+
+def _is_field(obj, in_tree: set) -> bool:
+    """A form field or a widget: it has a field type, it is a widget, it is
+    in the form's field tree, or it is a parent field (a name and kids)."""
+    if not isinstance(obj, pikepdf.Dictionary):
+        return False
+    try:
+        if "/FT" in obj or _name_of(obj, "/Subtype") == "/Widget":
+            return True
+        if obj.is_indirect and tuple(obj.objgen) in in_tree:
+            return True
+        return "/T" in obj and "/Kids" in obj and _name_of(obj, "/Type") != "/Pages"
+    except Exception:
+        return False
+
+
+def _drop_appearances(fld) -> None:
+    """Delete the appearance streams of field *fld* and of every widget
+    below it. They draw what the field said before it was redacted; a
+    viewer makes new ones from what it says now."""
+    for f in _with_descendants([fld]):
+        try:
+            if "/AP" in f:
+                del f["/AP"]
+        except Exception:
+            continue
+
+
+def _scrub_fields(fields: list, match, finder, marker: str, bump) -> None:
+    """What a form field says about itself, apart from its value: tooltip,
+    mapping name, default value, option list and captions holding a term
+    become the marker (``field_text``); a field whose own name holds one is
+    renamed to a neutral name no other field has (``field_names``). The
+    name is not deleted: a field without one is not a valid field."""
+    taken = set()
+    for fld in fields:
+        try:
+            name = fld.get("/T")
+            if isinstance(name, pikepdf.String):
+                taken.add(bytes(name))
+        except Exception:
+            continue
+    for fld in fields:
+        try:
+            redrawn = False
+            for key in ("/TU", "/TM", "/DV"):
+                value = fld.get(key)
+                if isinstance(value, pikepdf.String):
+                    if match(value):
+                        fld[key] = pikepdf.String(marker)
+                        bump("field_text")
+                        redrawn = redrawn or key == "/DV"
+                elif isinstance(value, pikepdf.Array):       # a list's default selection
+                    n = _redact_strings(value, match, marker=marker)
+                    bump("field_text", n)
+                    redrawn = redrawn or bool(n)
+            options = fld.get("/Opt")
+            if isinstance(options, pikepdf.Array):
+                n = _redact_strings(options, match, marker=marker)
+                bump("field_text", n)
+                redrawn = redrawn or bool(n)
+            captions = fld.get("/MK")
+            if isinstance(captions, pikepdf.Dictionary):
+                for key in ("/CA", "/RC", "/AC"):            # normal, rollover, down
+                    value = captions.get(key)
+                    if isinstance(value, pikepdf.String) and match(value):
+                        captions[key] = pikepdf.String(marker)
+                        bump("field_text")
+                        redrawn = True
+            name = fld.get("/T")
+            if isinstance(name, pikepdf.String) and match(name):
+                fld["/T"] = pikepdf.String(
+                    _neutral_name(("field", "item", "entry", "x"), taken, finder))
+                bump("field_names")
+            if redrawn:
+                _drop_appearances(fld)
+        except Exception:
+            continue
+
+
+def _scrub_pdftex(objects: list, finder) -> int:
+    """Delete every /PTEX.* entry that holds a term. pdfTeX records, on each
+    figure it includes, the name of the file it came from (/PTEX.FileName)
+    and that file's own document information (/PTEX.InfoDict); a term in
+    either is a term in the output. Returns the number of entries deleted."""
+    n = 0
+    for obj in objects:
+        try:
+            for key in [k for k in obj.keys() if k.startswith("/PTEX.")]:
+                if _holds_term(obj[key], finder):
+                    del obj[key]
+                    n += 1
+        except Exception:
+            continue
+    return n
+
+
+def _scrub_xfa(pdf, finder) -> int:
+    """Drop the form's /XFA entry when a packet holds a term, so the form
+    falls back to its AcroForm fields. XFA is XML the form is rebuilt from;
+    a value cannot be redacted inside it and leave a form that still works.
+
+    Raises RedactionNotPossibleError when there are no AcroForm fields to
+    fall back on: the form exists only as XFA, and removing that would
+    remove the form.
+    """
+    acro = pdf.Root.get("/AcroForm")
+    if not isinstance(acro, pikepdf.Dictionary) or "/XFA" not in acro:
+        return 0
+    if not _holds_term(acro["/XFA"], finder):
+        return 0
+    fields = acro.get("/Fields")
+    if not (isinstance(fields, pikepdf.Array)
+            and any(isinstance(f, pikepdf.Dictionary) for f in fields)):
+        raise RedactionNotPossibleError(_XFA_ONLY)
+    del acro["/XFA"]
+    return 1
+
+
+def _is_signature(obj) -> bool:
+    return (isinstance(obj, pikepdf.Dictionary)
+            and (_name_of(obj, "/Type") in ("/Sig", "/DocTimeStamp")
+                 or ("/ByteRange" in obj and "/Contents" in obj)))
+
+
+def _scrub_signatures(pdf, objects: list, finder) -> int:
+    """Remove the value of every signature that holds a term anywhere in it
+    — the signer's name, the reason, the place, the certificate bytes — so
+    the field is left unsigned. Redaction changes the signed bytes, so the
+    signature was void in any case; what it must not do is go on naming
+    someone. Covers signature fields and the catalog's /Perms (usage
+    rights, certification). Returns the number of signatures removed."""
+    removed: set = set()
+    n = 0
+
+    def holds(sig) -> bool:
+        # /Reference leads to the objects the signature covers, not to
+        # anything the signature itself says.
+        return _holds_term(sig, finder, skip=("/Reference",))
+
+    def count(sig) -> None:
+        nonlocal n
+        ident = tuple(sig.objgen) if sig.is_indirect else None
+        if ident is None or ident not in removed:
+            n += 1
+        if ident is not None:
+            removed.add(ident)
+
+    for obj in objects:
+        try:
+            sig = obj.get("/V")
+            if _is_signature(sig) and holds(sig):
+                del obj["/V"]
+                _drop_appearances(obj)       # "Digitally signed by ..."
+                count(sig)
+        except Exception:
+            continue
+    try:
+        perms = pdf.Root.get("/Perms")
+        if isinstance(perms, pikepdf.Dictionary):
+            for key in list(perms.keys()):
+                sig = perms[key]
+                if _is_signature(sig) and holds(sig):
+                    del perms[key]
+                    count(sig)
+            if not len(perms.keys()):
+                del pdf.Root["/Perms"]
+    except Exception:
+        pass
+    return n
 
 
 def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
@@ -1795,13 +2065,41 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
       * ``destinations`` — a named destination whose name holds a term is
         renamed, and the links that use it follow.
 
-    There is no rule for anything else. A term left anywhere else is found
-    by the sweep, and the redaction is refused.
+    And the places real files turned out to keep a term (#119, R1b). These
+    work on every annotation and field dictionary in the file, on a page or
+    off it — redaction takes an annotation under a box off its page, and a
+    tagged file's structure tree goes on pointing at it:
+
+      * ``rich_text`` — a rich-text entry (/RC, /RV) holding a term is
+        deleted;
+      * ``field_text`` / ``field_names`` — a field's tooltip, mapping name,
+        default value, option list and captions become the marker; a field
+        whose own name holds a term is renamed;
+      * ``links`` — a URI action whose address holds a term is removed the
+        way Sanitize removes that action, wherever it hangs;
+      * ``pdftex`` — a /PTEX.* entry holding a term is deleted;
+      * ``page_labels`` — a page-label prefix becomes the marker;
+      * ``xfa`` — the form's /XFA entry is dropped when a packet holds a
+        term, so the form falls back to its AcroForm fields. A form with no
+        such fields is refused here, with RedactionNotPossibleError: it
+        cannot be term-redacted;
+      * ``embedded_files`` — an attachment whose name, description or bytes
+        hold a term is removed whole (pdf_analyze.remove_embedded_files).
+        Bytes as stored: a zip, a docx or an xlsx is compressed inside and
+        is not opened;
+      * ``signatures`` — a signature holding a term anywhere in it has its
+        value removed, leaving the field unsigned.
+
+    There is no rule for anything else: web-capture names, an output
+    intent's strings, the document security store, an appearance stream or
+    a form no page paints. A term left there is found by the sweep, and the
+    redaction is refused.
     """
     if not terms:
         return {}
     match = _make_term_matcher(terms, case_sensitive)
     finder = TermFinder(terms, case_sensitive)
+    marker = _marker_for(finder)         # "[redacted]", unless that holds a term
     counts: dict[str, int] = {}
 
     def bump(key: str, n: int = 1):
@@ -1854,35 +2152,83 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
         # -- bookmarks / outline titles (D2 whole value) ---------------
         try:
             with pdf.open_outline() as outline:
-                bump("bookmarks", _scrub_outline_items(outline.root, match))
+                bump("bookmarks", _scrub_outline_items(outline.root, match, marker))
         except Exception:
             pass
 
-        # -- annotations + form values + links + embedded files --------
+        # Every dictionary and stream in the file, once. The rules from
+        # here on work on these, wherever they hang: an annotation or a
+        # field that is off its page is scrubbed like one that is on it.
         try:
-            bump_map = _scrub_objects(pdf, match)
+            objects = _all_objects(pdf)
+        except Exception:
+            objects = []
+        tree_ids = {tuple(f.objgen) for f in _field_tree(pdf) if f.is_indirect}
+        fields = [o for o in objects if _is_field(o, tree_ids)]
+        annotations = [o for o in objects if _is_annotation(o)]
+        owners = annotations + [f for f in fields if not _is_annotation(f)]
+
+        # -- XFA: dropped when a packet holds a term. A form that is only
+        #    XFA is the one refusal the scrub itself makes. -----------------
+        try:
+            bump("xfa", _scrub_xfa(pdf, finder))
+        except RedactionNotPossibleError:
+            raise
+        except Exception:
+            pass
+
+        # -- signatures that name a term (before the field values: a
+        #    signature is a field's value) ----------------------------------
+        try:
+            bump("signatures", _scrub_signatures(pdf, objects, finder))
+        except Exception:
+            pass
+
+        # -- annotations and form fields: text, rich text, names, values -
+        try:
+            bump_map = _scrub_objects(objects, annotations, fields, tree_ids, match, finder,
+                                      marker)
             for k, v in bump_map.items():
                 bump(k, v)
         except Exception:
             pass
 
+        # -- links: a web address holding a term goes the way Sanitize
+        #    removes that action, wherever it hangs; then the file targets
+        #    (/F) of the actions that are left --------------------------------
+        try:
+            bump("links", remove_links(pdf, match, also=owners))
+        except Exception:
+            pass
+        for annot in annotations:
+            try:
+                if "/A" in annot:
+                    bump("links", _scrub_action_uri(annot["/A"], match))
+            except Exception:
+                pass
+
         # -- structure text and layer names (D2 whole value) -----------
         try:
             tree = pdf.Root.get("/StructTreeRoot")
             if isinstance(tree, pikepdf.Dictionary):
-                bump("structure", _redact_strings(tree, match, _STRUCTURE_WAYS_OUT))
+                bump("structure", _redact_strings(tree, match, _STRUCTURE_WAYS_OUT, marker))
         except Exception:
             pass
         try:
             layers = pdf.Root.get("/OCProperties")
             if isinstance(layers, pikepdf.Dictionary):
-                bump("layers", _redact_strings(layers, match))
+                bump("layers", _redact_strings(layers, match, marker=marker))
         except Exception:
             pass
 
-        # -- private application data, scripts, named destinations -----
+        # -- private application data, pdfTeX's records, scripts, named
+        #    destinations, page labels --------------------------------------
         try:
-            bump("piece_info", _scrub_piece_info(pdf, finder))
+            bump("piece_info", _scrub_piece_info(objects, finder))
+        except Exception:
+            pass
+        try:
+            bump("pdftex", _scrub_pdftex(objects, finder))
         except Exception:
             pass
         try:
@@ -1893,11 +2239,27 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
                     return finder(js.read_bytes())
                 except Exception:
                     return True      # unreadable: cannot be shown free of it
-            bump("scripts", remove_scripts(pdf, script_hit))
+            bump("scripts", remove_scripts(pdf, script_hit, also=owners))
         except Exception:
             pass
         try:
-            bump("destinations", _rename_destinations(pdf, finder))
+            bump("destinations", _rename_destinations(pdf, objects, finder))
+        except Exception:
+            pass
+        try:
+            labels = pdf.Root.get("/PageLabels")
+            if isinstance(labels, pikepdf.Dictionary):
+                bump("page_labels", _redact_strings(labels, match, marker=marker))
+        except Exception:
+            pass
+
+        # -- attachments: one whose name, description or bytes hold a term
+        #    is removed whole. Bytes as stored: a zip, a docx or an xlsx is
+        #    compressed inside and is not opened. One that cannot be read is
+        #    left for the verifier, which refuses the run. -------------------
+        try:
+            bump("embedded_files", remove_embedded_files(
+                pdf, lambda thing: _holds_term(thing, finder, unreadable=False)))
         except Exception:
             pass
 
@@ -1944,82 +2306,82 @@ def _xmp_text_views(pdf, stream) -> list[str]:
     return views
 
 
-def _scrub_outline_items(items, match, depth: int = 0) -> int:
+def _scrub_outline_items(items, match, marker: str = _REDACTED_MARKER, depth: int = 0) -> int:
     """Recursively replace any outline title matching *match* with the whole-
-    value redaction marker (D2). Returns the number of titles replaced."""
+    value redaction *marker* (D2). Returns the number of titles replaced."""
     if depth > 50:
         return 0
     n = 0
     for it in items:
         try:
             if it.title and match(str(it.title)):
-                it.title = _REDACTED_MARKER
+                it.title = marker
                 n += 1
         except Exception:
             pass
         try:
-            n += _scrub_outline_items(it.children, match, depth + 1)
+            n += _scrub_outline_items(it.children, match, marker, depth + 1)
         except Exception:
             pass
     return n
 
 
-def _scrub_objects(pdf, match) -> dict[str, int]:
-    """Whole-value scrub (D2) of annotation text (/Contents,/T,/Subj — all
-    subtypes) and link URIs via a page→/Annots walk (reaching the inline /A
-    action dicts pdf.objects never yields), plus form-field values (/V) and
-    embedded-file names via an object-graph walk (reaching inherited /V on
-    parent fields and name-tree filespecs). Mirrors what verify_redaction
-    reads on each surface."""
+def _scrub_objects(objects: list, annotations: list, fields: list, tree_ids: set,
+                   match, finder, marker: str = _REDACTED_MARKER) -> dict[str, int]:
+    """Whole-value scrub (D2) of what annotations and form fields say, on
+    every such dictionary in the file — on a page or off it.
+
+      * ``field_text`` / ``field_names`` — see _scrub_fields;
+      * ``rich_text`` — a rich-text entry (/RC on an annotation, /RV on a
+        field) holding a term is deleted; it is the styled twin of the plain
+        text beside it, which is scrubbed here too;
+      * ``annotations`` — /Contents, /T and /Subj holding a term are deleted
+        (a field's /T is its name, and is renamed instead);
+      * ``form_fields`` — a value (/V) holding a term is emptied, and the
+        appearances that drew it, on the field and on every widget below
+        it, are dropped.
+
+    Mirrors what verify_redaction reads on each surface.
+    """
     counts: dict[str, int] = {}
 
     def bump(key: str, n: int = 1):
         if n:
             counts[key] = counts.get(key, 0) + n
 
-    # -- pages -> annotations: text keys + /A (link) actions -----------
-    try:
-        pages = pdf.pages
-    except Exception:
-        pages = []
-    for pg in pages:
-        try:
-            annots = pg.get("/Annots")
-        except Exception:
-            annots = None
-        if annots is None:
-            continue
-        for annot in annots:
+    _scrub_fields(fields, match, finder, marker, bump)
+
+    for obj in annotations + [f for f in fields if not _is_annotation(f)]:
+        for key in ("/RC", "/RV"):
             try:
-                if not isinstance(annot, pikepdf.Dictionary):
-                    continue
-            except Exception:
-                continue
-            for key in ("/Contents", "/T", "/Subj"):
-                try:
-                    if key in annot and match(annot[key]):
-                        del annot[key]
-                        bump("annotations")
-                except Exception:
-                    pass
-            try:
-                if "/A" in annot:
-                    bump("links", _scrub_action_uri(annot["/A"], match))
+                value = obj.get(key)
+                if value is not None and _holds_term(value, finder):
+                    del obj[key]
+                    bump("rich_text")
             except Exception:
                 pass
 
-    # -- object graph: form-field /V + embedded filespec names ---------
-    for obj in pdf.objects:
-        try:
-            if not isinstance(obj, pikepdf.Dictionary):
+    for annot in annotations:
+        is_field = _is_field(annot, tree_ids)
+        for key in ("/Contents", "/T", "/Subj"):
+            if key == "/T" and is_field:
                 continue
-        except Exception:
-            continue
+            try:
+                if key in annot and match(annot[key]):
+                    del annot[key]
+                    bump("annotations")
+            except Exception:
+                pass
+
+    for obj in objects:
         try:
-            if "/V" in obj and match(obj["/V"]):
+            if not isinstance(obj, pikepdf.Dictionary) or "/V" not in obj:
+                continue
+            value = obj["/V"]
+            if (_holds_term(value, finder) if isinstance(value, pikepdf.Stream)
+                    else match(value)):
                 obj["/V"] = pikepdf.String("")
-                if "/AP" in obj:
-                    del obj["/AP"]      # drop stale appearance stream
+                _drop_appearances(obj)       # stale: they drew the old value
                 bump("form_fields")
         except Exception:
             pass
@@ -2216,11 +2578,15 @@ def redact_pdf(
     link URIs, embedded-file names (#99) -- so a term surviving only in the
     /Title (never on any page) is still removed and still counts as a hit.
     So are structure-tree text, layer names, an application's private data,
-    metadata streams on any object, scripts and named destinations (#119;
-    see _scrub_document_surfaces). A term anywhere else in the file -- an
-    attachment's contents, XFA form data, a stream held by a private key --
-    has no rule: the verifier's whole-file sweep finds it and the run is
-    refused, never passed.
+    metadata streams on any object, scripts, named destinations, rich text,
+    what a form field says about itself, web addresses wherever they hang,
+    pdfTeX's records, page labels, XFA data, attachments and signatures
+    (#119; see _scrub_document_surfaces). A term anywhere else in the file
+    -- a stream held by a private key, an appearance no page shows -- has no
+    rule: the verifier's whole-file sweep finds it and the run is refused,
+    never passed. A form that exists only as XFA and holds a term in it
+    raises RedactionNotPossibleError (a ValueError): it cannot be
+    term-redacted.
 
     Verify, then commit. The redacted candidate is written to a temp file
     beside output_path, given a fresh content-derived trailer /ID as its last
