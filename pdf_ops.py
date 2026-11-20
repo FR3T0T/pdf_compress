@@ -1,5 +1,7 @@
 """PDF operations — merge, split, and page manipulation."""
 
+import hashlib
+import io
 import logging
 import math
 import os
@@ -26,7 +28,18 @@ from pdf_analyze import (
     trailer_ids,
     write_name_tree,
 )
-from pdf_verify import TermFinder, WalkStatus, term_boxes, verify_redaction, walk_objects
+from pdf_verify import (
+    STRUCTURE_WAYS_OUT,
+    PageText,
+    TermFinder,
+    WalkStatus,
+    structure_kids,
+    structure_stream,
+    structure_stream_refs,
+    term_boxes,
+    verify_redaction,
+    walk_objects,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1547,6 +1560,10 @@ class RedactResult:
     verification: dict | None = None
     #: pages rasterized by the flatten fallback on this run, if any (D1).
     flattened_pages: list = field(default_factory=list)
+    #: {page number (1-based): areas filled black on the picture of that
+    #: page before it replaced the page} — what could still be found on it,
+    #: and the user's own boxes (#119). Empty when nothing was flattened.
+    flattened_areas: dict = field(default_factory=dict)
 
 
 class RedactionVerificationError(Exception):
@@ -1637,7 +1654,7 @@ def _make_term_matcher(terms: list[str], case_sensitive: bool):
 #: Keys that lead out of the structure tree: to a page, to an annotation or
 #: XObject, to a content stream. Structure text is scrubbed; those are not
 #: the structure tree's to touch.
-_STRUCTURE_WAYS_OUT = ("/Pg", "/Obj", "/Stm", "/StmOwn")
+_STRUCTURE_WAYS_OUT = STRUCTURE_WAYS_OUT
 
 _CONTAINERS = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
 
@@ -1860,6 +1877,190 @@ def _listed_annotations(pdf) -> set:
     return listed
 
 
+# ── Annotations that draw a term (#119, R3) ──────────────────────────
+#
+#  An annotation is painted above the page. apply_redactions() removes page
+#  content under a box and leaves every annotation but its own marks, so a
+#  stamp that says "APPROVED" went on saying it: the run was refused, the
+#  page was offered for flattening, and the picture of the page showed the
+#  stamp. An annotation whose appearance draws a term is taken off its page.
+
+#: An appearance stream can only draw text if it shows some, or paints
+#: another form that might.
+_SHOWS_TEXT = (b"Tj", b"TJ", b"'", b'"', b"Do")
+
+
+def _appearance_streams(annot) -> list:
+    """Every appearance stream of *annot*: what /AP holds for the normal,
+    rollover and down appearances, each a stream or a dictionary of them by
+    state."""
+    found = []
+    try:
+        appearance = annot.get("/AP")
+        if isinstance(appearance, pikepdf.Dictionary):
+            for key in appearance.keys():
+                value = appearance[key]
+                if isinstance(value, pikepdf.Stream):
+                    found.append(value)
+                elif isinstance(value, pikepdf.Dictionary):
+                    found.extend(v for v in (value[k] for k in value.keys())
+                                 if isinstance(v, pikepdf.Stream))
+    except Exception:
+        pass
+    return found
+
+
+def _form_extent(stream) -> list:
+    """A page box that takes in what form XObject *stream* draws: its /BBox
+    through its /Matrix, and a wide margin, since text the box clips away
+    is still text in the stream."""
+    try:
+        x0, y0, x1, y1 = (float(v) for v in stream["/BBox"])
+    except Exception:
+        x0, y0, x1, y1 = 0.0, 0.0, 612.0, 792.0
+    try:
+        a, b, c, d, e, f = (float(v) for v in stream["/Matrix"])
+    except Exception:
+        a, b, c, d, e, f = 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
+    xs = [a * x + c * y + e for x in (x0, x1) for y in (y0, y1)]
+    ys = [b * x + d * y + f for x in (x0, x1) for y in (y0, y1)]
+    return [min(xs) - 500, min(ys) - 500, max(xs) + 500, max(ys) + 500]
+
+
+def _streams_drawing(streams: list, terms: list[str], case_sensitive: bool) -> set:
+    """(num, gen) of each of *streams* — form XObjects — in whose text the
+    page-text matcher finds one of *terms*.
+
+    "Draws" is asked of the matcher redaction itself searches a page with
+    (pdf_verify.PageText), so a term broken across two lines of a stamp, or
+    letter-spaced, is found as it would be on a page. To ask it, each
+    stream is copied into a scratch document as the whole content of a page
+    of its own; that document exists in memory only.
+    """
+    scratch = pikepdf.Pdf.new()
+    order, seen = [], set()
+    for stream in streams:
+        key = tuple(stream.objgen)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            data = stream.read_bytes()
+            if not any(op in data for op in _SHOWS_TEXT):
+                continue
+            box, copy = _form_extent(stream), scratch.copy_foreign(stream)
+            scratch.pages.append(pikepdf.Page(pikepdf.Dictionary(
+                Type=pikepdf.Name.Page, MediaBox=box,
+                Resources=pikepdf.Dictionary(XObject=pikepdf.Dictionary(Fm0=copy)),
+                Contents=scratch.make_stream(b"/Fm0 Do"))))
+            order.append(key)
+        except Exception:
+            continue                # the whole-file search still reads its bytes
+    if not order:
+        return set()
+    buffer = io.BytesIO()
+    scratch.save(buffer)
+    found = set()
+    with fitz.open(stream=buffer.getvalue(), filetype="pdf") as doc:
+        for key, page in zip(order, doc, strict=True):
+            try:
+                text = PageText(page, case_sensitive)
+            except Exception:
+                continue
+            if any(text.find(term) for term in terms):
+                found.add(key)
+    return found
+
+
+def _take_off_pages(pdf, doomed: list) -> int:
+    """Take the annotations in *doomed* off whatever page lists them, each
+    with its popup and with everything that replies to it, however deep.
+    Returns the number of replies that went."""
+    def ident(obj):
+        try:
+            return tuple(obj.objgen) if obj.is_indirect else None
+        except Exception:
+            return None
+
+    gone = {ident(a) for a in doomed} - {None}
+    pages = []
+    for page in pdf.pages:
+        try:
+            annots = page.obj.get("/Annots")
+            entries = [a for a in annots] if isinstance(annots, pikepdf.Array) else []
+        except Exception:
+            entries = []
+        pages.append((page.obj, entries))
+    listed = [a for _obj, entries in pages for a in entries
+              if isinstance(a, pikepdf.Dictionary) and ident(a) is not None]
+
+    replies, grew = 0, True
+    while grew:
+        grew = False
+        for annot in listed:
+            try:
+                if ident(annot) not in gone and ident(annot.get("/IRT")) in gone:
+                    gone.add(ident(annot))
+                    replies += 1
+                    grew = True
+            except Exception:
+                continue
+    popups = set()
+    for annot in listed:
+        try:
+            if ident(annot) in gone:
+                popups.add(ident(annot.get("/Popup")))
+            elif _name_of(annot, "/Subtype") == "/Popup" and ident(annot.get("/Parent")) in gone:
+                popups.add(ident(annot))
+        except Exception:
+            continue
+    for obj, entries in pages:
+        try:
+            keep = [a for a in entries if ident(a) is None or ident(a) not in gone | popups]
+            if len(keep) != len(entries):
+                obj["/Annots"] = pikepdf.Array(keep)
+        except Exception:
+            continue
+    return replies
+
+
+def _lift_annotations_drawing(pdf, annotations: list, terms: list[str],
+                              case_sensitive: bool) -> int:
+    """Take every annotation whose appearance draws a term off its page,
+    and return how many annotations went (replies included; a popup is not
+    counted).
+
+    Any of its appearance streams counts: normal, rollover or down, every
+    state, shown or hidden. The annotation loses its /AP as well as its
+    place on the page, so that whatever still refers to the dictionary — a
+    tagged file's structure tree — keeps nothing of what it drew; one that
+    was on no page to begin with loses just that. A form field's widget is
+    not touched here: a field has its own path (its value is emptied and
+    the appearances that drew it are dropped, _scrub_objects).
+    """
+    owners = []
+    for annot in annotations:
+        try:
+            if _name_of(annot, "/Subtype") == "/Widget" or "/FT" in annot:
+                continue
+            streams = _appearance_streams(annot)
+            if streams:
+                owners.append((annot, streams))
+        except Exception:
+            continue
+    if not owners:
+        return 0
+    drawing = _streams_drawing([s for _a, streams in owners for s in streams],
+                               terms, case_sensitive)
+    doomed = [a for a, streams in owners if any(tuple(s.objgen) in drawing for s in streams)]
+    for annot in doomed:
+        try:
+            del annot["/AP"]
+        except Exception:
+            continue
+    return len(doomed) + _take_off_pages(pdf, doomed) if doomed else 0
+
+
 def _field_tree(pdf) -> list:
     """Every field dictionary in the AcroForm tree, through /Kids, once."""
     try:
@@ -2063,22 +2264,6 @@ def _scrub_signatures(pdf, objects: list, finder) -> int:
     return n
 
 
-#: /Type of the dictionaries that make up the structure tree.
-_STRUCTURE_TYPES = ("/StructTreeRoot", "/StructElem", "/MCR", "/OBJR")
-
-
-def _structure_stream(kid):
-    """The stream a kid of a structure element names — the content stream
-    of a marked-content reference (/Stm), the XObject of an object
-    reference (/Obj) — or None."""
-    if isinstance(kid, pikepdf.Dictionary):
-        for key in ("/Stm", "/Obj"):
-            target = kid.get(key)
-            if isinstance(target, pikepdf.Stream):
-                return target
-    return None
-
-
 def _drop_stale_structure_refs(pdf) -> int:
     """Remove every reference the structure tree makes to a stream that
     nothing else in the file leads to; returns how many went.
@@ -2100,78 +2285,17 @@ def _drop_stale_structure_refs(pdf) -> int:
     object reference to an annotation is not a stream and is not touched
     (the scrub deals with those).
     """
-    try:
-        root = pdf.Root.get("/StructTreeRoot")
-    except Exception:
+    holders, named, alive = structure_stream_refs(pdf)
+    if not named - alive:
         return 0
-    if not isinstance(root, pikepdf.Dictionary):
-        return 0
-
-    def kids_of(elem) -> list:
-        kids = elem.get("/K")
-        return list(kids) if isinstance(kids, pikepdf.Array) else [kids]
-
-    # Every dictionary of the tree that has kids naming a stream.
-    holders, named = [], set()
-    seen, stack = set(), [root]
-    while stack:
-        cur = stack.pop()
-        try:
-            if not isinstance(cur, (pikepdf.Dictionary, pikepdf.Array)):
-                continue
-            if cur.is_indirect:
-                ident = tuple(cur.objgen)
-                if ident in seen:
-                    continue
-                seen.add(ident)
-            if isinstance(cur, pikepdf.Array):
-                stack.extend(cur)
-                continue
-            if _name_of(cur, "/Type") in ("/Page", "/Pages", "/Catalog"):
-                continue
-            if "/K" in cur:
-                streams = [s for s in map(_structure_stream, kids_of(cur)) if s is not None]
-                if streams:
-                    holders.append(cur)
-                    named.update(tuple(s.objgen) for s in streams)
-            stack.extend(cur[k] for k in cur.keys() if k not in _STRUCTURE_WAYS_OUT)
-        except Exception:
-            continue
-    if not named:
-        return 0
-
-    # Which of them the rest of the file still leads to.
-    alive: set = set()
-    seen, stack = set(), [pdf.trailer]
-    while stack and len(alive) < len(named):
-        cur = stack.pop()
-        try:
-            if not isinstance(cur, _CONTAINERS):
-                continue
-            if cur.is_indirect:
-                ident = tuple(cur.objgen)
-                if ident in seen:
-                    continue
-                seen.add(ident)
-                if ident in named:
-                    alive.add(ident)
-            if isinstance(cur, pikepdf.Array):
-                stack.extend(cur)
-                continue
-            if _name_of(cur, "/Type") in _STRUCTURE_TYPES:
-                continue
-            # /SE is a bookmark's way into the tree.
-            stack.extend(cur[k] for k in cur.keys() if k not in ("/StructTreeRoot", "/SE"))
-        except Exception:
-            continue
 
     removed = 0
     for holder in holders:
         try:
-            kids = kids_of(holder)
+            kids = structure_kids(holder)
             keep = []
             for kid in kids:
-                stream = _structure_stream(kid)
+                stream = structure_stream(kid)
                 if stream is not None and tuple(stream.objgen) not in alive:
                     removed += 1
                 else:
@@ -2182,6 +2306,312 @@ def _drop_stale_structure_refs(pdf) -> int:
                 holder["/K"] = pikepdf.Array(keep)
             else:
                 del holder["/K"]
+        except Exception:
+            continue
+    return removed
+
+
+# ── What a tagged file says of content a box removed (#119, R3) ──────
+#
+#  A structure element can describe its content in words: /Alt on a figure,
+#  /ActualText, the expansion of an abbreviation (/E), a title (/T). A box
+#  over the figure removed the picture and left the description. The
+#  elements whose own content a box removed are found by comparing what
+#  each marked-content sequence paints, before the redaction and after.
+
+#: Operators that put something on the page: text, a painted path, a shading.
+_SHOW_OPS = frozenset({"Tj", "TJ", "'", '"'})
+_PAINT_OPS = frozenset({"S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "sh"})
+_STRUCTURE_TEXT = ("/Alt", "/ActualText", "/E", "/T")
+
+
+def _stream_digest(stream) -> bytes:
+    """A digest of an image's data: decoded where that is possible, as
+    stored otherwise (the same bytes before and after, if it was not
+    touched)."""
+    try:
+        data = stream.read_bytes()
+    except Exception:
+        try: data = stream.read_raw_bytes()
+        except Exception: data = b"?"
+    return hashlib.sha256(data).digest()
+
+
+def _painted(holder, resources, marks: dict, depth: int = 0) -> bytes:
+    """A digest of everything content stream *holder* (a page or a form
+    XObject) paints, and into *marks*, {MCID: digest}, the same for each of
+    its marked-content sequences that has one.
+
+    What is compared is what is painted, not how it is written: the bytes
+    of the text shown, each image's data, each form's own digest, and how
+    many paths and shadings are painted. MuPDF rewrites a redacted page's
+    whole content stream — other operators, other spacing, strings cut up
+    differently — and leaves those the same wherever it removed nothing.
+    Returns b"" when the content cannot be parsed; the caller takes that as
+    changed.
+    """
+    try:
+        instructions = pikepdf.parse_content_stream(holder)
+    except Exception:
+        return b""
+    def lookup(kind: str, name):
+        try:
+            return resources[kind][str(name)]
+        except Exception:
+            return None
+
+    total, open_marks, sums = hashlib.sha256(), [], {}
+    for instruction in instructions:
+        try:
+            operator, operands = str(instruction.operator), instruction.operands
+        except Exception:
+            continue
+        piece = None
+        if operator in ("BDC", "BMC"):
+            mcid = None
+            if operator == "BDC" and len(operands) > 1:
+                props = operands[1]
+                if isinstance(props, pikepdf.Name):
+                    props = lookup("/Properties", props)
+                if isinstance(props, pikepdf.Dictionary) and isinstance(props.get("/MCID"), int):
+                    mcid = int(props["/MCID"])
+            open_marks.append(mcid)
+        elif operator == "EMC":
+            if open_marks:
+                open_marks.pop()
+        elif operator in _SHOW_OPS:
+            shown = [bytes(x) for o in operands
+                     for x in (o if isinstance(o, pikepdf.Array) else [o])
+                     if isinstance(x, pikepdf.String)]
+            if any(shown):
+                piece = b"T" + b"".join(shown)
+        elif operator in _PAINT_OPS:
+            piece = b"P"
+        elif operator == "INLINE IMAGE":
+            try: data = instruction.iimage.read_bytes()
+            except Exception: data = repr(instruction).encode("utf-8", "replace")
+            piece = b"I" + hashlib.sha256(data).digest()
+        elif operator == "Do" and operands:
+            target = lookup("/XObject", operands[0])
+            if isinstance(target, pikepdf.Stream):
+                if _name_of(target, "/Subtype") == "/Form" and depth < 12:
+                    inner = target.get("/Resources")
+                    piece = b"F" + _painted(target, inner if inner is not None else resources,
+                                            {}, depth + 1)
+                else:
+                    piece = b"I" + _stream_digest(target)
+        if piece is not None:
+            total.update(piece)
+            for mcid in {m for m in open_marks if m is not None}:
+                sums.setdefault(mcid, hashlib.sha256()).update(piece)
+    marks.update({mcid: s.digest() for mcid, s in sums.items()})
+    return total.digest()
+
+
+def _page_marks(page) -> dict:
+    """{MCID: digest} for the marked-content sequences of *page*'s own
+    content (not of the forms it paints), or None if it cannot be read."""
+    marks: dict = {}
+    try:
+        node, resources = page.obj, None
+        for _ in range(64):
+            if "/Resources" in node:
+                resources = node["/Resources"]
+                break
+            node = node.get("/Parent")
+            if not isinstance(node, pikepdf.Dictionary):
+                break
+        return marks if _painted(page, resources, marks) else None
+    except Exception:
+        return None
+
+
+def _painted_forms(page) -> list:
+    """Every form XObject *page* can paint, through its resources and the
+    resources of those forms: the redacted copies, after a redaction."""
+    found, seen, stack = [], set(), []
+    try:
+        stack.append(page.obj.get("/Resources"))
+    except Exception:
+        return found
+    while stack:
+        resources = stack.pop()
+        try:
+            xobjects = resources.get("/XObject") if resources is not None else None
+            if not isinstance(xobjects, pikepdf.Dictionary):
+                continue
+            for key in xobjects.keys():
+                form = xobjects[key]
+                if (isinstance(form, pikepdf.Stream) and _name_of(form, "/Subtype") == "/Form"
+                        and tuple(form.objgen) not in seen):
+                    seen.add(tuple(form.objgen))
+                    found.append(form)
+                    stack.append(form.get("/Resources"))
+        except Exception:
+            continue
+    return found
+
+
+def _drop_structure_text(pdf, source_path: str, password: str | None, touched: set) -> int:
+    """Delete what each structure element of *pdf* (the redacted document)
+    says in words of content a box removed; returns how many entries went.
+
+    An element whose own content was removed loses /Alt, /ActualText, /E
+    and /T. Every element above it loses /Alt, /ActualText and /E, which
+    speak for an element and all that is under it; a title is its own.
+    "Its own content" is what its /K names directly, and "removed" is:
+
+      * marked content of a page — the sequence paints something else now
+        than it does in the source, opened here from *source_path* for the
+        comparison (_painted), on a page that had a box (*touched*, page
+        indices);
+      * marked content of a form XObject (a reference with /Stm) — the form
+        is no longer anybody's content (the page has a redacted copy), and
+        the copy, found among the forms the page paints by its
+        /StructParents, paints something else in that sequence, or cannot
+        be found;
+      * an object reference — to an annotation that is on no page any more,
+        or to an XObject that is no longer anybody's content.
+
+    Whatever cannot be compared — a page that will not parse, a source that
+    will not open — counts as removed. Runs on every redaction, by term or
+    by box, before the stale references themselves are dropped.
+    """
+    try:
+        root = pdf.Root.get("/StructTreeRoot")
+    except Exception:
+        return 0
+    if not isinstance(root, pikepdf.Dictionary):
+        return 0
+
+    def ident(obj):
+        try:
+            return tuple(obj.objgen) if obj.is_indirect else None
+        except Exception:
+            return None
+
+    # The elements, each with the chain of elements above it.
+    elements, seen, stack = [], set(), [(root, ())]
+    while stack:
+        elem, above = stack.pop()
+        try:
+            if not isinstance(elem, pikepdf.Dictionary):
+                continue
+            key = ident(elem)
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            if _name_of(elem, "/Type") in ("/MCR", "/OBJR") or structure_stream(elem) is not None:
+                continue
+            if elem is not root and (key is None or key != ident(root)):
+                elements.append((elem, above))
+                above = above + (elem,)
+            for kid in structure_kids(elem):
+                if isinstance(kid, pikepdf.Dictionary):
+                    stack.append((kid, above))
+        except Exception:
+            continue
+    if not any(k in elem for elem, _above in elements for k in _STRUCTURE_TEXT):
+        return 0
+
+    page_of = {ident(page.obj): n for n, page in enumerate(pdf.pages)}
+    listed = _listed_annotations(pdf)
+    _holders, named, alive = structure_stream_refs(pdf)
+    before: dict = {}
+    after: dict = {}
+    source: list = []
+
+    def changed_on_page(pno: int, mcid) -> bool:
+        if pno not in touched:
+            return False
+        if pno not in after:
+            after[pno] = _page_marks(pdf.pages[pno])
+            try:
+                if not source:
+                    source.append(pikepdf.open(source_path, **(
+                        {"password": password} if password else {})))
+                before[pno] = _page_marks(source[0].pages[pno])
+            except Exception:
+                before[pno] = None
+        if before[pno] is None or after[pno] is None:
+            return True
+        return before[pno].get(mcid) != after[pno].get(mcid)
+
+    def changed_in_form(original, pno, mcid) -> bool:
+        if ident(original) in alive:
+            return False                    # still somebody's content, as it was
+        number = original.get("/StructParents")
+        pages = [pno] if pno is not None else sorted(touched)
+        for n in pages:
+            for copy in (_painted_forms(pdf.pages[n]) if 0 <= n < len(pdf.pages) else []):
+                if number is None or copy.get("/StructParents") != number:
+                    continue
+                was, now = {}, {}
+                if not (_painted(original, original.get("/Resources"), was)
+                        and _painted(copy, copy.get("/Resources"), now)):
+                    return True
+                return was.get(mcid) != now.get(mcid)
+        return True                         # no copy of it is painted: it went
+
+    def own_content_removed(elem, above) -> bool:
+        page = next((page_of.get(ident(e.get("/Pg"))) for e in (elem,) + above[::-1]
+                     if isinstance(e.get("/Pg"), pikepdf.Dictionary)), None)
+        for kid in structure_kids(elem):
+            if isinstance(kid, int) and not isinstance(kid, bool):
+                if page is not None and changed_on_page(page, kid):
+                    return True
+            elif isinstance(kid, pikepdf.Dictionary):
+                where = page_of.get(ident(kid.get("/Pg")), page)
+                target, mcid = kid.get("/Obj"), kid.get("/MCID")
+                if isinstance(kid.get("/Stm"), pikepdf.Stream):
+                    if changed_in_form(kid["/Stm"], where, mcid):
+                        return True
+                elif isinstance(mcid, int):
+                    if where is not None and changed_on_page(where, mcid):
+                        return True
+                elif isinstance(target, pikepdf.Stream):
+                    if ident(target) in named and ident(target) not in alive:
+                        return True
+                elif isinstance(target, pikepdf.Dictionary) and _is_annotation(target):
+                    if ident(target) is not None and ident(target) not in listed:
+                        return True
+        return False
+
+    dropped = 0
+    try:
+        for elem, above in elements:
+            try:
+                if not (any(k in elem for k in _STRUCTURE_TEXT)
+                        or any(k in e for e in above for k in _STRUCTURE_TEXT[:3])):
+                    continue
+                if not own_content_removed(elem, above):
+                    continue
+                for holder, keys in [(elem, _STRUCTURE_TEXT)] + [(e, _STRUCTURE_TEXT[:3])
+                                                                 for e in above]:
+                    for key in keys:
+                        if key in holder:
+                            del holder[key]
+                            dropped += 1
+            except Exception:
+                continue
+    finally:
+        for opened in source:
+            opened.close()
+    return dropped
+
+
+def _drop_thumbnails(pdf) -> int:
+    """Delete every page's /Thumb — a small picture of the page as it was —
+    and return how many went. Every page of a redacted output, not only the
+    ones a box was on: it is one entry, and nobody misses it."""
+    removed = 0
+    for obj in list(pdf.objects):
+        try:
+            if (isinstance(obj, pikepdf.Dictionary) and "/Thumb" in obj
+                    and _name_of(obj, "/Type") == "/Page"):
+                del obj["/Thumb"]
+                removed += 1
         except Exception:
             continue
     return removed
@@ -2339,6 +2769,13 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
         #    signature is a field's value) ----------------------------------
         try:
             bump("signatures", _scrub_signatures(pdf, objects, finder))
+        except Exception:
+            pass
+
+        # -- annotations whose appearance draws a term leave their page ----
+        try:
+            bump("annotations", _lift_annotations_drawing(pdf, annotations, terms,
+                                                          case_sensitive))
         except Exception:
             pass
 
@@ -2624,7 +3061,9 @@ def _scrub_embedded_file_names(doc, terms: list[str], case_sensitive: bool) -> l
 
 
 def _flatten_pages_to_image(src_path: str, dst_path: str,
-                            page_indices: list[int], dpi: int = 150) -> None:
+                            page_indices: list[int], dpi: int = 150, *,
+                            terms: list[str] | None = None, case_sensitive: bool = False,
+                            boxes: dict | None = None) -> dict[int, int]:
     """Write *dst_path* as a copy of *src_path* with only *page_indices*
     (0-based) rasterized to a full-page image (D1 flatten fallback).
 
@@ -2634,17 +3073,46 @@ def _flatten_pages_to_image(src_path: str, dst_path: str,
     keeping page size and orientation. Only the named pages are touched —
     never the whole document. (Callers hold 1-based page numbers from the
     verification report; convert before calling.)
+
+    A page is blacked out before it becomes a picture (#119). Once it is
+    one, no check has text to find on it, so whatever is still drawn there
+    is in the output for good — and a page is flattened exactly because
+    something could not be removed from it. Every place the matcher still
+    finds one of *terms* on the page (pdf_verify.term_boxes: the page's
+    text, text a clip hides, and what a shown annotation or form field
+    draws, which is the same reading of the page the picture is made from)
+    and every rectangle in *boxes* ({page index: [fitz.Rect]}, the user's
+    own) is filled black on the pixmap itself. Not on the page: there an
+    annotation could be painted over the fill. Returns {page index: how
+    many areas were filled} for the flattened pages.
+
+    A residual the matcher cannot put anywhere on the page — bytes in a
+    content stream that are no text it reads — is not covered by this.
     """
     flag = set(page_indices)
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
+    filled: dict[int, int] = {}
     src = fitz.open(src_path)
     out = fitz.open()
     try:
         for i in range(len(src)):
             if i in flag:
                 p = src[i]
+                areas = list(term_boxes(p, terms, case_sensitive)) if terms else []
+                areas += list((boxes or {}).get(i, []))
                 pix = p.get_pixmap(matrix=mat, alpha=False)
+                # Rectangles are in the page's own coordinates, before any
+                # /Rotate; the picture is of the page as it is shown.
+                to_picture = p.rotation_matrix * mat
+                for area in areas:
+                    spot = fitz.Rect(area) * to_picture
+                    spot.normalize()
+                    spot = fitz.IRect(math.floor(spot.x0) - 1, math.floor(spot.y0) - 1,
+                                      math.ceil(spot.x1) + 1, math.ceil(spot.y1) + 1) & pix.irect
+                    if not spot.is_empty:
+                        pix.set_rect(spot, (0,) * pix.n)
+                filled[i] = len(areas)
                 np_ = out.new_page(width=p.rect.width, height=p.rect.height)
                 np_.insert_image(np_.rect, pixmap=pix)
             else:
@@ -2653,6 +3121,7 @@ def _flatten_pages_to_image(src_path: str, dst_path: str,
     finally:
         out.close()
         src.close()
+    return filled
 
 
 def _source_file_ids(doc, input_path: str, password: str | None = None) -> list[str]:
@@ -2748,6 +3217,51 @@ def _redact_boxes(page, boxes: list) -> int:
             page.delete_widget(wdg)
     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
     return len(boxes)
+
+
+def _annotations_under(page, boxes: list) -> int:
+    """Take off *page* every annotation whose rectangle overlaps one of
+    *boxes* — boxes the user drew — and return how many went.
+
+    apply_redactions() leaves annotations alone (its own marks and links
+    aside), and an annotation is painted above the page: a stamp, a picture
+    of a signature or a note's icon lying over a box is painted above the
+    box. With each goes its popup and whatever replies to it, however deep
+    (PyMuPDF takes the popup and the first level of replies itself).
+    Widgets have been dealt with by _redact_boxes; a popup is not judged by
+    its own rectangle, it draws nothing on the page. Links are MuPDF's to
+    remove, and are removed here too in case it did not.
+    """
+    if not boxes:
+        return 0
+    doc = page.parent
+    doomed = {annot.xref for annot in list(page.annots() or [])
+              if any(box.intersects(annot.rect) for box in boxes)}
+    if doomed:
+        grew = True
+        while grew:                      # replies, and replies to replies
+            grew = False
+            for xref, _kind, _name in page.annot_xrefs():
+                if xref in doomed:
+                    continue
+                kind, value = doc.xref_get_key(xref, "IRT")
+                if kind == "xref" and int(value.split()[0]) in doomed:
+                    doomed.add(xref)
+                    grew = True
+        for xref in sorted(doomed):
+            try:
+                annot = page.load_annot(xref)
+            except Exception:
+                continue                 # it went with the one it replied to
+            if annot is not None:
+                page.delete_annot(annot)
+    for link in page.get_links():
+        try:
+            if any(box.intersects(link["from"]) for box in boxes):
+                page.delete_link(link)
+        except Exception:
+            continue
+    return len(doomed)
 
 
 def _refusal_message(failed) -> str:
@@ -2867,10 +3381,10 @@ def redact_pdf(
         rects_by_page.setdefault(int(r["page"]), []).append(r)
     target = list(pages) if pages is not None else list(range(len(doc)))
 
-    def redact_pages(doc) -> tuple[int, set]:
+    def redact_pages(doc) -> tuple[int, set, int]:
         """Redact the page content of *doc*; returns (rectangles drawn,
-        pages touched)."""
-        total, drawn, touched = len(doc), 0, set()
+        pages touched, annotations taken from under the user's boxes)."""
+        total, drawn, touched, lifted = len(doc), 0, set(), 0
         for i, pno in enumerate(target):
             if cancel and cancel.is_set():
                 doc.close()
@@ -2886,12 +3400,18 @@ def redact_pdf(
             # characters, and search_for's hits beside them, each widened to
             # the whole words it touches. It honours case_sensitive itself.
             boxes: list[fitz.Rect] = term_boxes(page, scrub_terms, case_sensitive)
+            drawn_by_hand = []
             for rr in rects_by_page.get(pno, []):
                 rect = fitz.Rect(rr["x0"], rr["y0"], rr["x1"], rr["y1"])
                 if not rect.is_empty and rect.is_valid:
-                    boxes.append(rect)
+                    drawn_by_hand.append(rect)
+            boxes.extend(drawn_by_hand)
 
             added = _redact_boxes(page, boxes)
+            # Nothing is drawn above a box: what lies over one drawn by hand
+            # goes. (What draws a term is found by what it draws, later, in
+            # the scrub.)
+            lifted += _annotations_under(page, drawn_by_hand)
             # Taking a word out can leave its neighbours reading as the term
             # ("a" [removed] "b" for the term "a b"). The verifier would find
             # that and refuse; look again and box it instead. Bounded: a box
@@ -2909,7 +3429,7 @@ def redact_pdf(
             if added:
                 drawn += added
                 touched.add(pno)
-        return drawn, touched
+        return drawn, touched, lifted
 
     # MuPDF checks a file's objects as it comes to read them. One it finds
     # damaged makes it go back to the file and rebuild everything from there
@@ -2917,7 +3437,7 @@ def redact_pdf(
     # gone, without a word. If that happens between here and the end of the
     # save below, the redaction is what is gone.
     repaired_at_start = bool(doc.is_repaired)
-    hit_count, pages_touched = redact_pages(doc)
+    hit_count, pages_touched, lifted = redact_pages(doc)
 
     # The page-content redaction is done; now widen the scrub and write the
     # output atomically. Saved even when hit_count == 0 -- a term can live
@@ -2927,6 +3447,7 @@ def redact_pdf(
     temps: list[str] = []
     surface_counts: dict[str, int] = {}
     flattened: list[int] = []
+    flattened_areas: dict[int, int] = {}
 
     def _mktmp() -> str:
         fd, t = tempfile.mkstemp(suffix=".pdf", dir=out_dir)
@@ -2955,7 +3476,7 @@ def redact_pdf(
             # so the same work done on it holds. Once: it cannot be repaired
             # twice.
             doc = fitz.open(work)
-            hit_count, pages_touched = redact_pages(doc)
+            hit_count, pages_touched, lifted = redact_pages(doc)
             emb_gone = _scrub_embedded_file_names(doc, scrub_terms, case_sensitive)
             work = _mktmp()
             doc.save(work, garbage=4, deflate=True, clean=True)
@@ -2966,6 +3487,8 @@ def redact_pdf(
             surface_counts["page_content"] = hit_count
         if emb_hits:
             surface_counts["embedded_files"] = emb_hits
+        if lifted:
+            surface_counts["annotations"] = lifted
         # The temp is fitz-saved from the authenticated doc — always
         # plaintext, so the scrub (and verify below) need no password.
         doc_scrub = _scrub_document_surfaces(work, scrub_terms, case_sensitive,
@@ -2981,7 +3504,18 @@ def redact_pdf(
             flat = _mktmp()
             # flatten_pages are 1-based (as the verification report and UI
             # count pages); _flatten_pages_to_image takes 0-based indices.
-            _flatten_pages_to_image(work, flat, [int(p) - 1 for p in flatten_pages])
+            # What can still be found on a page, and the user's own boxes,
+            # are blacked out on the picture itself.
+            by_hand: dict[int, list] = {}
+            for pno, entries in rects_by_page.items():
+                for rr in entries:
+                    rect = fitz.Rect(rr["x0"], rr["y0"], rr["x1"], rr["y1"])
+                    if not rect.is_empty and rect.is_valid:
+                        by_hand.setdefault(pno, []).append(rect)
+            filled = _flatten_pages_to_image(
+                work, flat, [int(p) - 1 for p in flatten_pages],
+                terms=scrub_terms, case_sensitive=case_sensitive, boxes=by_hand)
+            flattened_areas = {pno + 1: n for pno, n in sorted(filled.items())}
             final_src = flat
             flattened = sorted(set(int(p) for p in flatten_pages))
 
@@ -2994,9 +3528,14 @@ def redact_pdf(
             # The original of a form or an image the pages now have a
             # redacted copy of must not ride along on the structure tree.
             # Here, not in the scrub: a box drawn by hand leaves one too.
-            stale = _drop_stale_structure_refs(pdf)
-            if stale:
-                surface_counts["structure_refs"] = stale
+            # First what the tree says in words of content a box removed
+            # (it is told from the originals), then the thumbnails.
+            for key, n in (("structure_text", _drop_structure_text(
+                               pdf, input_path, password, pages_touched)),
+                           ("structure_refs", _drop_stale_structure_refs(pdf)),
+                           ("thumbnails", _drop_thumbnails(pdf))):
+                if n:
+                    surface_counts[key] = n
             save_with_content_id(pdf, candidate, fix_metadata_version=False)
 
         # Verify, then commit (fail-closed, #99): every target must be
@@ -3042,4 +3581,5 @@ def redact_pdf(
         surface_counts=surface_counts,
         verification=report.to_dict(),
         flattened_pages=flattened,
+        flattened_areas=flattened_areas,
     )

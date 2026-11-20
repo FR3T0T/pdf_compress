@@ -291,6 +291,24 @@ class TestWithNoWhitespaceAtAll:
         _res, out = _redact(tmp_path, src, term)
         assert _words(out) == left
 
+    @pytest.mark.parametrize("shown, mapped", [
+        ("see W H I T F I E L D's file", None),
+        ("see W H I T F I E L D\001s file", {1: chr(0x2019)}),
+        ("see W H I T F I E L D' file", None),
+    ], ids=["an apostrophe and s", "the curly apostrophe", "an apostrophe alone"])
+    def test_an_apostrophe_after_the_last_letter_is_the_end_of_the_word(self, tmp_path, shown,
+                                                                        mapped):
+        """The last "word" of the letter-spaced name is "D's": the term
+        ends inside it, at an apostrophe."""
+        src = _pdf(tmp_path / "src.pdf", _lines(shown), to_unicode=mapped)
+        _res, out = _redact(tmp_path, src, "Whitfield")
+        assert _words(out) == ["see", "file"]
+
+    def test_a_letter_after_the_last_letter_is_not(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _lines("see W H I T F I E L Ds file"))
+        with pytest.raises(ValueError, match="No matching content"):
+            redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=["Whitfield"])
+
     @pytest.mark.parametrize("shown, term", [
         ("values 1.0000 0.2000 end", "00000"),       # a real file's table of numbers
         ("the order 12 345 67 stands", "2345"),

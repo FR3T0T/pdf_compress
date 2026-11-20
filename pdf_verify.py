@@ -501,6 +501,9 @@ _FOLD_TABLE = {0x2010: "-", 0x2011: "-", **{ord(c): None for c in _INVISIBLE}}
 #: PageText views.
 _SPACED, _DEHYPHENATED, _JOINED, _SOLID = range(4)
 
+#: The straight apostrophe and the curly one (U+2019): see _solid_ok.
+_APOSTROPHES = "'" + chr(0x2019)
+
 #: Text flags for the matcher. What page.get_text() reads by default, less
 #: one: TEXT_MEDIABOX_CLIP, which also drops text a clipping path hides. A
 #: stamp cut off at "APPRO" by its clip still has "APPROVED" in the content
@@ -707,7 +710,9 @@ class PageText:
         letters and digits may not: the term "00000" is not in "1.0000
         0.2000", though the digits are there in a row once the space is
         gone. (Taking a full stop for the edge of a word found exactly that
-        in a real file's table of numbers, and nothing true.)
+        in a real file's table of numbers, and nothing true.) One thing may
+        follow the last letter: an apostrophe and what it brings, so that
+        "W H I T F I E L D's file" is found — its last word is "D's".
         """
         text, owner = self._view(_SOLID)
         i = at
@@ -719,6 +724,8 @@ class PageText:
         while i + 1 < len(text) and (owner[i + 1] == owner[i]
                                      or not self._apart(owner[i], owner[i + 1])):
             i += 1
+            if i == end and text[i] in _APOSTROPHES:
+                break
             if text[i].isalnum():
                 return False
         return True
@@ -1306,6 +1313,244 @@ def _rect_region_check(doc, rects: list[dict]) -> VerificationCheck:
         passed=not ev, evidence=ev)
 
 
+#: Keys that lead out of the structure tree: to a page, to an annotation or
+#: an XObject, to a content stream.
+STRUCTURE_WAYS_OUT = ("/Pg", "/Obj", "/Stm", "/StmOwn")
+#: /Type of the dictionaries that make up the structure tree.
+_STRUCTURE_TYPES = ("/StructTreeRoot", "/StructElem", "/MCR", "/OBJR")
+
+
+def structure_stream(kid):
+    """The stream a kid of a structure element names — the content stream
+    of a marked-content reference (/Stm), the XObject of an object
+    reference (/Obj) — or None."""
+    if isinstance(kid, pikepdf.Dictionary):
+        for key in ("/Stm", "/Obj"):
+            target = kid.get(key)
+            if isinstance(target, pikepdf.Stream):
+                return target
+    return None
+
+
+def structure_kids(elem) -> list:
+    """The kids of structure element *elem*, as a list."""
+    kids = elem.get("/K")
+    return list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+
+
+def structure_stream_refs(pdf) -> tuple[list, set, set]:
+    """(holders, named, alive) for the structure tree of *pdf*: the
+    dictionaries of the tree that have a kid naming a stream, the (num,
+    gen) of every stream so named, and those of them something outside the
+    tree leads to as well.
+
+    A stream that is named and not alive is in the file for the structure
+    tree alone. After a redaction that is the unredacted original of a
+    form, an image or a page's content, which the page has a redacted copy
+    of: redact_pdf removes the reference (pdf_ops._drop_stale_structure_refs)
+    and verify_redaction checks that none is left. "Outside the tree" is
+    tested by walking the file from the trailer without entering the tree,
+    not through the catalog and not through a bookmark's /SE.
+    """
+    holders: list = []
+    named: set = set()
+    try:
+        root = pdf.Root.get("/StructTreeRoot")
+    except Exception:
+        root = None
+    if not isinstance(root, pikepdf.Dictionary):
+        return holders, named, set()
+
+    seen, stack = set(), [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            if not isinstance(cur, (pikepdf.Dictionary, pikepdf.Array)):
+                continue
+            if cur.is_indirect:
+                ident = tuple(cur.objgen)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            if isinstance(cur, pikepdf.Array):
+                stack.extend(cur)
+                continue
+            if _type_name(cur) in ("/Page", "/Pages", "/Catalog"):
+                continue
+            if "/K" in cur:
+                streams = [s for s in map(structure_stream, structure_kids(cur)) if s is not None]
+                if streams:
+                    holders.append(cur)
+                    named.update(tuple(s.objgen) for s in streams)
+            stack.extend(cur[k] for k in cur.keys() if k not in STRUCTURE_WAYS_OUT)
+        except Exception:
+            continue
+    alive: set = set()
+    if not named:
+        return holders, named, alive
+
+    containers = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
+    seen, stack = set(), [pdf.trailer]
+    while stack and len(alive) < len(named):
+        cur = stack.pop()
+        try:
+            if not isinstance(cur, containers):
+                continue
+            if cur.is_indirect:
+                ident = tuple(cur.objgen)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                if ident in named:
+                    alive.add(ident)
+            if isinstance(cur, pikepdf.Array):
+                stack.extend(cur)
+                continue
+            if _type_name(cur) in _STRUCTURE_TYPES:
+                continue
+            stack.extend(cur[k] for k in cur.keys() if k not in ("/StructTreeRoot", "/SE"))
+        except Exception:
+            continue
+    return holders, named, alive
+
+
+def _whole_file_checks(output_path: str, password: Optional[str] = None) -> list[VerificationCheck]:
+    """Two checks every redaction gets, by term or by box, read with pikepdf
+    from the output as a whole (#119, R3).
+
+    ``redaction.structure_streams``: no stream is in the file for the
+    structure tree alone (structure_stream_refs). ``redaction.thumbnails``:
+    no page carries a /Thumb, a small picture of the page as it was. Both
+    are document-level: making a page a picture does not mend either. An
+    output that cannot be read fails both, marked unevaluated.
+    """
+    kept: list[str] = []
+    thumbs: list[str] = []
+    problem = None
+    kwargs = {"password": password} if password else {}
+    try:
+        with pikepdf.open(output_path, **kwargs) as pdf:
+            _holders, named, alive = structure_stream_refs(pdf)
+            if named - alive:
+                n = len(named - alive)
+                kept.append(f"{n} stream{'' if n == 1 else 's'} in the file can be reached only "
+                            f"through the structure tree: the original of content a page now "
+                            f"has a redacted copy of (document-level)")
+            in_tree = set()
+            for number, page in enumerate(pdf.pages, 1):
+                in_tree.add(tuple(page.obj.objgen))
+                if "/Thumb" in page.obj:
+                    thumbs.append(f"page {number} still carries a thumbnail of the page as "
+                                  f"it was (document-level)")
+            for obj in pdf.objects:
+                try:
+                    if (isinstance(obj, pikepdf.Dictionary) and "/Thumb" in obj
+                            and _type_name(obj) == "/Page" and tuple(obj.objgen) not in in_tree):
+                        thumbs.append("a page outside the page tree still carries a thumbnail "
+                                      "of the page as it was (document-level)")
+                except Exception:
+                    continue
+    except Exception as exc:
+        problem = (f"the output could not be read for this check "
+                   f"({type(exc).__name__}) (document-level)")
+    return [
+        VerificationCheck(
+            id="redaction.structure_streams",
+            description="No stream is kept in the file by the structure tree alone",
+            passed=not (kept or problem), evidence=kept or ([problem] if problem else []),
+            unevaluated=bool(problem)),
+        VerificationCheck(
+            id="redaction.thumbnails",
+            description="No page carries a thumbnail of itself",
+            passed=not (thumbs or problem),
+            evidence=_dedupe(thumbs) or ([problem] if problem else []),
+            unevaluated=bool(problem)),
+    ]
+
+
+def _valid_rects(doc, rects: list[dict]) -> list[tuple]:
+    """(page index, fitz.Rect) for each entry of *rects* that names a page
+    of *doc* and a real area. The others are _rect_region_check's to fail;
+    the checks that use this have nothing to look under them."""
+    found = []
+    for r in rects:
+        try:
+            pno = int(r["page"])
+            rect = fitz.Rect(float(r["x0"]), float(r["y0"]), float(r["x1"]), float(r["y1"]))
+        except Exception:
+            continue
+        if 0 <= pno < len(doc) and rect.is_valid and not rect.is_empty:
+            found.append((pno, rect))
+    return found
+
+
+_NUMBER_RE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)")
+
+
+def _annotation_rect(doc, page, xref: int):
+    """The rectangle of annotation *xref* in the coordinates redaction
+    rectangles are given in (PyMuPDF's, on the page before any rotation),
+    or None if it has none that can be read. Read from the object itself:
+    PyMuPDF's own annotation objects do not cover links, popups or
+    widgets."""
+    kind, value = doc.xref_get_key(xref, "Rect")
+    if kind == "xref":
+        value = doc.xref_object(int(value.split()[0]), compressed=True)
+    elif kind != "array":
+        return None
+    numbers = _NUMBER_RE.findall(value)
+    if len(numbers) != 4 or "R" in value.split():
+        return None
+    rect = fitz.Rect(*map(float, numbers))
+    rect.normalize()
+    rect = rect * page.transformation_matrix
+    rect.normalize()
+    return rect
+
+
+def _rect_annotation_check(doc, rects: list[dict]) -> VerificationCheck:
+    """No annotation is left lying over a redaction rectangle.
+
+    An annotation is painted above the page, so one that overlaps a box is
+    painted above the box: a stamp, a signature picture, a note's icon.
+    redact_pdf takes them off the page (and a widget's field is emptied as
+    before); this is what would notice if it did not. Every kind of
+    annotation counts but a popup, which draws nothing of its own on the
+    page and goes with the note it belongs to. One whose rectangle cannot
+    be read fails the check: it could be anywhere.
+    """
+    ev: list[str] = []
+    by_page: dict[int, list] = {}
+    for pno, rect in _valid_rects(doc, rects):
+        by_page.setdefault(pno, []).append(rect)
+    for pno, boxes in sorted(by_page.items()):
+        try:
+            page = doc[pno]
+            listed = list(page.annot_xrefs())
+        except Exception as exc:
+            ev.append(f"annotations on page {pno + 1} could not be read for "
+                      f"verification ({type(exc).__name__})")
+            continue
+        for xref, _kind, _name in listed:
+            try:
+                subtype = doc.xref_get_key(xref, "Subtype")[1].lstrip("/") or "unknown"
+                if subtype == "Popup":
+                    continue
+                rect = _annotation_rect(doc, page, xref)
+            except Exception:
+                subtype, rect = "unknown", None
+            if rect is None:
+                ev.append(f"the rectangle of a {subtype} annotation on page {pno + 1} "
+                          f"could not be read for verification")
+            elif any(rect.intersects(box) for box in boxes):
+                ev.append(f"a {subtype} annotation still lies over a redaction "
+                          f"rectangle on page {pno + 1}")
+    return VerificationCheck(
+        id="redaction.rect_annotations",
+        description="No annotation lies over a redaction rectangle",
+        passed=not ev, evidence=_dedupe(ev))
+
+
 def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                      rects: Optional[list[dict]] = None,
                      case_sensitive: bool = False,
@@ -1373,8 +1618,10 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                 output_path, terms, case_sensitive, password))
         if rects:
             report.checks.append(_rect_region_check(doc, rects))
+            report.checks.append(_rect_annotation_check(doc, rects))
     finally:
         doc.close()
+    report.checks.extend(_whole_file_checks(output_path, password))
     if source_ids is not None:
         report.checks.append(_file_id_check(
             "redaction.file_id", output_path, source_ids, source_sha256,

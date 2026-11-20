@@ -158,7 +158,7 @@ def _page_metadata(pdf) -> None:
 def _catalog_xmp(encoding: str):
     def plant(pdf) -> None:
         xml = f"<x:xmpmeta xmlns:x='adobe:ns:meta/'><creator>{TERM}</creator></x:xmpmeta>"
-        packet = pdf.make_stream(("﻿" + xml).encode(encoding))
+        packet = pdf.make_stream(("\ufeff" + xml).encode(encoding))
         packet["/Type"], packet["/Subtype"] = Name.Metadata, Name.XML
         pdf.Root["/Metadata"] = packet
     return plant
@@ -279,8 +279,8 @@ class TestTermSweep:
 
     @pytest.mark.parametrize("value, found", [
         (String(f"note about {TERM}"), True),                               # PDFDocEncoding
-        (String(("﻿" + f"note about {TERM}").encode("utf-16-be")), True),
-        (String(("﻿" + f"note about {TERM}").encode("utf-16-le")), True),
+        (String(("\ufeff" + f"note about {TERM}").encode("utf-16-be")), True),
+        (String(("\ufeff" + f"note about {TERM}").encode("utf-16-le")), True),
         (String(f"café {TERM} naïve".encode("utf-8")), True),
         (String(f"{TERM[:4]}\n   {TERM[4:]}"), False),                      # broken mid-word
         (String("nothing here"), False),
@@ -315,7 +315,7 @@ class TestTermSweep:
         def plant(pdf):
             shared = _form(pdf, f"footer for {TERM}")
             for page in pdf.pages:
-                page.obj["/Thumb"] = shared             # held, never painted
+                page.obj["/Stash"] = shared             # held, never painted
         src = _pdf(tmp_path / "s.pdf", plant, pages=3)
         report = verify_redaction(src, [TERM])
         assert _check(report, SWEEP).pages == [1, 2, 3]
@@ -607,7 +607,16 @@ class TestWhatHasNoRuleIsRefused:
         assert not os.path.exists(out) and os.listdir(tmp_path) == ["src.pdf"]
 
     def test_a_hidden_appearance_is_refused_with_the_flatten_offer(self, tmp_path):
-        src = _with_term_on_page(tmp_path / "src.pdf", _hidden_stamp)
+        """A form field's stale appearance: the field says nothing of the
+        term, the appearance still draws it. (An annotation that is not a
+        field is taken off the page for this, #119 R3; a field is not.)"""
+        def plant(pdf):
+            field = pdf.make_indirect(Dictionary(
+                Type=Name.Annot, Subtype=Name.Widget, FT=Name.Tx, T=String("who"),
+                Rect=[0, 0, 0, 0], F=2, AP=Dictionary(N=_form(pdf, f"typed by {TERM}"))))
+            pdf.pages[0].obj["/Annots"] = Array([field])
+            pdf.Root["/AcroForm"] = Dictionary(Fields=Array([field]))
+        src = _with_term_on_page(tmp_path / "src.pdf", plant)
         out = str(tmp_path / "out.pdf")
         with pytest.raises(RedactionVerificationError) as ei:
             redact_pdf(src, out, search_terms=[TERM])

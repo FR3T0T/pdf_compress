@@ -888,9 +888,10 @@ class TestRedactFlatten:
         out = str(tmp_path / "f_out.pdf")
         monkeypatch.setattr(fitz.Page, "apply_redactions",
                             lambda self, **k: None)
-        # Flatten is also a no-op → the leak survives the retry too.
+        # Flatten is also a no-op → the leak survives the retry too. (It
+        # reports the areas it blacked out on each picture: none.)
         monkeypatch.setattr("pdf_ops._flatten_pages_to_image",
-                            lambda s, d, p, **k: __import__("shutil").copyfile(s, d))
+                            lambda s, d, p, **k: __import__("shutil").copyfile(s, d) and {})
         with pytest.raises(RedactionVerificationError) as ei:
             redact_pdf(src, out, search_terms=["SECRET_TERM"], flatten_pages=[1])
         assert ei.value.flatten_pages is None       # no third fallback offered

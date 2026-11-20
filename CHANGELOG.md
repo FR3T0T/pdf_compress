@@ -70,7 +70,8 @@
   broken at a line end with no hyphen — and so also redacts two words that
   spell the term between them ("now here" for "nowhere"). It is accepted
   only as whole words run together: the term "00000" is not found in
-  "1.0000 0.2000". The matcher reads text a clipping path hides (a stamp cut
+  "1.0000 0.2000". An apostrophe may follow the last letter ("W H I T F I E
+  L D's file"). The matcher reads text a clipping path hides (a stamp cut
   off at "APPRO" still has "APPROVED" in the file), as `search_for` did.
   Scripts written without spaces (Chinese, Japanese, Thai and others) are not
   widened to "the whole word".
@@ -641,6 +642,71 @@
   code with no remaining callers.
 
 ### Fixed
+- **Redaction: nothing is drawn above a box any more (#119).** An annotation
+  is painted above the page, and PyMuPDF's redaction leaves every annotation
+  alone but its own marks and links. A stamp lying over a box drawn by hand
+  was still painted over it; a stamp that says the search term went on
+  saying it. Both runs were refused and the page offered for flattening,
+  and the flattened page showed the stamp (next entry). A box over a
+  picture of a signature, which has no text for any check to find, simply
+  verified. Now: in a search, an annotation whose appearance draws a term
+  is taken off its page. "Draws" is asked of the page-text matcher, on the
+  text of each of its appearance streams — normal, rollover and down, every
+  state, shown or hidden — so a term broken across two lines of a stamp is
+  found as it would be on a page. Under a box drawn by hand, every
+  annotation whose rectangle overlaps the box is taken off, whatever it
+  draws. With each goes its popup and everything that replies to it,
+  however deep. Counted in `surface_counts` as `annotations`. A form
+  field's widget keeps the path it had (value emptied, appearance dropped,
+  removed under a box); a popup is judged with its note, not by its own
+  rectangle; an annotation that is on no page loses the appearance that
+  drew the term. The verifier gains `redaction.rect_annotations`: no
+  annotation lies over a redaction rectangle. On the real-file run (1,139
+  public PDFs, one word each) the two files that were refused for this now
+  verify without flattening — 17 "APPROVED" stamps in one, a Sound
+  annotation labelled "SOUND" in the other — which makes 544 verified and 5
+  refused, from 542 and 7; nothing else moves, and no file gets a
+  different number of rectangles. Tests:
+  `TestAnAnnotationThatDrawsATerm`, `TestAnAnnotationUnderABox`,
+  `TestTheVerifierLooksForAnnotationsOverABox` in
+  `tests/test_redact_engine.py`.
+- **Redaction: a page made a picture is blacked out first (#119).** The
+  flatten fallback rendered the page and put the picture in its place. A
+  page is flattened because something on it could not be removed, so that
+  something was in the picture — and afterwards no check had text to find:
+  the run verified with the word readable. Before a page becomes a picture,
+  every place the matcher still finds a term on it (page text, text a clip
+  hides, what a shown annotation or form field draws) and every box the
+  user drew are filled black on the pixmap itself, where nothing can be
+  painted over the fill. `RedactResult.flattened_areas` records how many
+  areas per flattened page. Not covered: a residual the matcher cannot put
+  anywhere on the page. Tests: `TestAFlattenedPageIsBlackedOutFirst`, with
+  removal switched off.
+- **Redaction: a tagged file kept its description of what a box removed
+  (#119).** A structure element can say in words what its content is: `/Alt`
+  on a figure, `/ActualText`, `/E`, a title `/T`. A box over the figure
+  removed the picture and left "photo of ...", and the output verified. An
+  element whose own content a box removed — a term box or one drawn by
+  hand — now loses those four entries, and every element above it loses
+  `/Alt`, `/ActualText` and `/E`, which speak for all that is under them.
+  "Removed" is decided by comparing what each marked-content sequence
+  paints (the text shown, each image's data, each form, the number of paths
+  and shadings) in the source and in the redacted page, and for a form
+  XObject in the original and in the redacted copy the page now paints; an
+  object reference counts when its annotation is on no page any more.
+  Whatever cannot be compared counts as removed. On 63 tagged real files
+  the comparison marks 150 of 1,438 sequences, only on pages with a box,
+  and gives the same answer on PyMuPDF 1.27 and 2.1. Counted as
+  `structure_text`. The verifier also gains `redaction.structure_streams`,
+  the check for what `structure_refs` fixes: no stream is in the output for
+  the structure tree alone. Tests:
+  `TestWhatATaggedFileSaysOfRemovedContent`,
+  `TestNoStreamIsKeptByTheStructureTreeAlone`.
+- **Redaction: page thumbnails are removed (#119).** `/Thumb` is a small
+  picture of the page as it was, and it was kept. It is deleted from every
+  page of a redacted output (`thumbnails` in `surface_counts`), and
+  `redaction.thumbnails` checks that none is left. Tests:
+  `TestPageThumbnails`.
 - **Redaction: the unredacted original of a form, an image or a page could
   stay in a tagged file (#119).** PyMuPDF does not edit a form XObject, an
   image or a page's content stream in place: the page is given a redacted
