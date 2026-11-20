@@ -642,6 +642,45 @@
   code with no remaining callers.
 
 ### Fixed
+- **Redaction: a term box takes only its own characters (#119).** PyMuPDF
+  removes a character if its box overlaps a redaction rectangle at all, and
+  a character's box is as tall as its line. In type set close, the box of a
+  found word took letters, or whole words, from the lines above and below:
+  "prestations" came out as "prestatio". A term box is now applied in two
+  steps. First the text is removed with the box trimmed, top and bottom, to
+  where characters that are not part of the hit stop reaching into it —
+  never past the middle half of its height, which every character of the
+  hit crosses — with nothing filled and no image or drawing touched. Then
+  the whole box is applied with the text kept, so the black fill and the
+  pixels of a scan under it are covered exactly as before. If a hit
+  survives the trimmed step, the page's re-search finds it and applies the
+  whole box with the text removed, so trimming cannot cost a removal (on
+  the real files that happens only where an annotation draws the word).
+  Boxes drawn by hand are not trimmed; nor is a line that does not run
+  across the page. On 544 real files verified before and after: word
+  instances that left the pages without holding the term went from 1,049 to
+  628, leftover fragments from 322 to 214; words holding the term that left
+  stayed at 7,570, and no file gets a different number of rectangles or a
+  different outcome. What is still lost is mostly not a neighbour at all:
+  the other words of an annotation or form field that is removed whole, the
+  two halves of a hyphenated hit, and lines printed over one another. New:
+  `pdf_verify.term_hits` gives each rectangle with its trimmed one. Tests:
+  `TestATermBoxTakesOnlyItsOwnCharacters`.
+- **Redaction: line art under a box drawn by hand (#119).** A stroked path
+  under a box stayed in the page's content, under the fill, unless it lay
+  wholly inside the box as PyMuPDF measures that — by a curve's control
+  points, not by where the curve runs. A signature drawn as curves could
+  stay. PyMuPDF's other setting removes every drawing whose bounding box
+  overlaps the box, a table's frame or a long rule included, so it is used
+  only when nothing else would go: when every drawing that reaches a box
+  lies wholly inside one by where its path runs. Otherwise the default
+  stays, and the new check `redaction.rect_line_art` fails when a drawing
+  still has an edge inside a box. That is a page-content failure: the page
+  is offered for flattening, and the box is then black on the picture. A
+  solid black rectangle is not counted (every box's own fill is one). Box
+  mode only; term boxes treat line art as before. Tests:
+  `TestLineArtUnderABoxDrawnByHand`,
+  `TestTheVerifierLooksForLineArtInsideABox`.
 - **Redaction: nothing is drawn above a box any more (#119).** An annotation
   is painted above the page, and PyMuPDF's redaction leaves every annotation
   alone but its own marks and links. A stamp lying over a box drawn by hand
@@ -656,19 +695,27 @@
   found as it would be on a page. Under a box drawn by hand, every
   annotation whose rectangle overlaps the box is taken off, whatever it
   draws. With each goes its popup and everything that replies to it,
-  however deep. Counted in `surface_counts` as `annotations`. A form
-  field's widget keeps the path it had (value emptied, appearance dropped,
-  removed under a box); a popup is judged with its note, not by its own
-  rectangle; an annotation that is on no page loses the appearance that
-  drew the term. The verifier gains `redaction.rect_annotations`: no
-  annotation lies over a redaction rectangle. On the real-file run (1,139
+  however deep. Counted in `surface_counts` as `annotations_removed`;
+  `annotations` keeps its meaning, text scrubbed inside an annotation. A
+  form field's widget keeps the path it had (value emptied, appearance
+  dropped, removed under a box); a popup is judged with its note, not by its
+  own rectangle; an annotation that is on no page loses the appearance that
+  drew the term (counted as `annotations`: it is scrubbed, not removed). An
+  annotation written into the page's `/Annots` array itself, with no object
+  number, is taken off the page like any other in both modes: PyMuPDF's
+  list of a page's annotations leaves such an entry out, and 1.27 does not
+  delete a widget of that kind when asked to. The verifier gains
+  `redaction.rect_annotations`: no annotation lies over a redaction
+  rectangle (it reads the page's list entry by entry, so it sees those
+  too). On the real-file run (1,139
   public PDFs, one word each) the two files that were refused for this now
   verify without flattening — 17 "APPROVED" stamps in one, a Sound
   annotation labelled "SOUND" in the other — which makes 544 verified and 5
   refused, from 542 and 7; nothing else moves, and no file gets a
   different number of rectangles. Tests:
   `TestAnAnnotationThatDrawsATerm`, `TestAnAnnotationUnderABox`,
-  `TestTheVerifierLooksForAnnotationsOverABox` in
+  `TestTheVerifierLooksForAnnotationsOverABox`, `TestAnnotationCounts`,
+  `TestAnAnnotationWrittenIntoThePageList` in
   `tests/test_redact_engine.py`.
 - **Redaction: a page made a picture is blacked out first (#119).** The
   flatten fallback rendered the page and put the picture in its place. A

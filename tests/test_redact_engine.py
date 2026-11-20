@@ -185,7 +185,7 @@ class TestAnAnnotationThatDrawsATerm:
         assert res.verification["verified"] is True and res.flattened_pages == []
         # The page search reads what a shown annotation draws, so the word
         # also gets its box on the page, where it was.
-        assert res.surface_counts == {"page_content": 1, "annotations": 1}
+        assert res.surface_counts == {"page_content": 1, "annotations_removed": 1}
         assert _subtypes(out) == ["/Text"] and not _holds(out)
         with fitz.open(out) as doc:
             assert TERM not in doc[0].get_text()
@@ -205,7 +205,8 @@ class TestAnAnnotationThatDrawsATerm:
         src = _pdf(tmp_path / "src.pdf", plant)
         out = str(tmp_path / "out.pdf")
         res = redact_pdf(src, out, search_terms=[TERM])
-        assert res.verification["verified"] is True and res.surface_counts == {"annotations": 1}
+        assert res.verification["verified"] is True
+        assert res.surface_counts == {"annotations_removed": 1}
         assert _subtypes(out) == [] and not _holds(out)
 
     def test_a_term_the_page_search_cannot_join_up_is_found_in_it_too(self, tmp_path):
@@ -231,7 +232,7 @@ class TestAnAnnotationThatDrawsATerm:
         out = str(tmp_path / "out.pdf")
         res = redact_pdf(src, out, search_terms=[TERM])
         assert res.verification["verified"] is True
-        assert res.surface_counts.get("annotations") == 3     # the stamp and the two replies
+        assert res.surface_counts.get("annotations_removed") == 3   # the stamp, two replies
         assert _subtypes(out) == ["/Text", "/Popup"]          # the other note keeps its popup
         with pikepdf.open(out) as pdf:
             note, popup = pdf.pages[0].obj["/Annots"]
@@ -242,7 +243,8 @@ class TestAnAnnotationThatDrawsATerm:
             pdf, *_with_popup_and_replies(pdf, _stamp(pdf, "approved"))), body=f"about {TERM}")
         out = str(tmp_path / "out.pdf")
         res = redact_pdf(src, out, search_terms=[TERM])
-        assert res.verification["verified"] is True and "annotations" not in res.surface_counts
+        assert res.verification["verified"] is True
+        assert res.surface_counts == {"page_content": 1}
         assert _subtypes(out) == ["/Stamp", "/Popup", "/Text", "/Text"]
 
     def test_a_tagged_file_does_not_keep_what_it_drew(self, tmp_path):
@@ -302,7 +304,7 @@ class TestAnAnnotationUnderABox:
         out = str(tmp_path / "out.pdf")
         res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
         assert res.verification["verified"] is True and res.flattened_pages == []
-        assert res.surface_counts == {"page_content": 1, "annotations": 1}
+        assert res.surface_counts == {"page_content": 1, "annotations_removed": 1}
         assert _subtypes(out) == ["/Text"] and not _holds(out)
         box = [OVER_THE_STAMP[k] for k in ("x0", "y0", "x1", "y1")]
         assert _dark_share(out, box) > 0.99                  # nothing is drawn over the box
@@ -318,7 +320,7 @@ class TestAnAnnotationUnderABox:
         out = str(tmp_path / "out.pdf")
         res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
         assert res.verification["verified"] is True
-        assert _subtypes(out) == [] and res.surface_counts.get("annotations") == 1
+        assert _subtypes(out) == [] and res.surface_counts.get("annotations_removed") == 1
 
     def test_popup_and_replies_go_and_what_is_elsewhere_stays(self, tmp_path):
         def plant(pdf):
@@ -333,7 +335,7 @@ class TestAnAnnotationUnderABox:
         res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
         assert res.verification["verified"] is True
         assert _subtypes(out) == ["/Text", "/Popup", "/Link"]
-        assert res.surface_counts.get("annotations") == 3     # the stamp and its two replies
+        assert res.surface_counts.get("annotations_removed") == 3   # the stamp, two replies
 
     @pytest.mark.parametrize("rotate", [90, 180, 270])
     def test_on_a_turned_page(self, tmp_path, rotate):
@@ -757,3 +759,362 @@ class TestPageThumbnails:
         assert check.evidence == ["page 2 still carries a thumbnail of the page as it was "
                                   "(document-level)"]
         assert _check(verify_redaction(_pdf(tmp_path / "clean.pdf"), [TERM]), self.CHECK).passed
+
+
+# ── 9. Two counts for annotations ────────────────────────────────────────
+
+
+@pytest.mark.integration
+class TestAnnotationCounts:
+    """"annotations" is text scrubbed inside an annotation, as it has been.
+    An annotation taken off its page is counted as "annotations_removed"."""
+
+    def test_the_two_are_counted_apart(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: _on_page(
+            pdf, _stamp(pdf), _note(pdf, Contents=String(f"ask {TERM} first"))))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[TERM])
+        assert res.surface_counts == {"page_content": 1, "annotations": 1,
+                                      "annotations_removed": 1}
+        assert _subtypes(out) == ["/Text"]
+
+    def test_an_appearance_dropped_off_the_page_is_a_scrub_not_a_removal(self, tmp_path):
+        def plant(pdf):
+            root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+            root["/K"] = Array([pdf.make_indirect(Dictionary(
+                Type=Name.StructElem, S=Name.Annot, P=root,
+                K=Dictionary(Type=Name.OBJR, Obj=_stamp(pdf))))])
+            pdf.Root["/StructTreeRoot"] = root
+        src = _pdf(tmp_path / "src.pdf", plant, body=f"about {TERM}")
+        res = redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM])
+        assert res.surface_counts.get("annotations") == 1
+        assert "annotations_removed" not in res.surface_counts
+
+
+# ── 8. An annotation that is not an object of its own ────────────────────
+
+
+def _written_in_the_list(pdf, text: str = f"approved by {TERM}") -> None:
+    """A stamp whose dictionary stands in the page's /Annots array itself,
+    and a note that is an object of its own, elsewhere on the page."""
+    pdf.pages[0].obj["/Annots"] = Array([
+        Dictionary(Type=Name.Annot, Subtype=Name.Stamp, Rect=STAMP_RECT,
+                   AP=Dictionary(N=_drawn(pdf, text))),
+        _note(pdf, Contents=String("an unrelated note"))])
+
+
+@pytest.mark.integration
+class TestAnAnnotationWrittenIntoThePageList:
+    """PyMuPDF's list of a page's annotations leaves out one that has no
+    object number. It is on the page all the same."""
+
+    def test_the_fixture_is_what_it_claims(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _written_in_the_list)
+        with pikepdf.open(src) as pdf:
+            stamp, note = pdf.pages[0].obj["/Annots"]
+            assert not stamp.is_indirect and note.is_indirect
+
+    def test_under_a_box_it_leaves_the_page(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: _written_in_the_list(pdf, "approved"))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
+        assert res.verification["verified"] is True and res.flattened_pages == []
+        assert res.surface_counts == {"page_content": 1, "annotations_removed": 1}
+        assert _subtypes(out) == ["/Text"]
+
+    def test_drawing_a_term_it_leaves_the_page(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _written_in_the_list)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[TERM])
+        assert res.verification["verified"] is True
+        assert res.surface_counts == {"page_content": 1, "annotations_removed": 1}
+        assert _subtypes(out) == ["/Text"] and not _holds(out)
+
+    def test_one_that_draws_no_term_and_is_under_no_box_stays(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: _written_in_the_list(pdf, "approved"),
+                   body=f"about {TERM}")
+        out = str(tmp_path / "out.pdf")
+        redact_pdf(src, out, search_terms=[TERM], rects=[OVER_NOTHING])
+        assert _subtypes(out) == ["/Stamp", "/Text"]
+
+    @pytest.mark.filterwarnings("ignore:This document has 1 form widget")     # the fixture's own
+    @pytest.mark.parametrize("rotate", [0, 90])
+    def test_a_form_field_s_widget_written_into_the_list_goes_under_a_box(self, tmp_path, rotate):
+        """PyMuPDF 1.27 does not delete such a widget when asked to (2.1
+        does): it was left under the box, and the run was refused."""
+        def plant(pdf):
+            pdf.pages[0].obj["/Annots"] = Array([Dictionary(
+                Type=Name.Annot, Subtype=Name.Widget, FT=Name.Tx, T=String("who"),
+                V=String(f"{TERM} Ltd"), Rect=STAMP_RECT, DA=String("/Helv 12 Tf 0 g"))])
+        src = _pdf(tmp_path / "src.pdf", plant, rotate=rotate)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
+        assert res.verification["verified"] is True and res.flattened_pages == []
+        assert _subtypes(out) == [] and not _holds(out)
+
+    def test_the_verifier_reads_its_rectangle(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: _written_in_the_list(pdf, "approved"))
+        check = _check(verify_redaction(src, rects=[OVER_THE_STAMP]), "redaction.rect_annotations")
+        assert check.passed is False
+        assert check.evidence == ["a Stamp annotation still lies over a redaction rectangle on page 1"]
+        assert _check(verify_redaction(src, rects=[OVER_NOTHING]),
+                      "redaction.rect_annotations").passed is True
+
+
+# ── 5. Line art under a box drawn by hand ────────────────────────────────
+
+#: A box, in PyMuPDF's coordinates (from the top of the 792-point page),
+#: and drawings in the page's own (from the bottom).
+ART_BOX = {"page": 0, "x0": 90, "y0": 142, "x1": 210, "y1": 202}        # y 590..650 from the bottom
+CURVE = b"0 0 1 RG 1 w 100 600 m 150 660 150 660 200 600 c S"           # runs inside, control points above
+INSIDE = b"0 0 1 RG 2 w 110 620 m 190 620 l S"                          # wholly inside
+RULE = b"0 0 1 RG 1 w 50 615 m 400 615 l S"                             # a long rule through the box
+FRAME = b"0 0 1 RG 1 w 80 580 140 80 re S"                              # a frame round the box
+EDGE = b"0 0 1 RG 1 w 90 590 m 210 590 l S"                             # a rule along the box's lower edge
+BLACK = b"0 g 100 600 40 20 re f"                                       # a solid black bar inside
+LINE_ART = "redaction.rect_line_art"
+
+
+def _art(*drawings: bytes):
+    def plant(pdf):
+        page = pdf.pages[0].obj
+        page["/Contents"] = pdf.make_stream(
+            page["/Contents"].read_bytes() + b"\n" + b"\n".join(drawings))
+    return plant
+
+
+def _edges_inside(path, box: dict) -> int:
+    """How many drawings of the page still have a point of their path
+    strictly inside *box* — a look of this file's own, by sampling."""
+    inside = 0
+    with fitz.open(path) as doc:
+        for d in doc[box["page"]].get_drawings():
+            if d.get("fill") == (0.0, 0.0, 0.0) and all(it[0] == "re" for it in d["items"]):
+                continue                                    # the redaction's own fill
+            points = []
+            for it in d["items"]:
+                if it[0] == "l":
+                    a, b = it[1], it[2]
+                    points += [(a.x + (b.x - a.x) * t / 40, a.y + (b.y - a.y) * t / 40)
+                               for t in range(41)]
+                elif it[0] == "c":
+                    p = it[1:5]
+                    for t in (n / 40 for n in range(41)):
+                        u = 1 - t
+                        w = (u ** 3, 3 * u * u * t, 3 * u * t * t, t ** 3)
+                        points.append((sum(k * q.x for k, q in zip(w, p, strict=True)),
+                                       sum(k * q.y for k, q in zip(w, p, strict=True))))
+                elif it[0] == "re":
+                    r = it[1]
+                    points += [(r.x0 + (r.x1 - r.x0) * t / 40, y) for t in range(41)
+                               for y in (r.y0, r.y1)]
+                    points += [(x, r.y0 + (r.y1 - r.y0) * t / 40) for t in range(41)
+                               for x in (r.x0, r.x1)]
+            if any(box["x0"] + 0.5 < x < box["x1"] - 0.5 and box["y0"] + 0.5 < y < box["y1"] - 0.5
+                   for x, y in points):
+                inside += 1
+    return inside
+
+
+@pytest.mark.integration
+class TestLineArtUnderABoxDrawnByHand:
+    """A stroked path under a box stays in the page's content, under the
+    fill, unless it lies wholly inside the box as PyMuPDF measures that."""
+
+    def test_a_curve_that_runs_inside_the_box_is_removed(self, tmp_path):
+        """Its control points are outside the box, so the default leaves it.
+        Nothing else is near: everything that touches the box can go."""
+        src = _pdf(tmp_path / "src.pdf", _art(CURVE))
+        assert _edges_inside(src, ART_BOX) == 1             # the fixture is what it claims
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[ART_BOX])
+        assert res.verification["verified"] is True and res.flattened_pages == []
+        assert _edges_inside(out, ART_BOX) == 0
+
+    def test_a_frame_round_the_box_is_never_the_price(self, tmp_path):
+        """With a frame round the box, removing whatever touches it would
+        take the frame. The curve stays, and the run is refused for the
+        page instead; flattened, the box is black on the picture."""
+        src = _pdf(tmp_path / "src.pdf", _art(CURVE, FRAME))
+        out = str(tmp_path / "out.pdf")
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, out, rects=[ART_BOX])
+        failed = [c["id"] for c in ei.value.report["checks"] if not c["passed"]]
+        assert failed == [LINE_ART] and ei.value.flatten_pages == [1]
+        assert not os.path.exists(out)
+        res = redact_pdf(src, out, rects=[ART_BOX], flatten_pages=[1])
+        assert res.verification["verified"] is True and res.flattened_areas == {1: 1}
+        assert _dark_share(out, [ART_BOX[k] for k in ("x0", "y0", "x1", "y1")]) > 0.99
+
+    def test_a_rule_through_the_box_is_refused_not_deleted(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _art(RULE))
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, str(tmp_path / "out.pdf"), rects=[ART_BOX])
+        assert ei.value.flatten_pages == [1]
+        (check,) = [c for c in ei.value.report["checks"] if not c["passed"]]
+        assert check["id"] == LINE_ART
+        assert check["evidence"] == ["a drawing still has an edge inside a redaction "
+                                     "rectangle on page 1"]
+
+    def test_what_lies_wholly_inside_goes_and_the_frame_stays(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _art(INSIDE, FRAME, EDGE))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[ART_BOX])
+        assert res.verification["verified"] is True and _edges_inside(out, ART_BOX) == 0
+        with fitz.open(out) as doc:
+            kept = [d for d in doc[0].get_drawings() if d.get("fill") != (0.0, 0.0, 0.0)]
+        assert len(kept) == 2                               # the frame and the rule on the edge
+
+    def test_a_term_box_is_not_given_that_power(self, tmp_path):
+        """Box mode only: a rule under a word found by search is as it was."""
+        def plant(pdf):
+            page = pdf.pages[0].obj
+            page["/Contents"] = pdf.make_stream(
+                f"BT /F1 14 Tf 72 720 Td (a line about {TERM} here) Tj ET\n".encode()
+                + b"0 0 1 RG 1 w 60 722 m 400 722 l S")
+        src = _pdf(tmp_path / "src.pdf", plant)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[TERM])
+        assert res.verification["verified"] is True
+        assert LINE_ART not in [c["id"] for c in res.verification["checks"]]
+        with fitz.open(out) as doc:
+            assert any(d["rect"].width > 300 for d in doc[0].get_drawings())
+
+
+@pytest.mark.integration
+class TestTheVerifierLooksForLineArtInsideABox:
+    @pytest.mark.parametrize("drawing, passes", [
+        (CURVE, False), (INSIDE, False), (RULE, False), (FRAME, True), (EDGE, True), (BLACK, True),
+    ], ids=["a curve", "a line inside", "a rule through", "a frame round it",
+            "a rule along its edge", "a solid black bar"])
+    def test_an_edge_inside_fails_it_and_nothing_else_does(self, tmp_path, drawing, passes):
+        src = _pdf(tmp_path / "src.pdf", _art(drawing))
+        report = verify_redaction(src, rects=[ART_BOX])
+        check = _check(report, LINE_ART)
+        assert check.passed is passes
+        if not passes:
+            assert check.pages == [1] and report.flatten_target_pages() is not None
+
+    def test_another_box_s_own_fill_is_not_line_art(self, tmp_path):
+        """Two boxes that overlap, and a term's box inside one drawn by
+        hand: each fill has an edge inside the other."""
+        src = _pdf(tmp_path / "src.pdf", body=f"a line about {TERM} here")
+        word = _word_rect(src, TERM)
+        over = {"page": 0, "x0": word[0] - 40, "y0": word[1] - 20, "x1": word[2] - 10,
+                "y1": word[3] + 20}
+        lower = dict(over, y0=over["y0"] + 15, y1=over["y1"] + 30)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[TERM], rects=[over, lower])
+        assert res.verification["verified"] is True
+
+
+# ── 6. A term box takes only its own characters ──────────────────────────
+
+#: Three lines of 12-point type 13 points apart: each line's characters
+#: reach 3.5 points into the next line's.
+TIGHT = (b"BT /F1 12 Tf 72 720 Td (gypsy Algy jumpy) Tj 0 -13 Td (above Whitfield below) Tj "
+         b"0 -13 Td (TALL Hdlb CAPS) Tj ET")
+NEIGHBOURS = ["gypsy", "Algy", "jumpy", "above", "below", "TALL", "Hdlb", "CAPS"]
+
+
+def _content(data: bytes):
+    return lambda pdf: pdf.pages[0].obj.__setitem__("/Contents", pdf.make_stream(data))
+
+
+def _page_words(path) -> list:
+    with fitz.open(path) as doc:
+        return doc[0].get_text().split()
+
+
+@pytest.mark.integration
+class TestATermBoxTakesOnlyItsOwnCharacters:
+    """A character goes if its box overlaps a redaction rectangle at all,
+    and the box of a word is as tall as its line. In type set close, the
+    words above and below lost letters, or went."""
+
+    def test_the_lines_above_and_below_are_left_whole(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _content(TIGHT))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=["Whitfield"])
+        assert res.verification["verified"] is True and res.redaction_count == 1
+        assert _page_words(out) == NEIGHBOURS
+
+    def test_the_black_box_is_still_the_whole_box(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _content(TIGHT))
+        word = _word_rect(src, "Whitfield")
+        out = str(tmp_path / "out.pdf")
+        redact_pdf(src, out, search_terms=["Whitfield"])
+        assert _dark_share(out, word) > 0.99
+
+    def test_the_pixels_of_a_scan_are_covered_by_the_whole_box(self, tmp_path):
+        """An image under the text, as on a scanned page with its text
+        layer: its pixels are blanked under the full box, as before."""
+        def plant(pdf):
+            page = pdf.pages[0].obj
+            page["/Resources"]["/XObject"] = Dictionary(Im1=pdf.make_stream(
+                b"\xd0" * 64, Type=Name.XObject, Subtype=Name.Image, Width=8, Height=8,
+                ColorSpace=Name.DeviceGray, BitsPerComponent=8))
+            page["/Contents"] = pdf.make_stream(b"q 612 0 0 792 0 0 cm /Im1 Do Q\n" + TIGHT)
+        src = _pdf(tmp_path / "src.pdf", plant)
+        word = _word_rect(src, "Whitfield")
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=["Whitfield"])
+        assert res.verification["verified"] is True and _page_words(out) == NEIGHBOURS
+        with fitz.open(out) as doc:
+            (xref,) = [img[0] for img in doc[0].get_images()]
+            pix = fitz.Pixmap(doc, xref)
+            # The pixels the box touches are blanked in the image itself
+            # (the black fill is drawn on the page, over them); the rest stay.
+            assert 0xFF in pix.samples and 0xD0 in pix.samples
+        assert _dark_share(out, word) > 0.99
+
+    def test_trimming_never_costs_a_removal(self, tmp_path, monkeypatch):
+        """Make the trimmed pass remove nothing. The page is searched
+        again, and what is still found gets the whole box, text and all."""
+        real = fitz.Page.apply_redactions
+
+        def only_whole_boxes(self, *args, **kw):
+            if kw.get("images") == fitz.PDF_REDACT_IMAGE_NONE:
+                for annot in list(self.annots(types=[fitz.PDF_ANNOT_REDACT]) or []):
+                    self.delete_annot(annot)
+                return True
+            return real(self, *args, **kw)
+
+        monkeypatch.setattr(fitz.Page, "apply_redactions", only_whole_boxes)
+        src = _pdf(tmp_path / "src.pdf", _content(TIGHT))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=["Whitfield"])
+        assert res.verification["verified"] is True and res.redaction_count == 1
+        assert "Whitfield" not in _page_words(out)
+
+    def test_a_box_drawn_by_hand_is_not_trimmed(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _content(TIGHT))
+        word = _word_rect(src, "Whitfield")
+        out = str(tmp_path / "out.pdf")
+        redact_pdf(src, out, rects=[dict(zip(("x0", "y0", "x1", "y1"), word, strict=True), page=0)])
+        left = _page_words(out)
+        assert "Whitfield" not in left and "Algy" not in left and "Hdlb" not in left
+
+    def test_lines_set_apart_are_as_before(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _content(TIGHT.replace(b"-13 Td", b"-20 Td")))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=["Whitfield"])
+        assert _page_words(out) == NEIGHBOURS and res.redaction_count == 1
+
+    def test_type_set_up_the_page_is_removed_untrimmed(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _content(
+            b"BT /F1 12 Tf 0 1 -1 0 300 300 Tm (above Whitfield below) Tj ET"))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=["Whitfield"])
+        assert res.verification["verified"] is True and _page_words(out) == ["above", "below"]
+
+    def test_the_trimmed_box_keeps_the_middle_of_the_word(self, tmp_path):
+        import pdf_verify
+        src = _pdf(tmp_path / "src.pdf", _content(TIGHT))
+        with fitz.open(src) as doc:
+            ((whole, core),) = pdf_verify.term_hits(doc[0], ["Whitfield"])
+            (plain,) = pdf_verify.term_boxes(doc[0], ["Whitfield"])
+        assert tuple(whole) == tuple(plain) and core.x0 == whole.x0 and core.x1 == whole.x1
+        assert whole.y0 < core.y0 < core.y1 < whole.y1
+        middle, quarter = (whole.y0 + whole.y1) / 2, whole.height / 4
+        assert core.y0 <= middle - quarter + 0.01 and core.y1 >= middle + quarter - 0.01

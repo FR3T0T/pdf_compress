@@ -408,7 +408,10 @@ class TestWhatRemovalLeavesBehind:
         out = str(tmp_path / "out.pdf")
         with pytest.raises(RedactionVerificationError) as ei:
             redact_pdf(src, out, search_terms=["Whitfield"])
-        assert len(applied) == 1 and ei.value.flatten_pages == [1]
+        # Three tries and no more: the trimmed box for the text, the whole
+        # box for the fill, and the whole box once again for what the page
+        # search still finds (#119, R3).
+        assert len(applied) == 3 and ei.value.flatten_pages == [1]
         assert not os.path.exists(out)
 
 

@@ -39,7 +39,15 @@ transform raises, with the report, having touched nothing at the destination:
     ligature, where PyMuPDF's search_for is not. It reads text a clipping
     path hides. It cannot read text outside the page's visible box, or
     remove what an annotation's appearance draws: those are left to the
-    raw-content check and the sweep, which refuse the run.
+    raw-content check and the sweep, which refuse the run. For boxes drawn
+    by hand there are, besides the clipped extraction of each box, two
+    checks of what a box leaves that is not text: no annotation lies over
+    it (``redaction.rect_annotations``; an annotation is painted above the
+    page) and no drawing has an edge inside it
+    (``redaction.rect_line_art``). And every redaction, by term or by box,
+    is checked for a stream the structure tree alone keeps in the file
+    (``redaction.structure_streams``) and for page thumbnails
+    (``redaction.thumbnails``).
   - :func:`verify_sanitization` — re-runs the ``pdf_analyze`` audit on the
     output and asserts absent exactly the finding categories the enabled
     sanitize options promised to remove (expectations-based — anything else
@@ -561,7 +569,7 @@ class PageText:
         self._line: list[int] = []          # which line each character is on
         self._space: list[bool] = []
         self._joins: list[bool] = []        # part of a word that runs to its neighbours
-        self._lines: list[tuple] = []       # (first, end, bbox) of each line
+        self._lines: list[tuple] = []       # (first, end, bbox, runs across) of each line
         #: (kind, text, first character, last character). Kinds: "c" a
         #: character or a base with its accents, folded; "s" whitespace; "h"
         #: a soft hyphen; "b" a line break — its text says how the line
@@ -593,13 +601,14 @@ class PageText:
                         space.append(kind[0])
                         joins.append(kind[1])
                 if len(chars) > first:
-                    self._add_line(first, len(chars))
+                    across = line.get("dir") or (1.0, 0.0)
+                    self._add_line(first, len(chars), abs(across[1]) < 1e-3)
 
-    def _add_line(self, first: int, end: int) -> None:
+    def _add_line(self, first: int, end: int, across: bool = True) -> None:
         boxes = [b for b in self._boxes[first:end] if b[2] > b[0] and b[3] > b[1]]
         bbox = ((min(b[0] for b in boxes), min(b[1] for b in boxes),
                  max(b[2] for b in boxes), max(b[3] for b in boxes)) if boxes else None)
-        self._lines.append((first, end, bbox))
+        self._lines.append((first, end, bbox, across))
         chars, folds, combining = self._chars, _FOLDS[self._case], unicodedata.combining
         if len(folds) > 100000:             # a long-lived process, many documents
             folds.clear()
@@ -783,7 +792,7 @@ class PageText:
             return all(s >= -1e-6 for s in sides) or all(s <= 1e-6 for s in sides)
 
         found = []
-        for first, end, bbox in self._lines:
+        for first, end, bbox, _across in self._lines:
             if bbox is None or bbox[2] < x0 or bbox[0] > x1 or bbox[3] < y0 or bbox[1] > y1:
                 continue
             start = last = None
@@ -841,11 +850,48 @@ class PageText:
             a1 += 1
         return a0, a1
 
-    def boxes(self, spans) -> list:
+    def _trimmed(self, rect: tuple, line_no: int, a0: int, a1: int) -> tuple:
+        """*rect* — one line of the hit *a0*..*a1* — cut back at the top and
+        at the bottom to where characters that are not part of the hit stop
+        reaching into it; never past the middle half of its height, which
+        every character of the hit crosses.
+
+        A character goes if its box overlaps a redaction rectangle at all,
+        and a character's box is as tall as its line: with lines set close,
+        the full box of a word takes the words above and below it. Text is
+        removed with this box; the fill and the pixels under it are the full
+        box's (pdf_ops._redact_term_boxes). Only for a line that runs across
+        the page: on any other, top and bottom are not where the neighbours
+        are, and the rectangle is returned as it is.
+        """
+        x0, y0, x1, y1 = rect
+        if not self._lines[line_no][3]:
+            return rect
+        middle, quarter = (y0 + y1) / 2, (y1 - y0) / 4
+        top, bottom = y0, y1
+        for number, (first, end, bbox, _across) in enumerate(self._lines):
+            if (number == line_no or bbox is None or bbox[2] <= x0 or bbox[0] >= x1
+                    or bbox[3] <= y0 or bbox[1] >= y1):
+                continue
+            for i in range(first, end):
+                if a0 <= i <= a1 or self._space[i]:
+                    continue
+                b = self._boxes[i]
+                if b[2] <= x0 or b[0] >= x1 or b[3] <= top or b[1] >= bottom or b[3] <= b[1]:
+                    continue
+                centre = (b[1] + b[3]) / 2
+                if centre < middle:
+                    top = max(top, min(b[3] + 0.05, middle - quarter))
+                elif centre > middle:
+                    bottom = min(bottom, max(b[1] - 0.05, middle + quarter))
+        return (x0, top, x1, bottom)
+
+    def boxes(self, spans, trimmed: bool = False) -> list:
         """One rectangle per line of each hit in *spans*, each hit widened
         to whole words first. Hits that come to the same rectangle — two
         views of one occurrence, a search_for hit and the matcher's own —
-        are one rectangle."""
+        are one rectangle. With *trimmed*, (rectangle, trimmed rectangle)
+        pairs (_trimmed)."""
         rects, seen = [], set()
         for span in sorted(set(spans)):
             a0, a1 = self.widened(span)
@@ -863,13 +909,21 @@ class PageText:
                     key = tuple(round(v, 2) for v in rect)
                     if key not in seen:
                         seen.add(key)
-                        rects.append(fitz.Rect(rect))
+                        rects.append((fitz.Rect(rect), fitz.Rect(self._trimmed(
+                            rect, self._line[i], a0, a1))) if trimmed else fitz.Rect(rect))
                 i = j + 1
         return rects
 
 
 def term_boxes(page, terms, case_sensitive: bool = False) -> list:
-    """The rectangles to redact on *page* for *terms*: the matcher's hits
+    """The rectangles to redact on *page* for *terms* (term_hits, without
+    the trimmed boxes)."""
+    return [whole for whole, _trimmed in term_hits(page, terms, case_sensitive)]
+
+
+def term_hits(page, terms, case_sensitive: bool = False) -> list:
+    """The rectangles to redact on *page* for *terms*, each with the
+    trimmed rectangle to remove its text by (PageText._trimmed): the matcher's hits
     and search_for's, together, each widened to the whole words it touches
     (PageText.boxes).
 
@@ -924,8 +978,8 @@ def term_boxes(page, terms, case_sensitive: bool = False) -> list:
         if not all(i in covered or text._space[i] for i in range(span[0], span[1] + 1)):
             spans.append(span)
             cover(span)
-    rects = text.boxes(spans)
-    seen = {tuple(round(v, 2) for v in r) for r in rects}
+    rects = text.boxes(spans, trimmed=True)
+    seen = {tuple(round(v, 2) for v in r) for r, _trimmed in rects}
     for quad in loose:
         under = [i for a0, a1 in text.spans_under(quad) for i in range(a0, a1 + 1)
                  if not text._space[i]]
@@ -933,7 +987,7 @@ def term_boxes(page, terms, case_sensitive: bool = False) -> list:
         if key in seen or (under and all(i in covered for i in under)):
             continue
         seen.add(key)
-        rects.append(fitz.Rect(quad.rect))
+        rects.append((fitz.Rect(quad.rect), fitz.Rect(quad.rect)))    # nothing known to trim by
     return rects
 
 
@@ -1484,31 +1538,8 @@ def _valid_rects(doc, rects: list[dict]) -> list[tuple]:
     return found
 
 
-_NUMBER_RE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)")
-
-
-def _annotation_rect(doc, page, xref: int):
-    """The rectangle of annotation *xref* in the coordinates redaction
-    rectangles are given in (PyMuPDF's, on the page before any rotation),
-    or None if it has none that can be read. Read from the object itself:
-    PyMuPDF's own annotation objects do not cover links, popups or
-    widgets."""
-    kind, value = doc.xref_get_key(xref, "Rect")
-    if kind == "xref":
-        value = doc.xref_object(int(value.split()[0]), compressed=True)
-    elif kind != "array":
-        return None
-    numbers = _NUMBER_RE.findall(value)
-    if len(numbers) != 4 or "R" in value.split():
-        return None
-    rect = fitz.Rect(*map(float, numbers))
-    rect.normalize()
-    rect = rect * page.transformation_matrix
-    rect.normalize()
-    return rect
-
-
-def _rect_annotation_check(doc, rects: list[dict]) -> VerificationCheck:
+def _rect_annotation_check(doc, output_path: str, rects: list[dict],
+                           password: Optional[str] = None) -> VerificationCheck:
     """No annotation is left lying over a redaction rectangle.
 
     An annotation is painted above the page, so one that overlaps a box is
@@ -1518,6 +1549,138 @@ def _rect_annotation_check(doc, rects: list[dict]) -> VerificationCheck:
     annotation counts but a popup, which draws nothing of its own on the
     page and goes with the note it belongs to. One whose rectangle cannot
     be read fails the check: it could be anywhere.
+
+    The page's /Annots is read with pikepdf, entry by entry, because that
+    reads an annotation written into the array itself like any other;
+    PyMuPDF's lists pass over one that has no object number. Its /Rect is
+    put into the coordinates redaction rectangles are given in (PyMuPDF's,
+    on the page before any rotation) with the page's own matrix.
+    """
+    ev: list[str] = []
+    by_page: dict[int, list] = {}
+    for pno, rect in _valid_rects(doc, rects):
+        by_page.setdefault(pno, []).append(rect)
+    if not by_page:
+        return VerificationCheck(
+            id="redaction.rect_annotations",
+            description="No annotation lies over a redaction rectangle", passed=True)
+    kwargs = {"password": password} if password else {}
+    try:
+        with pikepdf.open(output_path, **kwargs) as pdf:
+            for pno, boxes in sorted(by_page.items()):
+                try:
+                    to_fitz = doc[pno].transformation_matrix
+                    annots = pdf.pages[pno].obj.get("/Annots")
+                    entries = list(annots) if isinstance(annots, pikepdf.Array) else []
+                except Exception as exc:
+                    ev.append(f"annotations on page {pno + 1} could not be read for "
+                              f"verification ({type(exc).__name__})")
+                    continue
+                for annot in entries:
+                    subtype = "unknown"
+                    try:
+                        if not isinstance(annot, pikepdf.Dictionary):
+                            continue
+                        subtype = str(annot.get("/Subtype", "")).lstrip("/") or "unknown"
+                        if subtype == "Popup":
+                            continue
+                        rect = fitz.Rect(*(float(v) for v in annot["/Rect"]))
+                        rect.normalize()
+                        rect = rect * to_fitz
+                        rect.normalize()
+                    except Exception:
+                        ev.append(f"the rectangle of a {subtype} annotation on page {pno + 1} "
+                                  f"could not be read for verification")
+                        continue
+                    if any(rect.intersects(box) for box in boxes):
+                        ev.append(f"a {subtype} annotation still lies over a redaction "
+                                  f"rectangle on page {pno + 1}")
+    except Exception as exc:
+        ev.append(f"annotations on page {min(by_page) + 1} could not be read for "
+                  f"verification ({type(exc).__name__})")
+    return VerificationCheck(
+        id="redaction.rect_annotations",
+        description="No annotation lies over a redaction rectangle",
+        passed=not ev, evidence=_dedupe(ev))
+
+
+def path_lines(drawing: dict, steps: int = 24) -> list[list[tuple]]:
+    """The path of one PyMuPDF drawing (an entry of page.get_drawings()) as
+    lists of points, one list per line, rectangle, quad or curve of it. A
+    curve is walked in *steps* straight pieces: where it runs, not where
+    its control points are."""
+    lines = []
+    for item in drawing.get("items", ()):
+        try:
+            kind = item[0]
+            if kind == "l":
+                lines.append([(item[1].x, item[1].y), (item[2].x, item[2].y)])
+            elif kind == "re":
+                r = item[1]
+                lines.append([(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1), (r.x0, r.y0)])
+            elif kind == "qu":
+                q = item[1]
+                lines.append([(p.x, p.y) for p in (q.ul, q.ur, q.lr, q.ll, q.ul)])
+            elif kind == "c":
+                p = item[1:5]
+                points = []
+                for n in range(steps + 1):
+                    s = n / steps
+                    u = 1 - s
+                    w = (u ** 3, 3 * u * u * s, 3 * u * s * s, s ** 3)
+                    points.append((sum(k * q.x for k, q in zip(w, p, strict=True)),
+                                   sum(k * q.y for k, q in zip(w, p, strict=True))))
+                lines.append(points)
+        except Exception:
+            continue
+    return lines
+
+
+def _passes_inside(p: tuple, q: tuple, box) -> bool:
+    """Does the straight line from *p* to *q* pass through the inside of
+    *box*, a quarter of a point in from its edges? (A rule along the edge of
+    a box, and the edges of the box's own fill, do not.)"""
+    x0, y0, x1, y1 = box.x0 + 0.25, box.y0 + 0.25, box.x1 - 0.25, box.y1 - 0.25
+    if x0 >= x1 or y0 >= y1:
+        return False
+    enter, leave = 0.0, 1.0
+    for start, delta, low, high in ((p[0], q[0] - p[0], x0, x1), (p[1], q[1] - p[1], y0, y1)):
+        if abs(delta) < 1e-12:
+            if not low < start < high:
+                return False
+            continue
+        a, b = (low - start) / delta, (high - start) / delta
+        enter, leave = max(enter, min(a, b)), min(leave, max(a, b))
+    return enter < leave or (p == q and x0 < p[0] < x1 and y0 < p[1] < y1)
+
+
+def is_plain_black(drawing: dict) -> bool:
+    """A drawing that is nothing but rectangles filled black — what the
+    fill of a redaction box is. Under a black box it shows nothing."""
+    fill = drawing.get("fill")
+    return (bool(drawing.get("items")) and fill is not None and not any(fill)
+            and all(item[0] == "re" for item in drawing["items"]))
+
+
+def has_edge_inside(drawing: dict, box) -> bool:
+    """True if any piece of *drawing*'s path passes through the inside of
+    *box* (a fitz.Rect), or lies inside it."""
+    return any(_passes_inside(a, b, box)
+               for line in path_lines(drawing) for a, b in zip(line, line[1:], strict=False))
+
+
+def _rect_line_art_check(doc, rects: list[dict]) -> VerificationCheck:
+    """No drawing has an edge inside a redaction rectangle.
+
+    A stroked path under a box drawn by hand stays in the page's content,
+    under the fill: the signature drawn as a curve, the line of a chart.
+    PyMuPDF removes a drawing that lies wholly inside the box, as it
+    measures that (by a curve's control points, not by where it runs), and
+    redact_pdf lets it remove whatever touches the box only when nothing
+    else would go with it. What is left with an edge inside a box fails
+    this check. It is page content, so the page can be flattened, and the
+    box is then black on the picture. A solid black rectangle is passed
+    over: every box's own fill is one, and it shows nothing.
     """
     ev: list[str] = []
     by_page: dict[int, list] = {}
@@ -1525,30 +1688,19 @@ def _rect_annotation_check(doc, rects: list[dict]) -> VerificationCheck:
         by_page.setdefault(pno, []).append(rect)
     for pno, boxes in sorted(by_page.items()):
         try:
-            page = doc[pno]
-            listed = list(page.annot_xrefs())
+            drawings = doc[pno].get_drawings()
         except Exception as exc:
-            ev.append(f"annotations on page {pno + 1} could not be read for "
+            ev.append(f"the drawings on page {pno + 1} could not be read for "
                       f"verification ({type(exc).__name__})")
             continue
-        for xref, _kind, _name in listed:
-            try:
-                subtype = doc.xref_get_key(xref, "Subtype")[1].lstrip("/") or "unknown"
-                if subtype == "Popup":
-                    continue
-                rect = _annotation_rect(doc, page, xref)
-            except Exception:
-                subtype, rect = "unknown", None
-            if rect is None:
-                ev.append(f"the rectangle of a {subtype} annotation on page {pno + 1} "
-                          f"could not be read for verification")
-            elif any(rect.intersects(box) for box in boxes):
-                ev.append(f"a {subtype} annotation still lies over a redaction "
-                          f"rectangle on page {pno + 1}")
+        if any(has_edge_inside(d, box) for d in drawings if not is_plain_black(d)
+               for box in boxes):
+            ev.append(f"a drawing still has an edge inside a redaction rectangle "
+                      f"on page {pno + 1}")
     return VerificationCheck(
-        id="redaction.rect_annotations",
-        description="No annotation lies over a redaction rectangle",
-        passed=not ev, evidence=_dedupe(ev))
+        id="redaction.rect_line_art",
+        description="No drawing has an edge inside a redaction rectangle",
+        passed=not ev, evidence=ev)
 
 
 def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
@@ -1618,7 +1770,8 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                 output_path, terms, case_sensitive, password))
         if rects:
             report.checks.append(_rect_region_check(doc, rects))
-            report.checks.append(_rect_annotation_check(doc, rects))
+            report.checks.append(_rect_annotation_check(doc, output_path, rects, password))
+            report.checks.append(_rect_line_art_check(doc, rects))
     finally:
         doc.close()
     report.checks.extend(_whole_file_checks(output_path, password))

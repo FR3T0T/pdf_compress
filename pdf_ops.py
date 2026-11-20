@@ -33,10 +33,12 @@ from pdf_verify import (
     PageText,
     TermFinder,
     WalkStatus,
+    path_lines,
     structure_kids,
     structure_stream,
     structure_stream_refs,
     term_boxes,
+    term_hits,
     verify_redaction,
     walk_objects,
 )
@@ -1553,8 +1555,11 @@ class RedactResult:
     #: per-surface removal breakdown, e.g. {"page_content": 12, "docinfo": 1,
     #: "bookmarks": 2}. page_content mirrors redaction_count; the rest are the
     #: document-level scrubs apply_redactions never touches (#99, #119), and
-    #: structure_refs, the structure tree's references to an unredacted
-    #: original, which a run by box alone can have too.
+    #: what a run by box alone can have too: structure_refs (the structure
+    #: tree's references to an unredacted original), structure_text,
+    #: thumbnails and annotations_removed. "annotations" is text scrubbed
+    #: inside an annotation; "annotations_removed" is annotations taken off
+    #: a page.
     surface_counts: dict = field(default_factory=dict)
     #: verify_redaction(output).to_dict() — the proof-of-removal artifact.
     verification: dict | None = None
@@ -1972,10 +1977,16 @@ def _streams_drawing(streams: list, terms: list[str], case_sensitive: bool) -> s
     return found
 
 
-def _take_off_pages(pdf, doomed: list) -> int:
+def _take_off_pages(pdf, doomed: list, draws=None) -> tuple[int, int]:
     """Take the annotations in *doomed* off whatever page lists them, each
     with its popup and with everything that replies to it, however deep.
-    Returns the number of replies that went."""
+
+    *doomed* are annotations that are objects of their own. One written
+    into a page's /Annots array itself has no identity to be named by: the
+    array is gone through, and such an entry goes if *draws* says so.
+    Returns (how many of those two kinds left a page, how many replies went
+    with them); a popup is not counted.
+    """
     def ident(obj):
         try:
             return tuple(obj.objgen) if obj.is_indirect else None
@@ -1993,6 +2004,7 @@ def _take_off_pages(pdf, doomed: list) -> int:
         pages.append((page.obj, entries))
     listed = [a for _obj, entries in pages for a in entries
               if isinstance(a, pikepdf.Dictionary) and ident(a) is not None]
+    first = len({ident(a) for a in listed} & gone)
 
     replies, grew = 0, True
     while grew:
@@ -2014,29 +2026,42 @@ def _take_off_pages(pdf, doomed: list) -> int:
                 popups.add(ident(annot))
         except Exception:
             continue
+
+    def stays(entry) -> bool:
+        if ident(entry) is not None:
+            return ident(entry) not in gone | popups
+        try:
+            return not (draws is not None and isinstance(entry, pikepdf.Dictionary)
+                        and draws(entry))
+        except Exception:
+            return True
+
     for obj, entries in pages:
         try:
-            keep = [a for a in entries if ident(a) is None or ident(a) not in gone | popups]
+            keep = [a for a in entries if stays(a)]
             if len(keep) != len(entries):
+                first += sum(1 for a in entries if ident(a) is None and not stays(a))
                 obj["/Annots"] = pikepdf.Array(keep)
         except Exception:
             continue
-    return replies
+    return first, replies
 
 
 def _lift_annotations_drawing(pdf, annotations: list, terms: list[str],
-                              case_sensitive: bool) -> int:
-    """Take every annotation whose appearance draws a term off its page,
-    and return how many annotations went (replies included; a popup is not
-    counted).
+                              case_sensitive: bool) -> tuple[int, int]:
+    """Take every annotation whose appearance draws a term off its page.
+    Returns (annotations that left a page, replies included and popups not;
+    annotations on no page that lost the appearance that drew it).
 
     Any of its appearance streams counts: normal, rollover or down, every
     state, shown or hidden. The annotation loses its /AP as well as its
     place on the page, so that whatever still refers to the dictionary — a
     tagged file's structure tree — keeps nothing of what it drew; one that
-    was on no page to begin with loses just that. A form field's widget is
-    not touched here: a field has its own path (its value is emptied and
-    the appearances that drew it are dropped, _scrub_objects).
+    was on no page to begin with loses just that. One written into the
+    page's /Annots array itself, not an object of its own, is taken out of
+    the array like any other. A form field's widget is not touched here: a
+    field has its own path (its value is emptied and the appearances that
+    drew it are dropped, _scrub_objects).
     """
     owners = []
     for annot in annotations:
@@ -2049,16 +2074,25 @@ def _lift_annotations_drawing(pdf, annotations: list, terms: list[str],
         except Exception:
             continue
     if not owners:
-        return 0
+        return 0, 0
     drawing = _streams_drawing([s for _a, streams in owners for s in streams],
                                terms, case_sensitive)
-    doomed = [a for a, streams in owners if any(tuple(s.objgen) in drawing for s in streams)]
+
+    def draws(annot) -> bool:
+        return (_name_of(annot, "/Subtype") != "/Widget" and "/FT" not in annot
+                and any(tuple(s.objgen) in drawing for s in _appearance_streams(annot)))
+
+    doomed = [a for a, _streams in owners if draws(a)]
+    if not doomed:
+        return 0, 0
+    # Off the pages first: an entry of a page's own list is known by what it draws.
+    first, replies = _take_off_pages(pdf, [a for a in doomed if a.is_indirect], draws)
     for annot in doomed:
         try:
             del annot["/AP"]
         except Exception:
             continue
-    return len(doomed) + _take_off_pages(pdf, doomed) if doomed else 0
+    return first + replies, max(0, len(doomed) - first)
 
 
 def _field_tree(pdf) -> list:
@@ -2774,8 +2808,9 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
 
         # -- annotations whose appearance draws a term leave their page ----
         try:
-            bump("annotations", _lift_annotations_drawing(pdf, annotations, terms,
-                                                          case_sensitive))
+            lifted, undrawn = _lift_annotations_drawing(pdf, annotations, terms, case_sensitive)
+            bump("annotations_removed", lifted)
+            bump("annotations", undrawn)
         except Exception:
             pass
 
@@ -3186,7 +3221,7 @@ def _box_key(rect) -> tuple:
     return tuple(round(v, 2) for v in rect)
 
 
-def _redact_boxes(page, boxes: list) -> int:
+def _redact_boxes(page, boxes: list, graphics: int | None = None, text: int | None = None) -> int:
     """Redact *boxes* on *page* and return how many there were.
 
     Form field (AcroForm widget) values live in /V and render via a
@@ -3202,6 +3237,10 @@ def _redact_boxes(page, boxes: list) -> int:
     PDF_REDACT_IMAGE_REMOVE deletes any image the box touches -- on a
     scanned page (one full-page image) that blanks the WHOLE page while
     still reporting success (RED-01).
+
+    *graphics* and *text* are passed to apply_redactions when given: how
+    line art under the boxes is treated (_line_art_mode), and whether text
+    is removed at all (_redact_term_boxes keeps it in its second step).
     """
     if not boxes:
         return 0
@@ -3215,8 +3254,87 @@ def _redact_boxes(page, boxes: list) -> int:
             except Exception:
                 pass
             page.delete_widget(wdg)
-    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
+    options = {"images": fitz.PDF_REDACT_IMAGE_PIXELS}
+    if graphics is not None:
+        options["graphics"] = graphics
+    if text is not None:
+        options["text"] = text
+    page.apply_redactions(**options)
     return len(boxes)
+
+
+def _redact_term_boxes(page, hits: list) -> int:
+    """Redact the term hits *hits* — (box, trimmed box) pairs from
+    pdf_verify.term_hits — and return how many there were.
+
+    In two steps, so that a term box takes only its own characters. A
+    character is removed if its box overlaps a redaction rectangle at all,
+    and the box of a word is as tall as its line: in type set close, the
+    whole box takes letters, or words, from the lines above and below.
+    First the text is removed with each box trimmed, top and bottom, to
+    where the neighbours stop reaching into it; nothing is filled and no
+    image or drawing is touched. Then the whole box is applied with the
+    text kept, so the black fill, the pixels of a scan under it and the
+    line art are treated exactly as they were with one step.
+
+    Should a hit survive the trimmed step, the page's re-search finds it
+    and redact_pdf applies the whole box to it with the text removed
+    (_redact_boxes): trimming cannot cost a removal. A PyMuPDF too old to
+    keep text does it in one step, as before.
+    """
+    if not hits:
+        return 0
+    whole = [box for box, _trimmed in hits]
+    keep_text = getattr(fitz, "PDF_REDACT_TEXT_NONE", None)
+    if keep_text is None:
+        return _redact_boxes(page, whole)
+    for _box, trimmed in hits:
+        page.add_redact_annot(trimmed, fill=False)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
+                          graphics=fitz.PDF_REDACT_LINE_ART_NONE)
+    return _redact_boxes(page, whole, text=keep_text)
+
+
+def _line_art_mode(page, boxes: list) -> int | None:
+    """How apply_redactions should treat line art under *boxes*, boxes the
+    user drew: fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED, or None for the
+    default.
+
+    The default removes a drawing that lies wholly inside a box as MuPDF
+    measures that, which for a curve is by its control points: a curve that
+    runs inside the box with a control point outside it stays in the
+    content, under the fill. "Remove if touched" takes that curve — and
+    every other drawing whose bounding box overlaps the box, a table's
+    frame or a long rule included. So it is used only when nothing else
+    would go: when every drawing that reaches a box (its bounding box,
+    widened by its line width) lies wholly inside one, by where its path
+    runs. Otherwise the default stays, and what is left with an edge inside
+    a box fails the verifier's line-art check.
+    """
+    touched = getattr(fitz, "PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED", None)
+    if touched is None or not boxes:
+        return None
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return None
+    reached = False
+    for drawing in drawings:
+        try:
+            reach = fitz.Rect(drawing["rect"])
+            margin = float(drawing.get("width") or 0) + 1
+            reach = (reach.x0 - margin, reach.y0 - margin, reach.x1 + margin, reach.y1 + margin)
+            if not any(reach[0] < b.x1 and reach[2] > b.x0 and reach[1] < b.y1 and reach[3] > b.y0
+                       for b in boxes):
+                continue
+            points = [p for line in path_lines(drawing) for p in line]
+            if not points or not any(all(b.x0 <= x <= b.x1 and b.y0 <= y <= b.y1
+                                         for x, y in points) for b in boxes):
+                return None
+            reached = True
+        except Exception:
+            return None
+    return touched if reached else None
 
 
 def _annotations_under(page, boxes: list) -> int:
@@ -3255,13 +3373,72 @@ def _annotations_under(page, boxes: list) -> int:
                 continue                 # it went with the one it replied to
             if annot is not None:
                 page.delete_annot(annot)
+    # One written into the page's /Annots array itself has no object number,
+    # and page.annots() leaves it out. Walking from the first annotation
+    # reaches it; it is judged the same, and nothing can reply to it.
+    direct = 0
+    while direct < 10000:
+        target, annot = None, page.first_annot
+        while annot is not None:
+            if (annot.xref == 0 and annot.type[0] not in (fitz.PDF_ANNOT_POPUP,
+                                                           fitz.PDF_ANNOT_WIDGET)
+                    and any(box.intersects(annot.rect) for box in boxes)):
+                target = annot
+                break
+            annot = annot.next
+        if target is None:
+            break
+        page.delete_annot(target)
+        direct += 1
     for link in page.get_links():
         try:
             if any(box.intersects(link["from"]) for box in boxes):
                 page.delete_link(link)
         except Exception:
             continue
-    return len(doomed)
+    return len(doomed) + direct
+
+
+def _unlisted_annotations_under(pdf, boxes: dict) -> int:
+    """Take out of each page's /Annots array every annotation that is
+    written into the array itself — not an object of its own — and overlaps
+    one of the user's boxes on that page; returns how many went. *boxes* is
+    {page index: [(x0, y0, x1, y1)]} in the page's own PDF coordinates.
+
+    The pikepdf side of _annotations_under, for what PyMuPDF does not take
+    off the page: 1.27 does not delete a form field's widget that has no
+    object number when asked to (2.1 does), and it stayed under the box.
+    Nothing can refer to such a dictionary, so nothing goes with it; a
+    popup is not judged by its own rectangle here either.
+    """
+    removed = 0
+    for pno, rects in boxes.items():
+        try:
+            page = pdf.pages[pno].obj
+            annots = page.get("/Annots")
+            if not isinstance(annots, pikepdf.Array):
+                continue
+            keep = []
+            for entry in annots:
+                under = False
+                try:
+                    if (isinstance(entry, pikepdf.Dictionary) and not entry.is_indirect
+                            and _name_of(entry, "/Subtype") != "/Popup"):
+                        x0, y0, x1, y1 = (float(v) for v in entry["/Rect"])
+                        x0, x1, y0, y1 = min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1)
+                        under = any(x0 < b[2] and x1 > b[0] and y0 < b[3] and y1 > b[1]
+                                    for b in rects)
+                except Exception:
+                    under = False
+                if not under:
+                    keep.append(entry)
+                elif _name_of(entry, "/Subtype") != "/Widget":
+                    removed += 1        # a widget under a box is not counted anywhere
+            if len(keep) != len(annots):
+                page["/Annots"] = pikepdf.Array(keep)
+        except Exception:
+            continue
+    return removed
 
 
 def _refusal_message(failed) -> str:
@@ -3309,10 +3486,16 @@ def redact_pdf(
         ligatures, with page.search_for()'s hits beside them. Every match
         is redacted, widened to the whole words it touches, and the page is
         searched again for as long as removing text leaves a new match.
+        The text of a match is removed with its box trimmed to its own
+        characters, so that words on the lines above and below are not
+        taken with it; the fill is the whole box (_redact_term_boxes).
       * rects: user-drawn boxes, each {"page": int (0-based), "x0", "y0",
         "x1", "y1": float} in PDF point coordinates -- for the visual
         redaction UI (Part 2); unused by the current search-term-only
-        frontend but wired through end-to-end.
+        frontend but wired through end-to-end. A box takes everything it
+        covers: every annotation that overlaps it leaves the page
+        (_annotations_under), and line art under it is removed where that
+        takes nothing else with it (_line_art_mode).
 
     Beyond the page content apply_redactions() reaches, search_terms are also
     scrubbed WHOLE-VALUE from every document-level surface verification checks
@@ -3381,10 +3564,15 @@ def redact_pdf(
         rects_by_page.setdefault(int(r["page"]), []).append(r)
     target = list(pages) if pages is not None else list(range(len(doc)))
 
+    #: {page index: the user's boxes on it, in the page's own PDF coordinates}:
+    #: for the one thing under a box that only pikepdf can take off the page.
+    hand_boxes: dict[int, list] = {}
+
     def redact_pages(doc) -> tuple[int, set, int]:
         """Redact the page content of *doc*; returns (rectangles drawn,
         pages touched, annotations taken from under the user's boxes)."""
         total, drawn, touched, lifted = len(doc), 0, set(), 0
+        hand_boxes.clear()
         for i, pno in enumerate(target):
             if cancel and cancel.is_set():
                 doc.close()
@@ -3396,27 +3584,37 @@ def redact_pdf(
 
             page = doc[pno]
             # Term hits come from the one matcher the verifier also uses
-            # (pdf_verify.term_boxes): its own views of the page's
+            # (pdf_verify.term_hits): its own views of the page's
             # characters, and search_for's hits beside them, each widened to
             # the whole words it touches. It honours case_sensitive itself.
-            boxes: list[fitz.Rect] = term_boxes(page, scrub_terms, case_sensitive)
+            hits = term_hits(page, scrub_terms, case_sensitive)
             drawn_by_hand = []
             for rr in rects_by_page.get(pno, []):
                 rect = fitz.Rect(rr["x0"], rr["y0"], rr["x1"], rr["y1"])
                 if not rect.is_empty and rect.is_valid:
                     drawn_by_hand.append(rect)
-            boxes.extend(drawn_by_hand)
 
-            added = _redact_boxes(page, boxes)
+            # A term box takes only its own characters; a box drawn by hand
+            # takes all it covers, and line art with it where that costs
+            # nothing else on the page.
+            added = _redact_term_boxes(page, hits)
+            added += _redact_boxes(page, drawn_by_hand,
+                                   graphics=_line_art_mode(page, drawn_by_hand))
             # Nothing is drawn above a box: what lies over one drawn by hand
             # goes. (What draws a term is found by what it draws, later, in
             # the scrub.)
             lifted += _annotations_under(page, drawn_by_hand)
+            if drawn_by_hand:
+                to_pdf = ~page.transformation_matrix
+                hand_boxes[pno] = [tuple((box * to_pdf).normalize()) for box in drawn_by_hand]
             # Taking a word out can leave its neighbours reading as the term
-            # ("a" [removed] "b" for the term "a b"). The verifier would find
-            # that and refuse; look again and box it instead. Bounded: a box
-            # that was already applied and removed nothing is not tried twice.
-            applied = {_box_key(b) for b in boxes}
+            # ("a" [removed] "b" for the term "a b"), and a hit can survive
+            # its trimmed box. The verifier would find either and refuse;
+            # look again, and give what is found the whole box, text and
+            # all. Bounded: a whole box that removed nothing is not tried
+            # twice, and a box is counted once.
+            counted = {_box_key(box) for box, _trimmed in hits}
+            applied: set = set()
             for _ in range(_REDACT_PASSES - 1):
                 if not (added and scrub_terms):
                     break
@@ -3425,7 +3623,9 @@ def redact_pdf(
                 if not again:
                     break
                 applied.update(map(_box_key, again))
-                added += _redact_boxes(page, again)
+                _redact_boxes(page, again)
+                added += sum(1 for b in again if _box_key(b) not in counted)
+                counted.update(map(_box_key, again))
             if added:
                 drawn += added
                 touched.add(pno)
@@ -3488,7 +3688,7 @@ def redact_pdf(
         if emb_hits:
             surface_counts["embedded_files"] = emb_hits
         if lifted:
-            surface_counts["annotations"] = lifted
+            surface_counts["annotations_removed"] = lifted
         # The temp is fitz-saved from the authenticated doc — always
         # plaintext, so the scrub (and verify below) need no password.
         doc_scrub = _scrub_document_surfaces(work, scrub_terms, case_sensitive,
@@ -3530,6 +3730,10 @@ def redact_pdf(
             # Here, not in the scrub: a box drawn by hand leaves one too.
             # First what the tree says in words of content a box removed
             # (it is told from the originals), then the thumbnails.
+            unlisted = _unlisted_annotations_under(pdf, hand_boxes)
+            if unlisted:
+                surface_counts["annotations_removed"] = (
+                    surface_counts.get("annotations_removed", 0) + unlisted)
             for key, n in (("structure_text", _drop_structure_text(
                                pdf, input_path, password, pages_touched)),
                            ("structure_refs", _drop_stale_structure_refs(pdf)),
