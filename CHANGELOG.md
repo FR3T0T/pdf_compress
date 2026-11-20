@@ -2,6 +2,101 @@
 ## Unreleased
 
 ### Added
+- **Redaction: a whole-file search for every target term (#119).** A term
+  redaction could finish verified with the term still in the file, in a
+  place the verifier's surface checks have no name for: structure-tree
+  `/Alt` and `/ActualText`, an application's private data (`/PieceInfo`), a
+  layer's name, a named destination, a script in `/Names /JavaScript`, a
+  metadata stream on a page, a form XObject no page paints. `verify_redaction`
+  now takes a second look, `redaction.term_sweep`: every string in the output
+  and the decoded bytes of every stream, wherever it hangs, using the
+  whole-file walker the sanitize sweep uses. Bytes are read every way text is
+  written in a PDF — Latin-1, PDFDocEncoding, code page 1252, UTF-8, UTF-16
+  in both byte orders and at either alignment — and whitespace in a term
+  matches any run of whitespace (`pdf_verify.TermFinder`). A hit fails the
+  check, with where it is in plain words and the raw object path beside it.
+  A search that could not cover the whole file — an object or a stream that
+  cannot be read — fails it too, and the refusal then says so instead of
+  "still present". A hit on an object a page leads to names the page and
+  offers the flatten (which rebuilds the document from its pages, so it
+  removes it); any other is document-level. Boxes-only redactions are not
+  swept. Not read, and why: images (pixels; that is #128); PDF names; and the
+  internals of fonts and colour profiles — embedded font programs, character
+  maps, a font descriptor's `/FontFamily`, a character collection's
+  `/Registry` and `/Ordering`, ICC profiles. In 521 real PDFs that redact
+  today, the word "Adobe" is in a character map or a `/Registry` string in
+  249 and "Identity" in 219, and "Copyright" is in a colour profile in 46:
+  searching those would refuse the words in every such file. They are exempt
+  by what the holder declares itself to be, never by a key name alone. Known
+  limits, each needing a file built for it: a term that is (part of) a font's
+  or profile's own name, or a PDF name; text behind an object that declares
+  itself an image, a font descriptor's program or an ICC profile; a term
+  written as a hex string or split across strings inside a stream no page
+  paints; and a very short term can be refused because its bytes occur by
+  chance in binary data. Cost on the real-file run (554 files with a word to
+  redact): 60 s → 72 s in total.
+  Tests: `TestTermSweep`, `TestWhatTheSweepLeavesAlone`,
+  `TestSweepNeverPassesOnAPartialLook` in `tests/test_redact_completeness.py`.
+- **Redaction: one matcher for the text of a page (#119).** Search-term
+  redaction found text with PyMuPDF's `search_for`, and the verifier looked
+  for what was left with `search_for` and three plain views of the page's
+  text. On PyMuPDF 1.27 `search_for` finds no term that is broken across a
+  line after a hyphen ("4455-" / "887", "123-45-" / "6789", "Dana Whit-" /
+  "field"), in any mode, and no letter-spaced heading; such a term was
+  reported as "No matching content", or was left in place beside the
+  occurrences that were found, and the output verified. On 2.1 it finds the
+  typesetter's hyphenation only, and its hit stops one letter short: "Dana
+  Whitfield" came out as a verified file with the "d" still on the page.
+  `pdf_verify.PageText` now reads the page's characters with their boxes and
+  looks for a term in four views of them: every run of whitespace, a line
+  break included, as one space; that, with a hyphen that ends a line dropped
+  together with the break; that, with only the break after such a hyphen
+  dropped; and no whitespace at all. Both sides are folded first: NFKC (a
+  ligature is its letters, a no-break space a space), U+2010 and U+2011 as
+  "-", soft hyphens and zero-width characters dropped, case folded unless the
+  search is case-sensitive. `redact_pdf` boxes what `pdf_verify.term_boxes`
+  returns — the matcher's hits and `search_for`'s, each widened to the whole
+  words it touches, one rectangle per line of a hit — and
+  `redaction.page_text` uses the same views to confirm nothing is left.
+  After a page is redacted it is searched again, up to three times, because
+  taking a word out can leave its neighbours reading as the term ("New"
+  [removed] "York"); that used to be a refusal.
+  **What changes for a user.** A hit takes the whole word: a term that is
+  part of a word, an address or a number redacts all of it, punctuation
+  attached to it included. `redaction_count` is still the number of
+  rectangles; right-to-left and stepped text, where `search_for` gave one
+  rectangle per glyph, now counts one per word. The view with no whitespace
+  finds a letter-spaced word, a number printed in groups and an address
+  broken at a line end with no hyphen — and so also redacts two words that
+  spell the term between them ("now here" for "nowhere"). It is accepted
+  only as whole words run together: the term "00000" is not found in
+  "1.0000 0.2000". An apostrophe may follow the last letter ("W H I T F I E
+  L D's file"). The matcher reads text a clipping path hides (a stamp cut
+  off at "APPRO" still has "APPROVED" in the file), as `search_for` did.
+  Scripts written without spaces (Chinese, Japanese, Thai and others) are not
+  widened to "the whole word".
+  **Known limits**, each refused or reported as no match, never passed: text
+  outside the page's visible box (crop box, or running off the page edge)
+  has no characters to box, and the raw-content check refuses the run with
+  the flatten offer; what an annotation's appearance draws on a page is not
+  page content and cannot be redacted (refused, flatten offered); a word
+  that is a PDF name inside a content stream (`/Subtype /Watermark`) is
+  still found by the byte-level checks; characters drawn out of reading
+  order are not put back in order; slanted text is boxed by its bounding
+  rectangle, as before, which takes in what is printed near it.
+  **Real files** (1,139 public PDFs, one word of its own text redacted from
+  each): 520 verified, 12 refused and 17 "no matching content" before; 542
+  verified, 7 refused and none unmatched now. All 17 unmatched files verify
+  (ligatures in the word itself, mostly). Of the nine that failed the
+  page-text or raw-content checks, three verify and six are still refused:
+  three for text outside the visible page, two for an annotation's
+  appearance, one for the PDF name. In the 520 files verified both times the
+  rectangles went from 6,998 to 6,947: nine more in six files, sixty fewer
+  in nine. Every added rectangle holds the term, except the two halves of
+  one false match (two separate labels, "su" and "Sin", for the word
+  "susin"). Cost: the run's redactions, timed back to back, took 88 s before
+  and 125 s now; the largest file, a 352-page book with 563 hits, 9.7 s.
+  Tests: `tests/test_redact_matcher.py`.
 - **Sanitize proves its output before it commits it (#101).** `sanitize_pdf`
   (`pdf_analyze.py`) writes the cleaned candidate to a temp file beside the
   destination, runs `verify_sanitization` on those exact bytes, and renames
@@ -189,6 +284,118 @@
   save-failure) and `tests/test_pdf_verify.py` (D1 flatten targeting).
 
 ### Changed
+- **Redaction scrubs six more surfaces, and refuses what it has no rule for
+  (#119).** So that an ordinary file passes the whole-file search above, a
+  term redaction now also: replaces structure-tree text holding a term
+  (`/Alt`, `/ActualText`, a title, an attribute) with `[redacted]`, as it
+  does a bookmark title; does the same to a layer's name; deletes an
+  application's `/PieceInfo` entry that holds a term anywhere under it;
+  deletes a metadata stream that holds a term in any encoding wherever it
+  hangs, not only the catalog's (one that cannot be decoded is deleted too,
+  since it cannot be shown free of the term); removes a script whose text
+  holds a term, by the sanitizer's own code and so from every place Sanitize
+  removes scripts; and renames a named destination whose name holds a term,
+  together with the links, actions and bookmarks that use it, writing the
+  name tree back sorted. Each is counted in `surface_counts` under
+  `structure`, `layers`, `piece_info`, `metadata` (`xmp` is still the
+  catalog's packet), `scripts` and `destinations`, and a term found only
+  there is a redaction, not "No matching content". All the document-level
+  scrubs now match the way the verifier does, so a term of two words is
+  found in a note that breaks the line between them. **A term anywhere else
+  is not scrubbed: the run is refused.** Of 524 real PDFs whose redaction of
+  one word of their own text used to finish verified, 41 were then refused,
+  every one because the word was still in the file; the next entry has the
+  rules for the places it was. Tests: `TestScrubRules`,
+  `TestWhatHasNoRuleIsRefused`.
+- **Redaction: rules for the places real files keep a term (#119).** They
+  apply to every annotation and form-field dictionary in the file, not only
+  the ones a page lists: redaction takes an annotation under a box off its
+  page, but a tagged file's structure tree goes on pointing at it, with its
+  text and its link address, and that used to verify. Each rule has its own
+  key in `surface_counts`.
+  `rich_text`: a rich-text entry holding a term (`/RC` on an annotation,
+  `/RV` on a field) is deleted; it is the styled twin of the plain text
+  beside it. `field_text`: a field's tooltip (`/TU`), mapping name (`/TM`),
+  default value (`/DV`), option list (`/Opt`) and captions (under `/MK`)
+  become the marker, wherever the field sits in the field tree.
+  `field_names`: a field whose own name (`/T`) holds a term is renamed to a
+  neutral name no other field has; on a page widget it used to be deleted,
+  which left a field with no name. The appearance streams that drew a
+  redacted value, default, option or caption are dropped on the field and on
+  every widget below it. `pdftex`: a `/PTEX.*` entry holding a term — the
+  name of an included figure's file, or anything under that file's
+  `/PTEX.InfoDict` — is deleted. `links`: a URI action whose address holds a
+  term is removed the way Sanitize removes that action, wherever it hangs (a
+  bookmark, the open action, a field, a chain); **a link annotation whose
+  own address held the term now leaves its page, where it used to stay with
+  the address deleted.** `page_labels`: a page-label prefix becomes the
+  marker. `xfa`: when an XFA packet holds a term the form's `/XFA` entry is
+  dropped, so the form falls back to its AcroForm fields; a form that has
+  none is refused with a plain message that an XFA-only form cannot be
+  term-redacted (`RedactionNotPossibleError`, a `ValueError`; nothing written). `embedded_files`: an
+  attachment whose name, description or bytes hold a term is removed whole —
+  from the attachment list (written back as one sorted leaf, so no `/Limits`
+  keeps the name), from every `/AF` array, and with its `/FileAttachment`
+  annotation. **Attachments are searched as their stored bytes only: a zip,
+  a docx or an xlsx is compressed inside and is not opened.** One that
+  cannot be read is left alone, and the run is then refused. `signatures`: a
+  signature holding a term anywhere in it — signer, reason, place,
+  certificate bytes — has its value removed, on a signature field or in the
+  catalog's `/Perms`, so the field is left unsigned; redaction voids a
+  signature in any case. New in `pdf_analyze`, shared with the sanitizer's
+  code: `remove_links`, `remove_embedded_files`, `write_name_tree`, and
+  `remove_scripts(..., also=)` for objects off the page.
+  Still refused, as known limits: web-capture names (`/Names /URLS`), an
+  output intent's standard strings, certificates in the document security
+  store, and anything else the sweep finds. (Three more were on this list:
+  a GoToE action that names a removed attachment, a form stream only the
+  structure tree still references, and the appearance of a note that is off
+  its page. The next entry and the first under Fixed deal with them.) On
+  1,139 real PDFs,
+  one word of its own text redacted from each: 524 finished verified before
+  any of this, 53 of them with the word still in the file; 483 with the
+  sweep and its first rules; 520 now, with 12 refused and 2 XFA-only forms
+  refused in plain words. Nine of the 12 fail the page-text or raw-content
+  checks, as before; three are the sweep (web-capture names, a GoToE target
+  naming a removed attachment, a form stream only the structure tree still
+  references).
+  Tests: `TestRichText`, `TestFormFieldText`, `TestPdfTexEntries`,
+  `TestOffThePage`, `TestLinksEverywhere`, `TestPageLabels`, `TestXfa`,
+  `TestAttachments`, `TestSignatures`, `TestStillRefused`.
+- **Redaction: what goes with a removed attachment and with text scrubbed off
+  the page; neutral names count up (#119).** Three things left over when the
+  rules above met real files. (1) A go-to action into an attachment
+  (`/GoToE`) names the attachment. When the attachment is removed, the
+  action is removed with it, the way Sanitize removes an action — a link
+  annotation whose own action it was leaves its page — whether the target
+  is given as a name in the attachment list or as the `/FileAttachment`
+  annotation that carries the file (by page and position, or page and
+  `/NM`). A real file's four links into its one attachment went on naming it
+  after it was gone, and the run was refused. Not counted on its own; a
+  target counted from another file (`/F`) or from the parent is left.
+  `pdf_analyze.remove_embedded_files` gains `also=` and `gone=`. (2) An
+  annotation that is on no page — redaction took it off, the structure tree
+  still points to it — and has its `/Contents`, `/T`, `/Subj` or `/RC`
+  scrubbed now loses its appearance (`/AP`) too: it drew that text, and
+  nothing shows it. An annotation that is on a page keeps its appearance; if
+  that draws a term the run is refused with the flatten offer, as before.
+  (3) The neutral names given to renamed fields and destinations count up
+  within one stem — `field-1`, `field-2`, `field-3` — where thirteen sibling
+  fields used to come out as `field1`, `item-1`, `item1`, `entry-1` and so
+  on. A stem is passed over only when it holds a term itself, the hyphen
+  only when it does, and a number only when the name would then hold one.
+  Tests: `TestActionsIntoARemovedAttachment`, `TestAnAppearanceOffThePage`,
+  `TestNeutralNamesCountUp`.
+- **`pdf_analyze`: the sanitizer's removals can be asked for selectively
+  (#119).** New `remove_scripts(pdf, wanted)` and
+  `remove_metadata_streams(pdf, wanted=None)`, and `_name_tree_items` is now
+  the public `name_tree_items`. Sanitize itself goes through the same
+  functions; its behaviour is unchanged.
+- **Sweep evidence names the same path on every run (#119).**
+  `pdf_verify.walk_objects` visits a dictionary's entries in key order. An
+  object reachable two ways used to be reported under whichever path the
+  hash seed put first. `plain_location` also names the structure tree, the
+  layer list and the named destinations.
 - **Default Sanitize now removes every additional action (`/AA`) on
   annotations and form fields (#101).** Analyze has always reported any `/AA`
   entry as an auto-run action, whatever it does, but with `auto_actions` on
@@ -435,6 +642,181 @@
   code with no remaining callers.
 
 ### Fixed
+- **Redaction: a term box takes only its own characters (#119).** PyMuPDF
+  removes a character if its box overlaps a redaction rectangle at all, and
+  a character's box is as tall as its line. In type set close, the box of a
+  found word took letters, or whole words, from the lines above and below:
+  "prestations" came out as "prestatio". A term box is now applied in two
+  steps. First the text is removed with the box trimmed, top and bottom, to
+  where characters that are not part of the hit stop reaching into it —
+  never past the middle half of its height, which every character of the
+  hit crosses — with nothing filled and no image or drawing touched. Then
+  the whole box is applied with the text kept, so the black fill and the
+  pixels of a scan under it are covered exactly as before. If a hit
+  survives the trimmed step, the page's re-search finds it and applies the
+  whole box with the text removed, so trimming cannot cost a removal (on
+  the real files that happens only where an annotation draws the word).
+  Boxes drawn by hand are not trimmed; nor is a line that does not run
+  across the page. On 544 real files verified before and after: word
+  instances that left the pages without holding the term went from 1,049 to
+  628, leftover fragments from 322 to 214; words holding the term that left
+  stayed at 7,570, and no file gets a different number of rectangles or a
+  different outcome. What is still lost is mostly not a neighbour at all:
+  the other words of an annotation or form field that is removed whole, the
+  two halves of a hyphenated hit, and lines printed over one another. New:
+  `pdf_verify.term_hits` gives each rectangle with its trimmed one. Tests:
+  `TestATermBoxTakesOnlyItsOwnCharacters`.
+- **Redaction: line art under a box drawn by hand (#119).** A stroked path
+  under a box stayed in the page's content, under the fill, unless it lay
+  wholly inside the box as PyMuPDF measures that — by a curve's control
+  points, not by where the curve runs. A signature drawn as curves could
+  stay. PyMuPDF's other setting removes every drawing whose bounding box
+  overlaps the box, a table's frame or a long rule included, so it is used
+  only when nothing else would go: when every drawing that reaches a box
+  lies wholly inside one by where its path runs. Otherwise the default
+  stays, and the new check `redaction.rect_line_art` fails when a drawing
+  still has an edge inside a box. That is a page-content failure: the page
+  is offered for flattening, and the box is then black on the picture. A
+  solid black rectangle is not counted (every box's own fill is one). Box
+  mode only; term boxes treat line art as before. Tests:
+  `TestLineArtUnderABoxDrawnByHand`,
+  `TestTheVerifierLooksForLineArtInsideABox`.
+- **Redaction: nothing is drawn above a box any more (#119).** An annotation
+  is painted above the page, and PyMuPDF's redaction leaves every annotation
+  alone but its own marks and links. A stamp lying over a box drawn by hand
+  was still painted over it; a stamp that says the search term went on
+  saying it. Both runs were refused and the page offered for flattening,
+  and the flattened page showed the stamp (next entry). A box over a
+  picture of a signature, which has no text for any check to find, simply
+  verified. Now: in a search, an annotation whose appearance draws a term
+  is taken off its page. "Draws" is asked of the page-text matcher, on the
+  text of each of its appearance streams — normal, rollover and down, every
+  state, shown or hidden — so a term broken across two lines of a stamp is
+  found as it would be on a page. Under a box drawn by hand, every
+  annotation whose rectangle overlaps the box is taken off, whatever it
+  draws. With each goes its popup and everything that replies to it,
+  however deep. Counted in `surface_counts` as `annotations_removed`;
+  `annotations` keeps its meaning, text scrubbed inside an annotation. A
+  form field's widget keeps the path it had (value emptied, appearance
+  dropped, removed under a box); a popup is judged with its note, not by its
+  own rectangle; an annotation that is on no page loses the appearance that
+  drew the term (counted as `annotations`: it is scrubbed, not removed). An
+  annotation written into the page's `/Annots` array itself, with no object
+  number, is taken off the page like any other in both modes: PyMuPDF's
+  list of a page's annotations leaves such an entry out, and 1.27 does not
+  delete a widget of that kind when asked to. The verifier gains
+  `redaction.rect_annotations`: no annotation lies over a redaction
+  rectangle (it reads the page's list entry by entry, so it sees those
+  too). On the real-file run (1,139
+  public PDFs, one word each) the two files that were refused for this now
+  verify without flattening — 17 "APPROVED" stamps in one, a Sound
+  annotation labelled "SOUND" in the other — which makes 544 verified and 5
+  refused, from 542 and 7; nothing else moves, and no file gets a
+  different number of rectangles. Tests:
+  `TestAnAnnotationThatDrawsATerm`, `TestAnAnnotationUnderABox`,
+  `TestTheVerifierLooksForAnnotationsOverABox`, `TestAnnotationCounts`,
+  `TestAnAnnotationWrittenIntoThePageList` in
+  `tests/test_redact_engine.py`.
+- **Redaction: a page made a picture is blacked out first (#119).** The
+  flatten fallback rendered the page and put the picture in its place. A
+  page is flattened because something on it could not be removed, so that
+  something was in the picture — and afterwards no check had text to find:
+  the run verified with the word readable. Before a page becomes a picture,
+  every place the matcher still finds a term on it (page text, text a clip
+  hides, what a shown annotation or form field draws) and every box the
+  user drew are filled black on the pixmap itself, where nothing can be
+  painted over the fill. `RedactResult.flattened_areas` records how many
+  areas per flattened page. Not covered: a residual the matcher cannot put
+  anywhere on the page. Tests: `TestAFlattenedPageIsBlackedOutFirst`, with
+  removal switched off.
+- **Redaction: a tagged file kept its description of what a box removed
+  (#119).** A structure element can say in words what its content is: `/Alt`
+  on a figure, `/ActualText`, `/E`, a title `/T`. A box over the figure
+  removed the picture and left "photo of ...", and the output verified. An
+  element whose own content a box removed — a term box or one drawn by
+  hand — now loses those four entries, and every element above it loses
+  `/Alt`, `/ActualText` and `/E`, which speak for all that is under them.
+  "Removed" is decided by comparing what each marked-content sequence
+  paints (the text shown, each image's data, each form, the number of paths
+  and shadings) in the source and in the redacted page, and for a form
+  XObject in the original and in the redacted copy the page now paints; an
+  object reference counts when its annotation is on no page any more.
+  Whatever cannot be compared counts as removed. On 63 tagged real files
+  the comparison marks 150 of 1,438 sequences, only on pages with a box,
+  and gives the same answer on PyMuPDF 1.27 and 2.1. Counted as
+  `structure_text`. The verifier also gains `redaction.structure_streams`,
+  the check for what `structure_refs` fixes: no stream is in the output for
+  the structure tree alone. Tests:
+  `TestWhatATaggedFileSaysOfRemovedContent`,
+  `TestNoStreamIsKeptByTheStructureTreeAlone`.
+- **Redaction: page thumbnails are removed (#119).** `/Thumb` is a small
+  picture of the page as it was, and it was kept. It is deleted from every
+  page of a redacted output (`thumbnails` in `surface_counts`), and
+  `redaction.thumbnails` checks that none is left. Tests:
+  `TestPageThumbnails`.
+- **Redaction: the unredacted original of a form, an image or a page could
+  stay in a tagged file (#119).** PyMuPDF does not edit a form XObject, an
+  image or a page's content stream in place: the page is given a redacted
+  copy, and the original is dropped when the file is written, if nothing
+  refers to it any more. In a tagged file the structure tree does — a
+  marked-content reference names the stream its content is in (`/Stm`), an
+  object reference names the XObject (`/Obj`) — and so the original stayed
+  in the output, unredacted, where no page paints it. For a search term the
+  whole-file search found it and refused the run. **For a box drawn by hand
+  nothing looked, and the output verified**: the text of a form under the
+  box, or the pixels of an image the box blacked out, were still in the
+  file. `redact_pdf` now removes, on every run, each reference the structure
+  tree makes to a stream that nothing else in the file leads to (tested by
+  walking the file without entering the structure tree, so a form a page
+  still paints keeps its reference). Counted in `surface_counts` as
+  `structure_refs`. The redacted copy is not put in the tree in its place:
+  that content is no longer tagged, which it already was not, the tree
+  having pointed at the original. Both PyMuPDF versions. Tests:
+  `TestWhatTheStructureTreeKeepsAlive`.
+- **Redaction: a file MuPDF repairs while saving it came out unredacted
+  (#119).** MuPDF checks an object when it comes to read it. Finding one
+  damaged, it goes back to the file on disk and rebuilds everything from
+  there, and whatever had been changed in memory is gone without an error.
+  When the damage is somewhere only the save reads, that is the redaction:
+  the page was redacted, and the file that was written was not. The verifier
+  caught it and the run was refused with the flatten offer — and a
+  flattened page would have been drawn from the unredacted file, with the
+  word visible and no text left for a check to find. `redact_pdf` now
+  notices the repair (`Document.is_repaired` turning true between the first
+  page and the end of the save) and does the redaction again on the copy
+  MuPDF has just written, which is sound. Three real files were refused or
+  unmatched for this, one of them a fuzzed file. Tests:
+  `TestAFileRepairedWhileItIsSaved`, on a file built with one wrong entry in
+  its cross-reference table.
+- **Redaction: a case-sensitive search could take the term in another case
+  (#119).** `search_for` ignores case, so each of its hits was confirmed by
+  asking for the text inside the hit's rectangle. The rectangle is as tall
+  as the line and reaches into the next one, and the answer included the
+  next line: "DANA WHITFIELD" was redacted in a case-sensitive search for
+  "Dana Whitfield" when that stood on the line below. The characters under
+  the hit are now compared themselves. Tests: `TestFolding`.
+- **Redaction: the text written in a term's place could hold the term
+  (#119).** Bookmark titles, and now structure text, layer names and field
+  text, are replaced with `[redacted]` — which contains "Ted", "Red" and
+  "act". A title replaced by it for one of those terms was then found by the
+  verifier, and the redaction was refused (since #99). The marker is now the
+  first of `[redacted]`, `[removed]`, `[hidden]`, `[...]` or nothing that
+  holds no term, and the neutral names given to renamed fields and
+  destinations are chosen the same way: a real file whose fields are called
+  "Field 1" and "Field 2" was being renamed, for the word "Field", to
+  `field-1`. Tests: `TestReplacementTextNeverHoldsTheTerm`.
+- **A page's content streams were loaded once per reference instead of once
+  (#119).** `pdf_analyze.page_content_blobs` — behind Analyze's
+  invisible-text check and the redaction verifier's raw-content check —
+  loaded a form XObject's stream for every place that draws it, and forms
+  draw each other. One real two-page file with 270 forms made 73,172 stream
+  loads and handed 157 MB per page to the search; it now makes 542 (each
+  stream once per page) and hands over 1 MB, and Analyze on that file goes
+  from 11 s to under 2 s. A stream that cannot be read used to be skipped
+  when reading it raised, so the verifier could not know it was there; it is
+  now returned as `None` in its place, once, and
+  `redaction.raw_content` fails on it and counts it once. No size budget is
+  added here (#120). Tests: `TestContentStreamsAreReadOnce`.
 - **Sanitize: shapes that verified with content still in the file, or were
   refused over something Analyze had not listed (#101).** Found by trying to
   break the gate. (1) An `/Info` dictionary also referenced from another key

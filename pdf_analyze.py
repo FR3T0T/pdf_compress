@@ -232,7 +232,7 @@ def _name_tree_leaves(node):
             _trouble("part of a name tree could not be read", exc)
 
 
-def _name_tree_items(node):
+def name_tree_items(node):
     """Yield (key, value) for every entry of a name tree (see
     _name_tree_leaves)."""
     for _leaf, entries in _name_tree_leaves(node):
@@ -244,8 +244,8 @@ def _name_tree_items(node):
 
 
 def _name_tree_values(node):
-    """The values of a name tree (see _name_tree_items)."""
-    for _key, value in _name_tree_items(node):
+    """The values of a name tree (see name_tree_items)."""
+    for _key, value in name_tree_items(node):
         yield value
 
 
@@ -296,7 +296,7 @@ def _all_pages(pdf: pikepdf.Pdf):
     for tree, word in trees:
         if tree is None:
             continue
-        for name, page in _name_tree_items(tree):
+        for name, page in name_tree_items(tree):
             if isinstance(page, pikepdf.Dictionary) and first_visit(page):
                 yield f"{word} {_label(name)}", page
 
@@ -1076,7 +1076,7 @@ def _scan_embedded_files(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
             nm = pdf.Root.get("/Names")
             if isinstance(nm, pikepdf.Dictionary) and "/EmbeddedFiles" in nm:
                 names.extend(_as_str(key) for key, _value
-                             in _name_tree_items(nm["/EmbeddedFiles"]))
+                             in name_tree_items(nm["/EmbeddedFiles"]))
         except Exception as exc:
             _trouble("the catalog's attachment list could not be read", exc)
 
@@ -1194,25 +1194,41 @@ def page_content_blobs(doc, page) -> list:
     ``page.get_contents()[0]`` and saw neither (ANL-03). Image XObjects are
     skipped (their streams are pixel data, not operators).
 
-    Public (used by pdf_verify's redaction verifier); a decoded stream that
-    is not readable is silently skipped here — callers that must fail closed
-    on an unreadable stream should compare the blob count to the returned
-    list length themselves (pdf_verify does).
+    Each stream is read once per page. A page lists a form once for every
+    place that draws it, and forms draw each other: one real two-page file
+    has 270 forms and 73,172 such references, and every one of them used to
+    be a stream load (#119).
+
+    Public (used by pdf_verify's redaction verifier). A stream that cannot
+    be read is returned as ``None``, in its place, once: a caller that must
+    fail closed counts the entries that are not bytes (pdf_verify does);
+    the analyzer skips them.
     """
-    blobs = []
+    blobs, seen = [], set()
+
+    def load(xref) -> None:
+        if xref in seen:
+            return
+        seen.add(xref)
+        try: blobs.append(doc.xref_stream(xref))
+        except Exception: blobs.append(None)
+
     try:
         for xref in page.get_contents():
-            try: blobs.append(doc.xref_stream(xref))
-            except Exception: continue
+            load(xref)
     except Exception:
         pass
     try:
         for item in page.get_xobjects():
             try:
                 xref = item[0]
+                if xref in seen:
+                    continue
                 subtype = doc.xref_get_key(xref, "Subtype")
                 if subtype and _as_str(subtype[1]).lstrip("/") == "Form":
-                    blobs.append(doc.xref_stream(xref))
+                    load(xref)
+                else:
+                    seen.add(xref)          # an image: looked at once, never read
             except Exception:
                 continue
     except Exception:
@@ -2014,8 +2030,15 @@ def _action_head_drop(action, opts: dict) -> Optional[str]:
     (gated on the matching opt) or it carries an inline /JS entry (gated on
     ``javascript``) — the same signal the analyzer's
     _scan_scripts_and_actions flags (``/S`` or inline ``/JS``).
+
+    A caller that removes by some other test than the options puts it in
+    *opts* under ``"_judge"``: a callable taking the action and returning
+    the counter key or None. It then decides alone (remove_scripts).
     """
     try:
+        judge = opts.get("_judge")
+        if judge is not None:
+            return judge(action)
         stype = _as_str(action.get("/S"))
         opt_counter = _DANGEROUS_ACTIONS.get(stype)
         if opt_counter is not None and opts.get(opt_counter[0]):
@@ -2210,6 +2233,372 @@ def _clean_named_scripts(tree, opts: dict, bump) -> None:
                     bump(key)
         except Exception as exc:
             _trouble("the document's named scripts could not be cleaned", exc)
+
+
+def _scrub_action_owners(pdf: pikepdf.Pdf, opts: dict, bump,
+                         on_page=None, on_annot=None) -> None:
+    """Apply *opts* to the actions of every page, annotation, bookmark and
+    form field. (The catalog's own actions and the named scripts are the
+    caller's to do first.)
+
+    Pages are the ones in the page tree and the ones outside it (_all_pages,
+    which the analyzer walks too). This loop reaches the annotations itself
+    rather than through _action_owners because it rewrites each page's
+    /Annots as it goes; a test holds the two walks to the same set of
+    annotations.
+
+    *on_page(page, label)* and *on_annot(annot, label)* are whatever else
+    the caller removes in the same pass; *on_annot* returns True when the
+    annotation must be dropped for its own reasons.
+    """
+    dropped: set = set()        # (num, gen) of annotations already dropped
+    for label, page in _all_pages(pdf):
+        try:
+            _scrub_owner_actions("page", label, page, opts, bump)
+            if on_page is not None:
+                on_page(page, label)
+            annots = page.get("/Annots")
+            if not isinstance(annots, pikepdf.Array):
+                continue
+        except Exception as exc:
+            _trouble(f"{_plain_owner(label)} could not be cleaned", exc)
+            continue
+        keep = []
+        for annot in list(annots):
+            try:
+                ident = tuple(annot.objgen) if annot.is_indirect else None
+                if ident is not None and ident in dropped:
+                    continue             # listed on an earlier page too; gone there
+                # /A, /PA and /AA, by the rule every site uses: an action
+                # goes for what it does or, in /AA, for firing by itself; one
+                # that stays has its /Next chain cleaned (ANL-02). When the
+                # annotation's own /A had to go, the annotation is dropped —
+                # and the /A has been deleted from it as well, because
+                # taking a widget off the page does not take it out of the
+                # file: /AcroForm still lists it.
+                drop = _scrub_owner_actions("annot", f"{label} annotation",
+                                            annot, opts, bump)
+                if on_annot is not None and on_annot(annot, label):
+                    drop = True
+                if not drop:
+                    keep.append(annot)
+                elif ident is not None:
+                    dropped.add(ident)
+            except Exception as exc:
+                if isinstance(annot, pikepdf.Dictionary):     # a null entry is not trouble
+                    _trouble(f"{_plain_owner(label)} annotation could not be cleaned", exc)
+                keep.append(annot)
+        try:
+            if len(keep) != len(annots):
+                page["/Annots"] = pikepdf.Array(keep)
+        except Exception as exc:
+            _trouble(f"the annotation list of {_plain_owner(label)} could not be rewritten", exc)
+
+    # Bookmarks, and form fields no page shows (a parent field, a field with
+    # no widget, a widget just dropped above). The owners come from the same
+    # generator the analyzer walks.
+    for owner_kind, label, owner in _action_owners(pdf):
+        if owner_kind in ("outline", "field"):
+            try:
+                _scrub_owner_actions(owner_kind, label, owner, opts, bump)
+            except Exception as exc:
+                _trouble(f"{_plain_owner(label)} could not be cleaned", exc)
+
+
+def remove_metadata_streams(pdf: pikepdf.Pdf, wanted=None) -> dict:
+    """Delete metadata streams from the open document, wherever they hang;
+    returns ``{(num, gen): stream}`` for the ones removed.
+
+    All of them (Sanitize's `metadata` option), or with *wanted* only those
+    it answers True for (redaction removes the ones that hold a term, #119).
+
+    A /Metadata slot is emptied where it stands. A stream that declares
+    itself metadata is then unhooked from wherever else it is referenced;
+    one that does not is not — outside a /Metadata slot nothing says it is
+    metadata, and a file can point a page's /Contents at the same stream.
+    """
+    streams = _metadata_streams(pdf)
+    chosen = {key: s for key, s in streams.items() if wanted is None or wanted(s)}
+    if not chosen:
+        return {}
+    for holder, md in list(_metadata_slots(pdf)):
+        try:
+            if tuple(md.objgen) in chosen:
+                del holder["/Metadata"]
+        except Exception as exc:
+            _trouble("an object's metadata entry could not be removed", exc)
+    _drop_stream_refs(pdf, {key for key, s in chosen.items() if _is_metadata_stream(s)})
+    return chosen
+
+
+def _remove_actions(pdf: pikepdf.Pdf, judge, also=()) -> int:
+    """Remove every action *judge* picks, the way Sanitize removes actions,
+    and return how many went. The body of remove_scripts and remove_links.
+
+    *judge(action)* returns a counter key for an action that must go, else
+    None (see _action_head_drop). The places are the sanitizer's own, by its
+    own code and so its own rules: the catalog, the named scripts, pages in
+    and out of the page tree, annotations (one whose own action goes is
+    dropped from its page), bookmarks and form fields, each down its /Next
+    chain.
+
+    *also* are annotation or field dictionaries the document's structure no
+    longer leads to — an annotation redaction took off its page, which a
+    tagged file's structure tree still references. Each is cleaned like an
+    annotation on a page; there is no page to take it off.
+
+    Tolerant, like the sanitizer: what cannot be processed is passed over,
+    and whoever verifies the result decides what that means.
+    """
+    removed = 0
+
+    def bump(_key: str, n: int = 1) -> None:
+        nonlocal removed
+        removed += max(n, 0)
+
+    opts = {"_judge": judge}
+    root = pdf.Root
+    try:
+        _scrub_owner_actions("document", "Document", root, opts, bump)
+    except Exception as exc:
+        _trouble("the document's own actions could not be cleaned", exc)
+    try:
+        names = root.get("/Names")
+        if isinstance(names, pikepdf.Dictionary) and "/JavaScript" in names:
+            _clean_named_scripts(names["/JavaScript"], opts, bump)
+    except Exception as exc:
+        _trouble("the document's named scripts could not be cleaned", exc)
+    _scrub_action_owners(pdf, opts, bump)
+    for owner in also:
+        try:
+            if isinstance(owner, pikepdf.Dictionary):
+                _scrub_owner_actions("annot", "An object off the page", owner, opts, bump)
+        except Exception as exc:
+            _trouble("an object off the page could not be cleaned", exc)
+    return removed
+
+
+def remove_scripts(pdf: pikepdf.Pdf, wanted, also=()) -> int:
+    """Remove every script *wanted* picks, the way Sanitize removes scripts,
+    and return how many went.
+
+    *wanted(js)* is asked about the /JS value of each JavaScript action — a
+    string or a stream — and answers True for one that must go. Unlike
+    Sanitize's `javascript` option this is selective: redaction removes the
+    scripts that hold a term and leaves the rest (#119). Where it looks, and
+    what *also* is for, is _remove_actions; a 3D stream's /OnInstantiate
+    script is covered as well. A script kept somewhere none of those reach
+    is not removed here either.
+    """
+    def is_wanted(js) -> bool:
+        return isinstance(js, (pikepdf.String, pikepdf.Stream)) and bool(wanted(js))
+
+    def judge(action) -> Optional[str]:
+        return "script" if is_wanted(action.get("/JS")) else None
+
+    removed = _remove_actions(pdf, judge, also)
+    for stream in list(_instantiate_scripts(pdf)):
+        try:
+            if is_wanted(stream.get("/OnInstantiate")):
+                del stream["/OnInstantiate"]
+                removed += 1
+        except Exception as exc:
+            _trouble("a 3D artwork script could not be removed", exc)
+    return removed
+
+
+def remove_links(pdf: pikepdf.Pdf, wanted, also=()) -> int:
+    """Remove every URI action whose address *wanted* picks, the way
+    Sanitize's `external_links` removes a link, and return how many went.
+
+    *wanted(uri)* is asked about the /URI value of each action of type
+    /URI. Selective, where the option is all or nothing (#119): the action
+    is deleted from where it is stored — a link annotation whose own action
+    it was leaves its page, one further down a chain is cut out and the
+    chain rejoined. See _remove_actions for the places and for *also*.
+    """
+    def judge(action) -> Optional[str]:
+        if _as_str(action.get("/S")) != "/URI":
+            return None
+        uri = action.get("/URI")
+        return "link" if uri is not None and wanted(uri) else None
+
+    return _remove_actions(pdf, judge, also)
+
+
+def write_name_tree(tree, items) -> None:
+    """Replace what name tree *tree* holds with *items* — ``(key, value)``
+    pairs, the key a pikepdf string or bytes — as a single sorted leaf.
+
+    A name tree is sorted by key and its inner nodes record the first and
+    last key below them (/Limits). Changing or removing a key in place
+    would leave both wrong, and would leave the old key in a /Limits; a tree
+    whose root holds every entry is valid at any size and has neither
+    problem. Entries whose key is not a string are kept, after the others.
+    """
+    named, other = [], []
+    for key, value in items:
+        if isinstance(key, (bytes, pikepdf.String)):
+            named.append((bytes(key), value))
+        else:
+            other.append((key, value))
+    flat = pikepdf.Array()
+    for key, value in sorted(named, key=lambda kv: kv[0]):
+        flat.append(pikepdf.String(key))
+        flat.append(value)
+    for key, value in other:
+        flat.append(key)
+        flat.append(value)
+    tree["/Names"] = flat
+    for stale in ("/Kids", "/Limits"):
+        if stale in tree:
+            del tree[stale]
+
+
+def remove_embedded_files(pdf: pikepdf.Pdf, wanted, also=(), gone=()) -> int:
+    """Remove whole every embedded file *wanted* picks — its file
+    specification and its payload — and return how many went.
+
+    *wanted* is asked about each file specification that carries a payload,
+    and about each name the attachment list files one under. Selective,
+    where Sanitize's `embedded_files` is all or nothing (#119).
+
+    A chosen file specification is emptied in place, as the sanitizer
+    empties one it finds on a holder it has no rule for: whatever still
+    refers to it is left with no payload, no name and no description. Then
+    the places that list files are tidied. Its entry leaves the attachment
+    name tree, which is written back as one sorted leaf so that no /Limits
+    keeps the name. It leaves every /AF array. And a /FileAttachment
+    annotation whose file it was leaves its page.
+
+    An action that opened a removed file goes with it: an embedded go-to
+    action (/GoToE) whose target, counted from this document, is a name the
+    attachment list no longer has, or a /FileAttachment annotation that has
+    just left its page. It names what it opened, and would be left pointing
+    at nothing. It is removed the way Sanitize removes an action
+    (_remove_actions, which is also what *also* is for), and is not counted:
+    the count is of files. *gone* are names the caller has already taken
+    out of the attachment list itself, as text; the actions into those go
+    too.
+    """
+    def emptied(d) -> bool:
+        return isinstance(d, pikepdf.Dictionary) and not (set(d.keys()) - {"/Type"})
+
+    def carries_removed_file(annot) -> bool:
+        return (isinstance(annot, pikepdf.Dictionary)
+                and _as_str(annot.get("/Subtype")) == "/FileAttachment"
+                and emptied(annot.get("/FS")))
+
+    chosen, seen = [], set()
+
+    def choose(d) -> None:
+        if d.is_indirect:
+            key = tuple(d.objgen)
+            if key in seen:
+                return
+            seen.add(key)
+        chosen.append(d)
+
+    for d in list(_filespec_dicts(pdf)):
+        try:
+            if _has_payload(d) and wanted(d):
+                choose(d)
+        except Exception as exc:
+            _trouble("a file specification could not be examined", exc)
+    names, tree, items = None, None, []
+    try:
+        names = pdf.Root.get("/Names")
+        tree = names.get("/EmbeddedFiles") if isinstance(names, pikepdf.Dictionary) else None
+        if isinstance(tree, pikepdf.Dictionary):
+            items = list(name_tree_items(tree))
+            for key, value in items:
+                if isinstance(value, pikepdf.Dictionary) and wanted(key):
+                    choose(value)
+    except Exception as exc:
+        _trouble("the document's attachment list could not be read", exc)
+    gone_names: set = {str(name) for name in gone}
+    if not chosen and not gone_names:
+        return 0
+
+    for d in chosen:
+        try:
+            for k in list(d.keys()):
+                if k != "/Type":
+                    del d[k]
+        except Exception as exc:
+            _trouble("an embedded file could not be removed", exc)
+
+    # What a go-to action can name of the files that went, read before any
+    # list is rewritten: the key the attachment list filed one under (as its
+    # bytes and as text), or the annotation that carried one, by page and
+    # position or by page and /NM.
+    gone_annots: set = set()
+    try:
+        for key, value in items:
+            if isinstance(key, pikepdf.String) and emptied(value):
+                gone_names.update((bytes(key), str(key)))
+        for number, page in enumerate(pdf.pages):
+            annots = page.obj.get("/Annots")
+            for position, annot in enumerate(annots if isinstance(annots, pikepdf.Array) else []):
+                if carries_removed_file(annot):
+                    gone_annots.add((number, position))
+                    if isinstance(annot.get("/NM"), pikepdf.String):
+                        gone_annots.add((number, bytes(annot["/NM"])))
+    except Exception as exc:
+        _trouble("the actions that open a removed file could not be found", exc)
+
+    def opens_removed_file(action) -> Optional[str]:
+        # With /F the target is counted from some other file, not this one.
+        if _as_str(action.get("/S")) != "/GoToE" or "/F" in action:
+            return None
+        target = action.get("/T")
+        if not isinstance(target, pikepdf.Dictionary) or _as_str(target.get("/R")) != "/C":
+            return None
+        name, page, annot = target.get("/N"), target.get("/P"), target.get("/A")
+        if isinstance(name, pikepdf.String):
+            return ("embedded_goto" if bytes(name) in gone_names or str(name) in gone_names
+                    else None)
+        if isinstance(annot, pikepdf.String):
+            annot = bytes(annot)
+        if isinstance(page, int) and isinstance(annot, (int, bytes)):
+            return "embedded_goto" if (page, annot) in gone_annots else None
+        return None
+
+    try:
+        left = [(key, value) for key, value in items if not emptied(value)]
+        if len(left) != len(items):
+            if left:
+                write_name_tree(tree, left)
+            else:
+                del names["/EmbeddedFiles"]
+    except Exception as exc:
+        _trouble("the document's attachment list could not be rewritten", exc)
+    if gone_names or gone_annots:
+        _remove_actions(pdf, opens_removed_file, also)
+    for obj in list(_reachable(pdf)):
+        try:
+            af = obj.get("/AF")
+            if isinstance(af, pikepdf.Array):
+                keep = [x for x in af if not emptied(x)]
+                if not keep:
+                    del obj["/AF"]
+                elif len(keep) != len(af):
+                    obj["/AF"] = pikepdf.Array(keep)
+            elif af is not None and emptied(af):
+                del obj["/AF"]
+        except Exception as exc:
+            _trouble("an associated-files list could not be rewritten", exc)
+    for label, page in _all_pages(pdf):
+        try:
+            annots = page.get("/Annots")
+            if not isinstance(annots, pikepdf.Array):
+                continue
+            keep = [a for a in annots if not carries_removed_file(a)]
+            if len(keep) != len(annots):
+                page["/Annots"] = pikepdf.Array(keep)
+        except Exception as exc:
+            _trouble(f"the annotation list of {_plain_owner(label)} could not be rewritten", exc)
+    return len(chosen)
 
 
 def _reachable(pdf: pikepdf.Pdf):
@@ -2420,72 +2809,27 @@ def _remove_content(pdf: pikepdf.Pdf, opts: dict) -> dict[str, int]:
             _trouble("the document's attachment list could not be removed", exc)
         _drop_af(root, "the document")
 
-    # Pages and their annotations — the pages in the page tree and the ones
-    # outside it (_all_pages, which the analyzer walks too). This loop
-    # reaches the annotations itself rather than through _action_owners
-    # because it rewrites each page's /Annots as it goes; a test holds the
-    # two walks to the same set of annotations.
-    dropped: set = set()        # (num, gen) of annotations already dropped
-    for label, page in _all_pages(pdf):
-        try:
-            _scrub_owner_actions("page", label, page, opts, _bump)
-            if opts["embedded_files"]:
-                _drop_af(page, _plain_owner(label))
-            annots = page.get("/Annots")
-            if not isinstance(annots, pikepdf.Array):
-                continue
-        except Exception as exc:
-            _trouble(f"{_plain_owner(label)} could not be cleaned", exc)
-            continue
-        keep = []
-        for annot in list(annots):
-            try:
-                ident = tuple(annot.objgen) if annot.is_indirect else None
-                if ident is not None and ident in dropped:
-                    continue             # listed on an earlier page too; gone there
-                # /A, /PA and /AA, by the rule every site uses: an action
-                # goes for what it does or, in /AA, for firing by itself; one
-                # that stays has its /Next chain cleaned (ANL-02). When the
-                # annotation's own /A had to go, the annotation is dropped —
-                # and the /A has been deleted from it as well, because
-                # taking a widget off the page does not take it out of the
-                # file: /AcroForm still lists it.
-                drop = _scrub_owner_actions("annot", f"{label} annotation",
-                                            annot, opts, _bump)
-                # Embedded files carried by the annotation itself:
-                # /FileAttachment annots hold a stream via /FS→/EF, and /AF
-                # arrays reference embedded streams — both independent of
-                # the name tree, and both invisible to the /A→/S check
-                # above (ANL-04).
-                if opts["embedded_files"]:
-                    if _as_str(annot.get("/Subtype")) == "/FileAttachment":
-                        drop = True
-                        if _first_time(annot.get("/FS")):
-                            _bump("file_attachment_annot")
-                    _drop_af(annot, f"{_plain_owner(label)} annotation")
-                if not drop:
-                    keep.append(annot)
-                elif ident is not None:
-                    dropped.add(ident)
-            except Exception as exc:
-                if isinstance(annot, pikepdf.Dictionary):     # a null entry is not trouble
-                    _trouble(f"{_plain_owner(label)} annotation could not be cleaned", exc)
-                keep.append(annot)
-        try:
-            if len(keep) != len(annots):
-                page["/Annots"] = pikepdf.Array(keep)
-        except Exception as exc:
-            _trouble(f"the annotation list of {_plain_owner(label)} could not be rewritten", exc)
+    # Pages, their annotations, bookmarks and form fields (_scrub_action_owners).
+    # The embedded files a page or an annotation carries go in the same pass:
+    # /FileAttachment annots hold a stream via /FS→/EF, and /AF arrays
+    # reference embedded streams — both independent of the name tree, and
+    # both invisible to the action checks (ANL-04).
+    def _page_files(page, label: str) -> None:
+        if opts["embedded_files"]:
+            _drop_af(page, _plain_owner(label))
 
-    # Bookmarks, and form fields no page shows (a parent field, a field with
-    # no widget, a widget just dropped above). The owners come from the same
-    # generator the analyzer walks.
-    for owner_kind, label, owner in _action_owners(pdf):
-        if owner_kind in ("outline", "field"):
-            try:
-                _scrub_owner_actions(owner_kind, label, owner, opts, _bump)
-            except Exception as exc:
-                _trouble(f"{_plain_owner(label)} could not be cleaned", exc)
+    def _annot_files(annot, label: str) -> bool:
+        """True if the annotation is itself an attachment and must go."""
+        drop = False
+        if opts["embedded_files"]:
+            if _as_str(annot.get("/Subtype")) == "/FileAttachment":
+                drop = True
+                if _first_time(annot.get("/FS")):
+                    _bump("file_attachment_annot")
+            _drop_af(annot, f"{_plain_owner(label)} annotation")
+        return drop
+
+    _scrub_action_owners(pdf, opts, _bump, on_page=_page_files, on_annot=_annot_files)
 
     # Embedded files the structural removals above could not reach: a
     # payload on any other holder (a /Screen or /RichMedia annotation, a
@@ -2524,21 +2868,7 @@ def _remove_content(pdf: pikepdf.Pdf, opts: dict) -> dict[str, int]:
         # editing context at all invents a packet (and an /Info) in a file
         # that had neither.
         try:
-            streams = _metadata_streams(pdf)
-            if streams:
-                # A /Metadata slot is emptied where it stands. A stream that
-                # declares itself metadata is then unhooked from wherever
-                # else it is referenced; one that does not is not — outside
-                # a /Metadata slot nothing says it is metadata, and a file
-                # can point a page's /Contents at the same stream.
-                for holder, _md in list(_metadata_slots(pdf)):
-                    try:
-                        del holder["/Metadata"]
-                    except Exception as exc:
-                        _trouble("an object's metadata entry could not be removed", exc)
-                _drop_stream_refs(pdf, {k for k, s in streams.items()
-                                        if _is_metadata_stream(s)})
-                _bump("xmp_metadata", len(streams))
+            _bump("xmp_metadata", len(remove_metadata_streams(pdf)))
         except Exception as exc:
             _trouble("metadata streams could not be removed", exc)
         try:

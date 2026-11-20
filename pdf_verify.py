@@ -23,7 +23,31 @@ transform raises, with the report, having touched nothing at the destination:
     leak invisible to one library is still caught by the other. When the
     caller supplies the source's trailer /ID elements it also asserts the
     output carries none of them (``redaction.file_id``): a cleaned copy that
-    keeps its source's identifier is still linkable to it.
+    keeps its source's identifier is still linkable to it. And it takes a
+    second, whole-file look for the terms (``redaction.term_sweep``, #119):
+    every string in the output and the decoded bytes of every stream,
+    wherever it hangs, read in every encoding text has in a PDF
+    (:class:`TermFinder`). That is what finds a term in a place the surface
+    checks have no name for — structure-tree text, an application's private
+    data, a layer's name, a form no page paints. It does not read images,
+    the internals of fonts and colour profiles, or PDF names (see the note
+    above :func:`_term_sweep_check` for why, and for what that leaves).
+    Page text is searched by :class:`PageText`, the one matcher
+    ``redact_pdf`` also boxes by (:func:`term_boxes`): the page's
+    characters with their boxes, looked at in four views so that a term is
+    found across a line break, a line-end hyphen, letter-spacing and a
+    ligature, where PyMuPDF's search_for is not. It reads text a clipping
+    path hides. It cannot read text outside the page's visible box, or
+    remove what an annotation's appearance draws: those are left to the
+    raw-content check and the sweep, which refuse the run. For boxes drawn
+    by hand there are, besides the clipped extraction of each box, two
+    checks of what a box leaves that is not text: no annotation lies over
+    it (``redaction.rect_annotations``; an annotation is painted above the
+    page) and no drawing has an edge inside it
+    (``redaction.rect_line_art``). And every redaction, by term or by box,
+    is checked for a stream the structure tree alone keeps in the file
+    (``redaction.structure_streams``) and for page thumbnails
+    (``redaction.thumbnails``).
   - :func:`verify_sanitization` — re-runs the ``pdf_analyze`` audit on the
     output and asserts absent exactly the finding categories the enabled
     sanitize options promised to remove (expectations-based — anything else
@@ -87,6 +111,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional
@@ -341,17 +366,647 @@ def _bytes_contain(raw: bytes, term: str, case_sensitive: bool) -> bool:
     return needle.lower() in raw.lower()
 
 
-def _term_in_page_text(page, text: str, term: str,
-                       case_sensitive: bool) -> tuple[bool, Optional[str]]:
+def _pdfdoc_table() -> dict:
+    """Latin-1 code point -> what that byte is in PDFDocEncoding, for the
+    bytes where the two differ (typographic quotes and dashes, the bullet,
+    the euro, the fi and fl ligatures). From pikepdf's codec; empty if this
+    pikepdf has none, which leaves the Latin-1 reading alone."""
+    table = {}
+    for i in range(256):
+        try:
+            ch = bytes([i]).decode("pdfdoc")
+        except Exception:
+            continue
+        if ch != chr(i):
+            table[i] = ch
+    return table
+
+
+_PDFDOC = _pdfdoc_table()
+
+
+class TermFinder:
+    """Finds target terms in raw bytes: a string object's, or a stream's
+    decoded data.
+
+    A PDF has no one text encoding, so the bytes are read every way text is
+    written in one: Latin-1 and PDFDocEncoding (the same for ASCII), Windows
+    code page 1252 (what most page content uses), UTF-8, and UTF-16 in both
+    byte orders and at either alignment. Whitespace in a term matches any
+    run of whitespace, a line break or a no-break space included; nothing
+    else is bridged, so a term broken in the middle of a word is not found
+    here (that is the page-text matcher's work). Case is folded unless
+    *case_sensitive*.
+
+    Shared by the verifier's sweep and by the scrub in pdf_ops, so the scrub
+    removes by the same test it will be checked with.
+    """
+
+    def __init__(self, terms, case_sensitive: bool = False):
+        self.terms = [t for t in (terms or []) if t and t.strip()]
+        self._case = case_sensitive
+        self._tests = []
+        for term in self.terms:
+            words = self._fold(term).split()
+            if len(words) == 1:
+                self._tests.append((term, words[0], None))
+            else:
+                self._tests.append((term, None, re.compile(r"\s+".join(map(re.escape, words)))))
+        joined = "".join(self.terms)
+        self._ascii = joined.isascii()
+        self._latin1 = all(ord(c) < 256 for c in joined)
+        # An ASCII word is the same bytes in UTF-8 as in Latin-1; only a term
+        # of several words needs the UTF-8 reading, for the whitespace.
+        self._utf8 = not (self._ascii and all(rx is None for _t, _w, rx in self._tests))
+
+    def _fold(self, text: str) -> str:
+        return text if self._case else text.casefold()
+
+    def _readings(self, raw: bytes):
+        latin = raw.decode("latin-1")
+        yield latin
+        if not self._ascii:
+            if _PDFDOC:
+                yield latin.translate(_PDFDOC)
+            yield raw.decode("cp1252", "replace")
+        if self._utf8:
+            yield raw.decode("utf-8", "replace")
+        if self._latin1:
+            # UTF-16 of Latin-1 text is that text with a zero byte beside
+            # every character: dropping the zeros reads it in either byte
+            # order and at either alignment.
+            if b"\x00" in raw:
+                yield raw.replace(b"\x00", b"").decode("latin-1")
+        else:
+            for encoding in ("utf-16-be", "utf-16-le"):
+                yield raw.decode(encoding, "replace")
+                yield raw[1:].decode(encoding, "replace")
+
+    def find(self, raw) -> list[str]:
+        """The terms found in *raw*, in the order they were given."""
+        raw = bytes(raw)
+        if not raw or not self._tests:
+            return []
+        pending, found = list(self._tests), set()
+        for reading in self._readings(raw):
+            text = self._fold(reading)
+            left = []
+            for term, word, rx in pending:
+                if (word in text) if rx is None else (rx.search(text) is not None):
+                    found.add(term)
+                else:
+                    left.append((term, word, rx))
+            pending = left
+            if not pending:
+                break
+        return [t for t in self.terms if t in found]
+
+    def __call__(self, raw) -> bool:
+        return bool(self.find(raw))
+
+
+# ════════════════════════════════════════════════════════════════════
+#  The page-text matcher (#119, D3)
+# ════════════════════════════════════════════════════════════════════
+#
+#  One matcher for the text of a page, used on both sides: redact_pdf boxes
+#  what it finds, and verify_redaction confirms it finds nothing. It reads
+#  the page's characters with their boxes (PyMuPDF's "rawdict") and does
+#  its own matching, because search_for cannot be relied on for it. On
+#  PyMuPDF 1.27 search_for finds no term that is broken across a line after
+#  a hyphen, in any mode, and no letter-spaced one. On 2.1 it finds the
+#  typesetter's hyphenation only, and its hit can stop one letter short of
+#  the word.
+#
+#  A term is looked for in four views of the page's text:
+#
+#    spaced        every run of whitespace, a line break included, is one
+#                  space — "Dana" at the end of a line and "Whitfield" at
+#                  the start of the next;
+#    dehyphenated  as spaced, but a hyphen that ends a line goes, with the
+#                  break — "Dana Whit-" / "field";
+#    joined        as spaced, but the break after a hyphen that ends a line
+#                  goes and the hyphen stays — "4455-" / "887";
+#    solid         no whitespace at all — "C O N F I D E N T I A L", a
+#                  number printed in groups, an address broken at the end
+#                  of a line with no hyphen. Accepted only where the match
+#                  is whole words run together (PageText._solid_ok).
+#
+#  Both sides are folded the same way first: NFKC (a ligature is its
+#  letters, a full-width letter the plain one, a no-break space a space),
+#  the hyphen characters U+2010 and U+2011 become "-", and characters that
+#  take no room — the soft hyphen, zero-width spaces and joiners, direction
+#  marks — are dropped. Case is folded unless the search is case-sensitive.
+
+#: Characters with no width of their own, dropped before matching.
+_INVISIBLE = frozenset(map(chr, (
+    0x00AD, 0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF,                    # soft hyphen, zero width
+    0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,            # direction marks
+    0x2066, 0x2067, 0x2068, 0x2069)))
+_SOFT_HYPHEN = chr(0x00AD)
+_FOLD_TABLE = {0x2010: "-", 0x2011: "-", **{ord(c): None for c in _INVISIBLE}}
+
+#: PageText views.
+_SPACED, _DEHYPHENATED, _JOINED, _SOLID = range(4)
+
+#: The straight apostrophe and the curly one (U+2019): see _solid_ok.
+_APOSTROPHES = "'" + chr(0x2019)
+
+#: Text flags for the matcher. What page.get_text() reads by default, less
+#: one: TEXT_MEDIABOX_CLIP, which also drops text a clipping path hides. A
+#: stamp cut off at "APPRO" by its clip still has "APPROVED" in the content
+#: stream, where any other extractor reads it — and search_for, as redact_pdf
+#: always called it, reads it too. Ligatures are kept whole (one character,
+#: one box) and folded here.
+_MATCH_FLAGS = (fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE
+                | getattr(fitz, "TEXT_CID_FOR_UNKNOWN_UNICODE", 0))    # not in old PyMuPDF
+
+
+#: What the matcher needs of one character, worked out once per character
+#: and not once per occurrence: (is whitespace, joins a word together). And
+#: the folded form of each character or accented letter, case-sensitively
+#: (True) and not. A page is some thousands of characters from an alphabet
+#: of a hundred.
+_CHAR_KINDS: dict = {}
+_FOLDS: dict = {False: {}, True: {}}
+
+
+def _fold_text(text: str, case_sensitive: bool) -> str:
+    """*text* as the matcher compares it (see the note above)."""
+    text = unicodedata.normalize("NFKC", text).translate(_FOLD_TABLE)
+    if not case_sensitive:
+        text = unicodedata.normalize("NFKC", text.casefold())
+    return text
+
+
+def _unspaced_script(ch: str) -> bool:
+    """True for a character of a script written without spaces between
+    words — Chinese, Japanese, Thai, Lao, Khmer, Burmese, Tibetan. A hit
+    there is not widened to "the whole word": the nearest spaces are the
+    ends of the sentence."""
+    o = ord(ch)
+    return (0x2E80 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF or 0xFF66 <= o <= 0xFF9F
+            or 0x20000 <= o <= 0x3FFFF or 0x0E00 <= o <= 0x0FFF
+            or 0x1000 <= o <= 0x109F or 0x1780 <= o <= 0x17FF)
+
+
+class PageText:
+    """The characters of one page with their boxes, and the views of them a
+    term is searched in. Built once per page; any number of terms can then
+    be looked for.
+
+    ``spans(term)`` gives the hits as (first, last) character positions;
+    ``boxes(spans)`` turns hits into rectangles, each hit widened to the
+    whole words it touches and cut into one rectangle per line;
+    ``find(term)`` is the verifier's question. ``placed(quad, term)`` puts
+    a hit found some other way (search_for) on the same characters.
+    """
+
+    def __init__(self, page, case_sensitive: bool = False):
+        self._case = case_sensitive
+        self._chars: list[str] = []
+        self._boxes: list[tuple] = []
+        self._line: list[int] = []          # which line each character is on
+        self._space: list[bool] = []
+        self._joins: list[bool] = []        # part of a word that runs to its neighbours
+        self._lines: list[tuple] = []       # (first, end, bbox, runs across) of each line
+        #: (kind, text, first character, last character). Kinds: "c" a
+        #: character or a base with its accents, folded; "s" whitespace; "h"
+        #: a soft hyphen; "b" a line break — its text says how the line
+        #: ended: "hard" on a hyphen, "soft" on a soft hyphen, or "".
+        self._toks: list[tuple] = []
+        self._views: dict = {}
+        self._cuts: list[tuple] = []        # see _spaced
+        self._broken = False                # some line ends on a hyphen
+        chars, boxes, line_of = self._chars, self._boxes, self._line
+        space, joins, kinds = self._space, self._joins, _CHAR_KINDS
+        raw = page.get_text("rawdict", flags=_MATCH_FLAGS)
+        for block in raw.get("blocks", ()):
+            if block.get("type", 0) != 0:
+                continue
+            for line in block.get("lines", ()):
+                first, number = len(chars), len(self._lines)
+                for span in line.get("spans", ()):
+                    for ch in span.get("chars", ()):
+                        c = ch.get("c")
+                        if not c:
+                            continue
+                        kind = kinds.get(c)
+                        if kind is None:
+                            white = unicodedata.normalize("NFKC", c).isspace()
+                            kind = kinds[c] = (white, not white and not _unspaced_script(c))
+                        chars.append(c)
+                        boxes.append(ch.get("bbox") or (0, 0, 0, 0))
+                        line_of.append(number)
+                        space.append(kind[0])
+                        joins.append(kind[1])
+                if len(chars) > first:
+                    across = line.get("dir") or (1.0, 0.0)
+                    self._add_line(first, len(chars), abs(across[1]) < 1e-3)
+
+    def _add_line(self, first: int, end: int, across: bool = True) -> None:
+        boxes = [b for b in self._boxes[first:end] if b[2] > b[0] and b[3] > b[1]]
+        bbox = ((min(b[0] for b in boxes), min(b[1] for b in boxes),
+                 max(b[2] for b in boxes), max(b[3] for b in boxes)) if boxes else None)
+        self._lines.append((first, end, bbox, across))
+        chars, folds, combining = self._chars, _FOLDS[self._case], unicodedata.combining
+        if len(folds) > 100000:             # a long-lived process, many documents
+            folds.clear()
+        toks, start, i = self._toks, len(self._toks), first
+        while i < end:
+            c = chars[i]
+            if c == _SOFT_HYPHEN:
+                toks.append(("h", "", i, i))
+                i += 1
+                continue
+            j = i + 1
+            while j < end and combining(chars[j]):
+                j += 1
+            if j > i + 1:
+                c = "".join(chars[i:j])
+            folded = folds.get(c)
+            if folded is None:
+                folded = _fold_text(c, self._case)
+                # " " for whitespace, "" for what folds away to nothing.
+                folded = folds[c] = " " if folded.isspace() else "".join(folded.split())
+            if folded == " ":
+                toks.append(("s", "", i, j - 1))
+            elif folded:
+                toks.append(("c", folded, i, j - 1))
+            i = j
+        # How the line ends decides what its break means in two of the views.
+        ending, k = "", len(toks) - 1
+        while k >= start and toks[k][0] == "s":
+            k -= 1
+        if k >= start and toks[k][0] == "h":
+            ending = "soft"
+        elif (k > start and toks[k][:2] == ("c", "-") and toks[k - 1][0] == "c"
+              and toks[k - 1][1][-1].isalnum()):
+            ending = "hard"
+        self._broken = self._broken or bool(ending)
+        toks.append(("b", ending, -1, -1))
+
+    # -- views ---------------------------------------------------------
+
+    def _spaced(self) -> tuple[str, list]:
+        """The spaced view, built from the tokens; the other three are cut
+        out of it. Notes in ``_cuts``, for each line that ends on a hyphen
+        and runs straight on into the next: where that hyphen is in the
+        text (-1 for a soft hyphen, which is not in it) and where the space
+        that stands for the line break is."""
+        text: list[str] = []
+        owner: list[int] = []
+        pending, hyphen = False, None       # hyphen: of a broken line, until the next character
+        for k, (kind, value, _a0, _a1) in enumerate(self._toks):
+            if kind == "c":
+                if pending and text:
+                    if hyphen is not None:
+                        self._cuts.append((hyphen, len(text)))
+                    text.append(" ")
+                    owner.append(-1)
+                pending, hyphen = False, None
+                if len(value) == 1:
+                    text.append(value)
+                    owner.append(k)
+                else:
+                    text.extend(value)
+                    owner.extend([k] * len(value))
+            elif kind == "s":
+                pending = True      # and a hyphen stays noted: the next line may be indented
+            elif kind == "b":
+                pending = True
+                if value and text:
+                    hyphen = len(text) - 1 if value == "hard" else -1
+        return "".join(text), owner
+
+    def _view(self, mode: int) -> tuple[str, list]:
+        """(text, owner): the page's text in view *mode*, and for each of its
+        characters the token it came from (-1 for a space)."""
+        if mode not in self._views:
+            if _SPACED not in self._views:
+                self._views[_SPACED] = self._spaced()
+            text, owner = self._views[_SPACED]
+            if mode == _SOLID:
+                self._views[mode] = (text.replace(" ", ""), [k for k in owner if k >= 0])
+            elif mode != _SPACED:
+                # Without the break's space; dehyphenated, without the hyphen too.
+                gone = sorted(i for hyphen, gap in self._cuts
+                              for i in ((hyphen, gap) if mode == _DEHYPHENATED else (gap,))
+                              if i >= 0)
+                parts, owners, prev = [], [], 0
+                for i in gone:
+                    parts.append(text[prev:i])
+                    owners.extend(owner[prev:i])
+                    prev = i + 1
+                parts.append(text[prev:])
+                owners.extend(owner[prev:])
+                self._views[mode] = ("".join(parts), owners)
+        return self._views[mode]
+
+    def _apart(self, k0: int, k1: int) -> bool:
+        """True if whitespace or a line break lies between tokens *k0* <
+        *k1*: they belong to different words."""
+        return any(self._toks[k][0] in "sb" for k in range(k0 + 1, k1))
+
+    def _solid_ok(self, at: int, end: int) -> bool:
+        """Is the match text[at:end] of the solid view to be believed?
+
+        With every space gone, any neighbours read as one word, so the view
+        is kept to whole words run together: the match has to start at the
+        first letter or digit of a word and end at the last one of a word,
+        a word being what stands between two spaces. Punctuation at the
+        edge of the word may be left outside the match ("(4111 1111)."),
+        letters and digits may not: the term "00000" is not in "1.0000
+        0.2000", though the digits are there in a row once the space is
+        gone. (Taking a full stop for the edge of a word found exactly that
+        in a real file's table of numbers, and nothing true.) One thing may
+        follow the last letter: an apostrophe and what it brings, so that
+        "W H I T F I E L D's file" is found — its last word is "D's".
+        """
+        text, owner = self._view(_SOLID)
+        i = at
+        while i > 0 and (owner[i - 1] == owner[i] or not self._apart(owner[i - 1], owner[i])):
+            i -= 1
+            if text[i].isalnum():
+                return False
+        i = end - 1
+        while i + 1 < len(text) and (owner[i + 1] == owner[i]
+                                     or not self._apart(owner[i], owner[i + 1])):
+            i += 1
+            if i == end and text[i] in _APOSTROPHES:
+                break
+            if text[i].isalnum():
+                return False
+        return True
+
+    # -- matching ------------------------------------------------------
+
+    def spans(self, term: str) -> list[tuple[int, int]]:
+        """Every hit for *term*, as (first, last) character positions, in
+        reading order. A hit found in more than one view is one hit."""
+        folded = _fold_text(term, self._case)
+        spaced, solid = " ".join(folded.split()), "".join(folded.split())
+        if not solid:
+            return []
+        found: set = set()
+        modes = (_SPACED, _DEHYPHENATED, _JOINED) if self._broken else (_SPACED,)
+        for mode in modes + (_SOLID,):
+            text, owner = self._view(mode)
+            needle = solid if mode == _SOLID else spaced
+            at = text.find(needle)
+            while at >= 0:
+                end = at + len(needle)
+                if mode != _SOLID or self._solid_ok(at, end):
+                    found.add((self._toks[owner[at]][2], self._toks[owner[end - 1]][3]))
+                at = text.find(needle, at + 1)
+        return sorted(found)
+
+    def find(self, term: str) -> bool:
+        """True if *term* is on the page, in any view."""
+        return bool(self.spans(term))
+
+    def text_of(self, span: tuple[int, int]) -> str:
+        """The page's own characters from *span*'s first to its last."""
+        return "".join(self._chars[span[0]:span[1] + 1])
+
+    def spans_under(self, quad) -> list[tuple[int, int]]:
+        """The characters whose centre is inside *quad* — a hit from
+        search_for(quads=True) — as runs: one span for each stretch of a
+        line that is inside without a break. The quad and not its bounding
+        rectangle: the rectangle round a hit in slanted text takes in
+        whatever else is printed near it."""
+        corners = [(p.x, p.y) for p in (quad.ul, quad.ur, quad.lr, quad.ll)]
+        x0, x1 = min(c[0] for c in corners), max(c[0] for c in corners)
+        y0, y1 = min(c[1] for c in corners), max(c[1] for c in corners)
+
+        def inside(i: int) -> bool:
+            if self._space[i]:
+                return False
+            b = self._boxes[i]
+            px, py = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            if not (x0 <= px <= x1 and y0 <= py <= y1):
+                return False
+            sides = [(bx - ax) * (py - ay) - (by - ay) * (px - ax)
+                     for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1],
+                                                   strict=True)]
+            return all(s >= -1e-6 for s in sides) or all(s <= 1e-6 for s in sides)
+
+        found = []
+        for first, end, bbox, _across in self._lines:
+            if bbox is None or bbox[2] < x0 or bbox[0] > x1 or bbox[3] < y0 or bbox[1] > y1:
+                continue
+            start = last = None
+            for i in range(first, end):
+                if inside(i):
+                    start, last = (i if start is None else start), i
+                elif start is not None and not self._space[i]:
+                    found.append((start, last))
+                    start = None
+            if start is not None:
+                found.append((start, last))
+        return found
+
+    def placed(self, quad, term: str) -> list[tuple[int, int]]:
+        """Where a search_for hit for *term* lies on the page's characters:
+        the spans under *quad* that read as the term, or [] if none does.
+
+        A quad takes in whatever else is printed over the hit, and its edge
+        can catch a neighbour's last letter, so the characters are asked
+        what they say. A run that holds the whole term is cut down to the
+        term. Failing that, one hit can be a piece of the term — search_for
+        cuts a hit at each line, and into single glyphs in right-to-left
+        text — and the longest run that is a piece of it is taken, and only
+        that one.
+        """
+        key = "".join(_fold_text(term, self._case).split())
+        whole, pieces = [], []
+        for span in self.spans_under(quad):
+            text, owner = [], []
+            for i in range(span[0], span[1] + 1):
+                if not self._space[i]:
+                    folded = "".join(_fold_text(self._chars[i], self._case).split())
+                    text.extend(folded)
+                    owner.extend([i] * len(folded))
+            text = "".join(text)
+            at = text.find(key) if key else -1
+            if at >= 0:
+                whole.append((owner[at], owner[at + len(key) - 1]))
+            elif any(t and t in key for t in (text, text.rstrip("-"))):
+                pieces.append(span)
+        return whole or sorted(pieces, key=lambda s: s[0] - s[1])[:1]
+
+    # -- boxes ---------------------------------------------------------
+
+    def widened(self, span: tuple[int, int]) -> tuple[int, int]:
+        """*span* grown to the whole words it touches: out to the nearest
+        whitespace on the same line, on each side. Not through a script
+        written without spaces (_unspaced_script)."""
+        a0, a1 = span
+        line, joins = self._line, self._joins
+        while a0 > 0 and line[a0 - 1] == line[a0] and joins[a0 - 1] and joins[a0]:
+            a0 -= 1
+        last = len(line) - 1
+        while a1 < last and line[a1 + 1] == line[a1] and joins[a1 + 1] and joins[a1]:
+            a1 += 1
+        return a0, a1
+
+    def _trimmed(self, rect: tuple, line_no: int, a0: int, a1: int) -> tuple:
+        """*rect* — one line of the hit *a0*..*a1* — cut back at the top and
+        at the bottom to where characters that are not part of the hit stop
+        reaching into it; never past the middle half of its height, which
+        every character of the hit crosses.
+
+        A character goes if its box overlaps a redaction rectangle at all,
+        and a character's box is as tall as its line: with lines set close,
+        the full box of a word takes the words above and below it. Text is
+        removed with this box; the fill and the pixels under it are the full
+        box's (pdf_ops._redact_term_boxes). Only for a line that runs across
+        the page: on any other, top and bottom are not where the neighbours
+        are, and the rectangle is returned as it is.
+        """
+        x0, y0, x1, y1 = rect
+        if not self._lines[line_no][3]:
+            return rect
+        middle, quarter = (y0 + y1) / 2, (y1 - y0) / 4
+        top, bottom = y0, y1
+        for number, (first, end, bbox, _across) in enumerate(self._lines):
+            if (number == line_no or bbox is None or bbox[2] <= x0 or bbox[0] >= x1
+                    or bbox[3] <= y0 or bbox[1] >= y1):
+                continue
+            for i in range(first, end):
+                if a0 <= i <= a1 or self._space[i]:
+                    continue
+                b = self._boxes[i]
+                if b[2] <= x0 or b[0] >= x1 or b[3] <= top or b[1] >= bottom or b[3] <= b[1]:
+                    continue
+                centre = (b[1] + b[3]) / 2
+                if centre < middle:
+                    top = max(top, min(b[3] + 0.05, middle - quarter))
+                elif centre > middle:
+                    bottom = min(bottom, max(b[1] - 0.05, middle + quarter))
+        return (x0, top, x1, bottom)
+
+    def boxes(self, spans, trimmed: bool = False) -> list:
+        """One rectangle per line of each hit in *spans*, each hit widened
+        to whole words first. Hits that come to the same rectangle — two
+        views of one occurrence, a search_for hit and the matcher's own —
+        are one rectangle. With *trimmed*, (rectangle, trimmed rectangle)
+        pairs (_trimmed)."""
+        rects, seen = [], set()
+        for span in sorted(set(spans)):
+            a0, a1 = self.widened(span)
+            i = a0
+            while i <= a1:
+                j = i
+                while j < a1 and self._line[j + 1] == self._line[i]:
+                    j += 1
+                part = [self._boxes[n] for n in range(i, j + 1) if not self._space[n]
+                        and self._boxes[n][2] > self._boxes[n][0]
+                        and self._boxes[n][3] > self._boxes[n][1]]
+                if part:
+                    rect = (min(b[0] for b in part), min(b[1] for b in part),
+                            max(b[2] for b in part), max(b[3] for b in part))
+                    key = tuple(round(v, 2) for v in rect)
+                    if key not in seen:
+                        seen.add(key)
+                        rects.append((fitz.Rect(rect), fitz.Rect(self._trimmed(
+                            rect, self._line[i], a0, a1))) if trimmed else fitz.Rect(rect))
+                i = j + 1
+        return rects
+
+
+def term_boxes(page, terms, case_sensitive: bool = False) -> list:
+    """The rectangles to redact on *page* for *terms* (term_hits, without
+    the trimmed boxes)."""
+    return [whole for whole, _trimmed in term_hits(page, terms, case_sensitive)]
+
+
+def term_hits(page, terms, case_sensitive: bool = False) -> list:
+    """The rectangles to redact on *page* for *terms*, each with the
+    trimmed rectangle to remove its text by (PageText._trimmed): the matcher's hits
+    and search_for's, together, each widened to the whole words it touches
+    (PageText.boxes).
+
+    search_for is kept beside the matcher because it is MuPDF's own reading
+    of the page and may see what the views do not. Each of its hits is put
+    back on the page's characters — those under the hit's quad that read as
+    the term or a piece of it (PageText.placed) — so that a hit that stops
+    short of the word (PyMuPDF 2.1 on a hyphenated word) is widened like
+    any other, and so that an occurrence found both ways is one rectangle.
+    A hit whose characters the matcher has already found adds nothing and
+    is dropped. One that cannot be placed on characters is passed on as the
+    rectangle search_for gave, unless every character under it is already
+    in a rectangle.
+
+    search_for has no case-sensitive mode. In a case-sensitive search the
+    characters are compared in their own case, so a hit in another case is
+    not placed, and is dropped; one with no character under it at all is
+    kept only if the text in its rectangle holds the term exactly. (That
+    last test alone, on every hit, is what redact_pdf used to do. A hit's
+    rectangle is as tall as the line and reaches into the next one, so the
+    term in the right case on the line below made a hit in the wrong case
+    pass.)
+    """
+    terms = [t for t in (terms or []) if t and t.strip()]
+    if not terms:
+        return []
+    text = PageText(page, case_sensitive)
+    spans: list = []
+    found: list = []        # search_for's hits, placed on characters
+    loose: list = []        # ... and the ones that could not be
+    for term in terms:
+        spans.extend(text.spans(term))
+        for quad in page.search_for(term, flags=fitz.TEXT_DEHYPHENATE, quads=True):
+            placed = text.placed(quad, term)
+            if placed:
+                found.extend(placed)
+            elif not case_sensitive:
+                loose.append(quad)
+            elif not text.spans_under(quad) and term in page.get_textbox(quad.rect):
+                # Nothing under it to ask. (With characters under it that
+                # do not read as the term, it is the term in another case.)
+                loose.append(quad)
+    covered: set = set()         # every character some rectangle will take
+
+    def cover(span) -> None:
+        a0, a1 = text.widened(span)
+        covered.update(i for i in range(a0, a1 + 1) if not text._space[i])
+
+    for span in spans:
+        cover(span)
+    for span in found:
+        if not all(i in covered or text._space[i] for i in range(span[0], span[1] + 1)):
+            spans.append(span)
+            cover(span)
+    rects = text.boxes(spans, trimmed=True)
+    seen = {tuple(round(v, 2) for v in r) for r, _trimmed in rects}
+    for quad in loose:
+        under = [i for a0, a1 in text.spans_under(quad) for i in range(a0, a1 + 1)
+                 if not text._space[i]]
+        key = tuple(round(v, 2) for v in quad.rect)
+        if key in seen or (under and all(i in covered for i in under)):
+            continue
+        seen.add(key)
+        rects.append((fitz.Rect(quad.rect), fitz.Rect(quad.rect)))    # nothing known to trim by
+    return rects
+
+
+def _term_in_page_text(page, text: str, term: str, case_sensitive: bool,
+                       chars: Optional[PageText] = None) -> tuple[bool, Optional[str]]:
     """(found, error) — is *term* extractable from *page*?
 
-    Three views of the extracted text are searched: as-is, whitespace-
-    normalized, and dehyphenated-then-normalized — a term wrapped across a
-    line break appears with '\\n' (or '-\\n') where the caller's term has a
-    space (or nothing), and without normalization an exact-case cross-line
-    occurrence would be invisible to case_sensitive matching (the per-rect
-    search_for confirm below sees only one line's fragment per hit rect, so
-    it can never confirm a multi-line match by itself).
+    The matcher is asked first (*chars*, the page's PageText): the same
+    views redact_pdf boxed by, so what it would have boxed and did not
+    remove is found here.
+
+    Behind it, the older checks. Three views of the extracted text are
+    searched: as-is, whitespace-normalized, and dehyphenated-then-
+    normalized — a term wrapped across a line break appears with '\\n' (or
+    '-\\n') where the caller's term has a space (or nothing), and without
+    normalization an exact-case cross-line occurrence would be invisible to
+    case_sensitive matching (the per-rect search_for confirm below sees only
+    one line's fragment per hit rect, so it can never confirm a multi-line
+    match by itself).
 
     search_for() (with TEXT_DEHYPHENATE, matching redact_pdf's own search)
     additionally catches kerned text the plain views miss. It is always
@@ -361,6 +1016,8 @@ def _term_in_page_text(page, text: str, term: str,
     *error* is set when search_for itself raised, so the caller records a
     failed-verification line instead of passing vacuously (fail-closed).
     """
+    if chars is not None and chars.find(term):
+        return True, None
     norm_term = " ".join(term.split())
     views = (text,
              " ".join(text.split()),
@@ -509,6 +1166,14 @@ def _term_surface_checks(doc, output_path: str, terms: list[str],
             text = ""
             page_text_ev.append(f"page text on page {pno} could not be read "
                                 f"for verification: {exc}")
+        try:
+            chars = PageText(page, case_sensitive)
+        except Exception as exc:
+            # Not a pass: the matcher did not look. Page-attributed, like
+            # the line above, so the page can be offered for flattening.
+            chars = None
+            page_text_ev.append(f"page text on page {pno} could not be read character "
+                                f"by character for verification ({type(exc).__name__})")
         blobs = page_content_blobs(doc, page)
         good = [bytes(b) for b in blobs if isinstance(b, (bytes, bytearray))]
         if len(good) != len(blobs):
@@ -538,7 +1203,7 @@ def _term_surface_checks(doc, output_path: str, terms: list[str],
                              f"for verification: {exc}")
 
         for term in terms:
-            found, err = _term_in_page_text(page, text, term, case_sensitive)
+            found, err = _term_in_page_text(page, text, term, case_sensitive, chars)
             if err:
                 page_text_ev.append(f"page text on page {pno} could not be "
                                     f"fully verified for term '{term}': {err}")
@@ -702,6 +1367,342 @@ def _rect_region_check(doc, rects: list[dict]) -> VerificationCheck:
         passed=not ev, evidence=ev)
 
 
+#: Keys that lead out of the structure tree: to a page, to an annotation or
+#: an XObject, to a content stream.
+STRUCTURE_WAYS_OUT = ("/Pg", "/Obj", "/Stm", "/StmOwn")
+#: /Type of the dictionaries that make up the structure tree.
+_STRUCTURE_TYPES = ("/StructTreeRoot", "/StructElem", "/MCR", "/OBJR")
+
+
+def structure_stream(kid):
+    """The stream a kid of a structure element names — the content stream
+    of a marked-content reference (/Stm), the XObject of an object
+    reference (/Obj) — or None."""
+    if isinstance(kid, pikepdf.Dictionary):
+        for key in ("/Stm", "/Obj"):
+            target = kid.get(key)
+            if isinstance(target, pikepdf.Stream):
+                return target
+    return None
+
+
+def structure_kids(elem) -> list:
+    """The kids of structure element *elem*, as a list."""
+    kids = elem.get("/K")
+    return list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+
+
+def structure_stream_refs(pdf) -> tuple[list, set, set]:
+    """(holders, named, alive) for the structure tree of *pdf*: the
+    dictionaries of the tree that have a kid naming a stream, the (num,
+    gen) of every stream so named, and those of them something outside the
+    tree leads to as well.
+
+    A stream that is named and not alive is in the file for the structure
+    tree alone. After a redaction that is the unredacted original of a
+    form, an image or a page's content, which the page has a redacted copy
+    of: redact_pdf removes the reference (pdf_ops._drop_stale_structure_refs)
+    and verify_redaction checks that none is left. "Outside the tree" is
+    tested by walking the file from the trailer without entering the tree,
+    not through the catalog and not through a bookmark's /SE.
+    """
+    holders: list = []
+    named: set = set()
+    try:
+        root = pdf.Root.get("/StructTreeRoot")
+    except Exception:
+        root = None
+    if not isinstance(root, pikepdf.Dictionary):
+        return holders, named, set()
+
+    seen, stack = set(), [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            if not isinstance(cur, (pikepdf.Dictionary, pikepdf.Array)):
+                continue
+            if cur.is_indirect:
+                ident = tuple(cur.objgen)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            if isinstance(cur, pikepdf.Array):
+                stack.extend(cur)
+                continue
+            if _type_name(cur) in ("/Page", "/Pages", "/Catalog"):
+                continue
+            if "/K" in cur:
+                streams = [s for s in map(structure_stream, structure_kids(cur)) if s is not None]
+                if streams:
+                    holders.append(cur)
+                    named.update(tuple(s.objgen) for s in streams)
+            stack.extend(cur[k] for k in cur.keys() if k not in STRUCTURE_WAYS_OUT)
+        except Exception:
+            continue
+    alive: set = set()
+    if not named:
+        return holders, named, alive
+
+    containers = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
+    seen, stack = set(), [pdf.trailer]
+    while stack and len(alive) < len(named):
+        cur = stack.pop()
+        try:
+            if not isinstance(cur, containers):
+                continue
+            if cur.is_indirect:
+                ident = tuple(cur.objgen)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                if ident in named:
+                    alive.add(ident)
+            if isinstance(cur, pikepdf.Array):
+                stack.extend(cur)
+                continue
+            if _type_name(cur) in _STRUCTURE_TYPES:
+                continue
+            stack.extend(cur[k] for k in cur.keys() if k not in ("/StructTreeRoot", "/SE"))
+        except Exception:
+            continue
+    return holders, named, alive
+
+
+def _whole_file_checks(output_path: str, password: Optional[str] = None) -> list[VerificationCheck]:
+    """Two checks every redaction gets, by term or by box, read with pikepdf
+    from the output as a whole (#119, R3).
+
+    ``redaction.structure_streams``: no stream is in the file for the
+    structure tree alone (structure_stream_refs). ``redaction.thumbnails``:
+    no page carries a /Thumb, a small picture of the page as it was. Both
+    are document-level: making a page a picture does not mend either. An
+    output that cannot be read fails both, marked unevaluated.
+    """
+    kept: list[str] = []
+    thumbs: list[str] = []
+    problem = None
+    kwargs = {"password": password} if password else {}
+    try:
+        with pikepdf.open(output_path, **kwargs) as pdf:
+            _holders, named, alive = structure_stream_refs(pdf)
+            if named - alive:
+                n = len(named - alive)
+                kept.append(f"{n} stream{'' if n == 1 else 's'} in the file can be reached only "
+                            f"through the structure tree: the original of content a page now "
+                            f"has a redacted copy of (document-level)")
+            in_tree = set()
+            for number, page in enumerate(pdf.pages, 1):
+                in_tree.add(tuple(page.obj.objgen))
+                if "/Thumb" in page.obj:
+                    thumbs.append(f"page {number} still carries a thumbnail of the page as "
+                                  f"it was (document-level)")
+            for obj in pdf.objects:
+                try:
+                    if (isinstance(obj, pikepdf.Dictionary) and "/Thumb" in obj
+                            and _type_name(obj) == "/Page" and tuple(obj.objgen) not in in_tree):
+                        thumbs.append("a page outside the page tree still carries a thumbnail "
+                                      "of the page as it was (document-level)")
+                except Exception:
+                    continue
+    except Exception as exc:
+        problem = (f"the output could not be read for this check "
+                   f"({type(exc).__name__}) (document-level)")
+    return [
+        VerificationCheck(
+            id="redaction.structure_streams",
+            description="No stream is kept in the file by the structure tree alone",
+            passed=not (kept or problem), evidence=kept or ([problem] if problem else []),
+            unevaluated=bool(problem)),
+        VerificationCheck(
+            id="redaction.thumbnails",
+            description="No page carries a thumbnail of itself",
+            passed=not (thumbs or problem),
+            evidence=_dedupe(thumbs) or ([problem] if problem else []),
+            unevaluated=bool(problem)),
+    ]
+
+
+def _valid_rects(doc, rects: list[dict]) -> list[tuple]:
+    """(page index, fitz.Rect) for each entry of *rects* that names a page
+    of *doc* and a real area. The others are _rect_region_check's to fail;
+    the checks that use this have nothing to look under them."""
+    found = []
+    for r in rects:
+        try:
+            pno = int(r["page"])
+            rect = fitz.Rect(float(r["x0"]), float(r["y0"]), float(r["x1"]), float(r["y1"]))
+        except Exception:
+            continue
+        if 0 <= pno < len(doc) and rect.is_valid and not rect.is_empty:
+            found.append((pno, rect))
+    return found
+
+
+def _rect_annotation_check(doc, output_path: str, rects: list[dict],
+                           password: Optional[str] = None) -> VerificationCheck:
+    """No annotation is left lying over a redaction rectangle.
+
+    An annotation is painted above the page, so one that overlaps a box is
+    painted above the box: a stamp, a signature picture, a note's icon.
+    redact_pdf takes them off the page (and a widget's field is emptied as
+    before); this is what would notice if it did not. Every kind of
+    annotation counts but a popup, which draws nothing of its own on the
+    page and goes with the note it belongs to. One whose rectangle cannot
+    be read fails the check: it could be anywhere.
+
+    The page's /Annots is read with pikepdf, entry by entry, because that
+    reads an annotation written into the array itself like any other;
+    PyMuPDF's lists pass over one that has no object number. Its /Rect is
+    put into the coordinates redaction rectangles are given in (PyMuPDF's,
+    on the page before any rotation) with the page's own matrix.
+    """
+    ev: list[str] = []
+    by_page: dict[int, list] = {}
+    for pno, rect in _valid_rects(doc, rects):
+        by_page.setdefault(pno, []).append(rect)
+    if not by_page:
+        return VerificationCheck(
+            id="redaction.rect_annotations",
+            description="No annotation lies over a redaction rectangle", passed=True)
+    kwargs = {"password": password} if password else {}
+    try:
+        with pikepdf.open(output_path, **kwargs) as pdf:
+            for pno, boxes in sorted(by_page.items()):
+                try:
+                    to_fitz = doc[pno].transformation_matrix
+                    annots = pdf.pages[pno].obj.get("/Annots")
+                    entries = list(annots) if isinstance(annots, pikepdf.Array) else []
+                except Exception as exc:
+                    ev.append(f"annotations on page {pno + 1} could not be read for "
+                              f"verification ({type(exc).__name__})")
+                    continue
+                for annot in entries:
+                    subtype = "unknown"
+                    try:
+                        if not isinstance(annot, pikepdf.Dictionary):
+                            continue
+                        subtype = str(annot.get("/Subtype", "")).lstrip("/") or "unknown"
+                        if subtype == "Popup":
+                            continue
+                        rect = fitz.Rect(*(float(v) for v in annot["/Rect"]))
+                        rect.normalize()
+                        rect = rect * to_fitz
+                        rect.normalize()
+                    except Exception:
+                        ev.append(f"the rectangle of a {subtype} annotation on page {pno + 1} "
+                                  f"could not be read for verification")
+                        continue
+                    if any(rect.intersects(box) for box in boxes):
+                        ev.append(f"a {subtype} annotation still lies over a redaction "
+                                  f"rectangle on page {pno + 1}")
+    except Exception as exc:
+        ev.append(f"annotations on page {min(by_page) + 1} could not be read for "
+                  f"verification ({type(exc).__name__})")
+    return VerificationCheck(
+        id="redaction.rect_annotations",
+        description="No annotation lies over a redaction rectangle",
+        passed=not ev, evidence=_dedupe(ev))
+
+
+def path_lines(drawing: dict, steps: int = 24) -> list[list[tuple]]:
+    """The path of one PyMuPDF drawing (an entry of page.get_drawings()) as
+    lists of points, one list per line, rectangle, quad or curve of it. A
+    curve is walked in *steps* straight pieces: where it runs, not where
+    its control points are."""
+    lines = []
+    for item in drawing.get("items", ()):
+        try:
+            kind = item[0]
+            if kind == "l":
+                lines.append([(item[1].x, item[1].y), (item[2].x, item[2].y)])
+            elif kind == "re":
+                r = item[1]
+                lines.append([(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1), (r.x0, r.y0)])
+            elif kind == "qu":
+                q = item[1]
+                lines.append([(p.x, p.y) for p in (q.ul, q.ur, q.lr, q.ll, q.ul)])
+            elif kind == "c":
+                p = item[1:5]
+                points = []
+                for n in range(steps + 1):
+                    s = n / steps
+                    u = 1 - s
+                    w = (u ** 3, 3 * u * u * s, 3 * u * s * s, s ** 3)
+                    points.append((sum(k * q.x for k, q in zip(w, p, strict=True)),
+                                   sum(k * q.y for k, q in zip(w, p, strict=True))))
+                lines.append(points)
+        except Exception:
+            continue
+    return lines
+
+
+def _passes_inside(p: tuple, q: tuple, box) -> bool:
+    """Does the straight line from *p* to *q* pass through the inside of
+    *box*, a quarter of a point in from its edges? (A rule along the edge of
+    a box, and the edges of the box's own fill, do not.)"""
+    x0, y0, x1, y1 = box.x0 + 0.25, box.y0 + 0.25, box.x1 - 0.25, box.y1 - 0.25
+    if x0 >= x1 or y0 >= y1:
+        return False
+    enter, leave = 0.0, 1.0
+    for start, delta, low, high in ((p[0], q[0] - p[0], x0, x1), (p[1], q[1] - p[1], y0, y1)):
+        if abs(delta) < 1e-12:
+            if not low < start < high:
+                return False
+            continue
+        a, b = (low - start) / delta, (high - start) / delta
+        enter, leave = max(enter, min(a, b)), min(leave, max(a, b))
+    return enter < leave or (p == q and x0 < p[0] < x1 and y0 < p[1] < y1)
+
+
+def is_plain_black(drawing: dict) -> bool:
+    """A drawing that is nothing but rectangles filled black — what the
+    fill of a redaction box is. Under a black box it shows nothing."""
+    fill = drawing.get("fill")
+    return (bool(drawing.get("items")) and fill is not None and not any(fill)
+            and all(item[0] == "re" for item in drawing["items"]))
+
+
+def has_edge_inside(drawing: dict, box) -> bool:
+    """True if any piece of *drawing*'s path passes through the inside of
+    *box* (a fitz.Rect), or lies inside it."""
+    return any(_passes_inside(a, b, box)
+               for line in path_lines(drawing) for a, b in zip(line, line[1:], strict=False))
+
+
+def _rect_line_art_check(doc, rects: list[dict]) -> VerificationCheck:
+    """No drawing has an edge inside a redaction rectangle.
+
+    A stroked path under a box drawn by hand stays in the page's content,
+    under the fill: the signature drawn as a curve, the line of a chart.
+    PyMuPDF removes a drawing that lies wholly inside the box, as it
+    measures that (by a curve's control points, not by where it runs), and
+    redact_pdf lets it remove whatever touches the box only when nothing
+    else would go with it. What is left with an edge inside a box fails
+    this check. It is page content, so the page can be flattened, and the
+    box is then black on the picture. A solid black rectangle is passed
+    over: every box's own fill is one, and it shows nothing.
+    """
+    ev: list[str] = []
+    by_page: dict[int, list] = {}
+    for pno, rect in _valid_rects(doc, rects):
+        by_page.setdefault(pno, []).append(rect)
+    for pno, boxes in sorted(by_page.items()):
+        try:
+            drawings = doc[pno].get_drawings()
+        except Exception as exc:
+            ev.append(f"the drawings on page {pno + 1} could not be read for "
+                      f"verification ({type(exc).__name__})")
+            continue
+        if any(has_edge_inside(d, box) for d in drawings if not is_plain_black(d)
+               for box in boxes):
+            ev.append(f"a drawing still has an edge inside a redaction rectangle "
+                      f"on page {pno + 1}")
+    return VerificationCheck(
+        id="redaction.rect_line_art",
+        description="No drawing has an edge inside a redaction rectangle",
+        passed=not ev, evidence=ev)
+
+
 def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                      rects: Optional[list[dict]] = None,
                      case_sensitive: bool = False,
@@ -765,10 +1766,15 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
         if terms:
             report.checks.extend(_term_surface_checks(
                 doc, output_path, terms, case_sensitive, password))
+            report.checks.append(_term_sweep_check(
+                output_path, terms, case_sensitive, password))
         if rects:
             report.checks.append(_rect_region_check(doc, rects))
+            report.checks.append(_rect_annotation_check(doc, output_path, rects, password))
+            report.checks.append(_rect_line_art_check(doc, rects))
     finally:
         doc.close()
+    report.checks.extend(_whole_file_checks(output_path, password))
     if source_ids is not None:
         report.checks.append(_file_id_check(
             "redaction.file_id", output_path, source_ids, source_sha256,
@@ -891,7 +1897,9 @@ def walk_objects(pdf, status: WalkStatus, *, strings: bool = False,
                 children = [(f"[{i}]", v) for i, v in enumerate(obj)]
             else:
                 yield path, obj
-                children = [(str(k), obj[k]) for k in obj.keys()]
+                # In key order: keys() is a set, and an object reachable two
+                # ways must be reported under the same path on every run.
+                children = [(str(k), obj[k]) for k in sorted(obj.keys())]
             for seg, child in reversed(children):
                 if isinstance(child, containers):
                     stack.append((seg, path, child))
@@ -936,6 +1944,12 @@ def plain_location(segments: list[str], page: Optional[int] = None) -> str:
         where = "in the document's named scripts"
     elif names == "/EmbeddedFiles":
         where = "in the document's attachment list"
+    elif names == "/Dests":
+        where = "in the document's named destinations"
+    elif segments[1:3] == ["/Root", "/StructTreeRoot"]:
+        where = "in the document's structure tree"
+    elif segments[1:3] == ["/Root", "/OCProperties"]:
+        where = "in the document's layer list"
     elif "/Outlines" in segments:
         where = "in a bookmark"
     elif "/AcroForm" in segments:
@@ -971,6 +1985,252 @@ def plain_location(segments: list[str], page: Optional[int] = None) -> str:
     if steps:
         parts.append(f"{steps} step{'' if steps == 1 else 's'} down a chain of actions")
     return ", ".join(parts)
+
+
+# ── Whole-file term sweep (redaction, #119) ──────────────────────────
+#
+#  The surface checks look where redaction knows a term can be: page text,
+#  annotations, form values, links, document information, bookmarks. The
+#  term sweep is the second look, as the sanitization sweep is: every
+#  string in the file and the decoded bytes of every stream, wherever it
+#  hangs. A term in a place nobody thought of is still bytes in the file.
+#
+#  What it does not read, and why:
+#    * images — pixels, not text (finding a word in pixels is OCR, #128);
+#    * the internals of fonts and colour profiles. An embedded font program
+#      carries its name, its foundry and a copyright line; a character map
+#      says "Adobe" and "Identity" (in nearly half of real files); a colour
+#      profile says "Copyright" and names its maker. None of that is the
+#      document's text, and searching it would refuse those words in every
+#      file that has such a font;
+#    * names. A font's name, a style name, a layer's intent are PDF names,
+#      not strings.
+#  So a term that is, or is part of, a font's or a profile's own name stays
+#  in the output. That is the known limit of this check.
+
+#: /Type of a font object -> the entries under it that are streams of font
+#: machinery: embedded programs and binary tables, character maps.
+_FONT_STREAM_KEYS = {
+    "/FontDescriptor": ("/FontFile", "/FontFile2", "/FontFile3", "/CIDSet"),
+    "/Font": ("/ToUnicode", "/Encoding", "/CIDToGIDMap"),
+    "/CMap": ("/UseCMap",),
+}
+
+#: ... and the entries that are strings a font carries about itself.
+_FONT_STRING_KEYS = {"/FontDescriptor": ("/FontFamily", "/CharSet")}
+
+
+def _type_name(obj) -> str:
+    kind = obj.get("/Type")
+    return str(kind) if isinstance(kind, pikepdf.Name) else ""
+
+
+def _font_streams(obj) -> list:
+    """The streams that are font machinery because of what *obj* is: a font
+    descriptor's programs, a font's character maps, a character map itself.
+    Judged by the /Type the holder declares, never by a key name alone —
+    a /FontFile entry on anything else is just a stream."""
+    kind = _type_name(obj)
+    found = [obj] if kind == "/CMap" and isinstance(obj, pikepdf.Stream) else []
+    for key in _FONT_STREAM_KEYS.get(kind, ()):
+        value = obj.get(key)
+        if isinstance(value, pikepdf.Stream):
+            found.append(value)
+    return found
+
+
+def _is_font_string(path) -> bool:
+    """True for a string a font carries about itself: a font descriptor's
+    /FontFamily or /CharSet, or the /Registry and /Ordering of a character
+    collection (a dictionary that has both, as strings)."""
+    holder = path[1][2] if path[1] is not None else None
+    if not isinstance(holder, (pikepdf.Dictionary, pikepdf.Stream)):
+        return False
+    key = path[0]
+    if key in _FONT_STRING_KEYS.get(_type_name(holder), ()):
+        return True
+    return (key in ("/Registry", "/Ordering")
+            and isinstance(holder.get("/Registry"), pikepdf.String)
+            and isinstance(holder.get("/Ordering"), pikepdf.String))
+
+
+def _is_image(stream) -> bool:
+    """An image XObject, or a thumbnail (an image that need not say so)."""
+    subtype = stream.get("/Subtype")
+    if isinstance(subtype, pikepdf.Name):
+        return str(subtype) == "/Image"
+    return ("/Width" in stream and "/Height" in stream
+            and ("/BitsPerComponent" in stream or "/ImageMask" in stream))
+
+
+def _owner_id(path) -> Optional[tuple]:
+    """(num, gen) of the nearest indirect dictionary, stream or array at or
+    above *path*: the object a hit belongs to."""
+    containers = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
+    while path is not None:
+        obj = path[2]
+        try:
+            if isinstance(obj, containers) and obj.is_indirect:
+                return tuple(obj.objgen)
+        except Exception:
+            return None
+        path = path[1]
+    return None
+
+
+def _pages_reaching(pdf, wanted: set) -> dict:
+    """{object id: [page numbers]} — the pages each of *wanted* can be
+    reached from.
+
+    This decides whether flattening can remove a hit. Flattening rebuilds
+    the document from its pages, the flattened ones as plain images, so an
+    object survives it only if a page that was kept still leads to it. A
+    hit reachable from pages is therefore fixed by flattening all of them;
+    one no page leads to (the catalog's own entries, the structure tree) is
+    document-level.
+
+    The walk from a page stops at other pages and at the page tree, and
+    takes the resources a page inherits from above it. Only run when there
+    is a hit to place.
+    """
+    containers = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
+    found: dict = {key: [] for key in wanted}
+    for number, page in enumerate(pdf.pages, 1):
+        start = page.obj
+        stack = [start]
+        try:
+            node, hops = start, 0
+            while "/Resources" not in node and hops < 64:
+                node = node.get("/Parent")
+                if not isinstance(node, pikepdf.Dictionary):
+                    break
+                hops += 1
+            if hops and isinstance(node, pikepdf.Dictionary) and "/Resources" in node:
+                stack.append(node["/Resources"])
+        except Exception:
+            pass
+        seen: set = set()
+        try:
+            start_key = tuple(start.objgen) if start.is_indirect else None
+        except Exception:
+            start_key = None
+        while stack:
+            cur = stack.pop()
+            try:
+                if not isinstance(cur, containers):
+                    continue
+                key = tuple(cur.objgen) if cur.is_indirect else None
+                if key is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if key in found:
+                        found[key].append(number)
+                if isinstance(cur, pikepdf.Array):
+                    stack.extend(v for v in cur if isinstance(v, containers))
+                    continue
+                is_start = cur is start or (key is not None and key == start_key)
+                if not is_start and _type_name(cur) in ("/Page", "/Pages", "/Catalog"):
+                    continue
+                skip = ("/Parent",) if is_start else ()
+                stack.extend(cur[k] for k in cur.keys()
+                             if k not in skip and isinstance(cur[k], containers))
+            except Exception:
+                continue
+    return found
+
+
+def _term_sweep_check(output_path: str, terms: list[str], case_sensitive: bool,
+                      password: Optional[str] = None) -> VerificationCheck:
+    """No target term is left in any string or stream of the output.
+
+    Fail-closed twice over, like the sanitization sweep. A hit fails the
+    check, with where it is in plain words (the raw object path is kept
+    beside it). And a search that did not cover the whole file — the output
+    would not open, an object or a stream could not be read — fails it too:
+    what was not read cannot be reported free of the terms.
+
+    A hit on an object some page leads to names the page (and offers the
+    flatten, which removes it); any other is document-level.
+    """
+    desc = "No target term appears in any string or stream of the file"
+    finder = TermFinder(terms, case_sensitive)
+    hits: list = []            # (term, what, path)
+    problems: list[str] = []
+    lines: list[str] = []
+    paths: list[str] = []
+    pages: set = set()
+    kwargs = {"password": password} if password else {}
+    try:
+        with pikepdf.open(output_path, **kwargs) as pdf:
+            # Font machinery by identity first: a character map two fonts
+            # share is one wherever the walk happens to reach it from.
+            machinery: set = set()
+            for obj in pdf.objects:
+                try:
+                    if isinstance(obj, (pikepdf.Dictionary, pikepdf.Stream)):
+                        machinery.update(tuple(s.objgen) for s in _font_streams(obj))
+                except Exception:
+                    continue           # the walk below meets it too, and says so
+            status = WalkStatus()
+            for path, obj in walk_objects(pdf, status, strings=True):
+                try:
+                    if isinstance(obj, pikepdf.String):
+                        if _is_font_string(path):
+                            continue
+                        found, what = finder.find(bytes(obj)), "a text string"
+                    else:
+                        # An inline font dictionary is in no object list.
+                        machinery.update(tuple(s.objgen) for s in _font_streams(obj))
+                        if not isinstance(obj, pikepdf.Stream):
+                            continue
+                        if tuple(obj.objgen) in machinery or _is_image(obj):
+                            continue
+                        data = obj.read_bytes()
+                        if data[36:40] == b"acsp":       # an ICC colour profile
+                            continue
+                        found, what = finder.find(data), "a stream"
+                except Exception as exc:
+                    # The type only: library messages quote the file's path.
+                    problems.append(
+                        f"could not read {render_path(path)} ({type(exc).__name__})")
+                    continue
+                hits.extend((term, what, path) for term in found)
+            problems = status.problems + problems
+
+            owners = {id(h): _owner_id(h[2]) for h in hits}
+            reach = _pages_reaching(pdf, {o for o in owners.values() if o}) if hits else {}
+            placed = [(h, reach.get(owners[id(h)]) or []) for h in hits]
+            seen: set = set()
+            # Document-level hits first: the list is cut at twenty lines, and
+            # the one that rules out the flatten must not be what is cut.
+            for (term, what, path), on in sorted(placed, key=lambda p: bool(p[1])):
+                raw = render_path(path)
+                if (term, raw) in seen:
+                    continue
+                seen.add((term, raw))
+                segments = _segments(path)
+                if on:
+                    pages.update(on)
+                    more = (f", and on {len(on) - 1} more page{'' if len(on) == 2 else 's'}"
+                            if len(on) > 1 else "")
+                    lines.append(f"term '{term}' found in {what} "
+                                 f"{plain_location(segments, on[0])}{more}")
+                else:
+                    lines.append(f"term '{term}' found in {what} "
+                                 f"{plain_location(segments)} (document-level)")
+                paths.append(raw)
+    except Exception as exc:
+        problems.append(f"the output could not be opened ({type(exc).__name__})")
+    incomplete = [f"the whole-file search did not cover the whole file ({p}); what it "
+                  f"did not read cannot be reported free of the terms (document-level)"
+                  for p in problems[:5]]
+    evidence = lines[:20] + ([f"... and {len(lines) - 20} more"] if len(lines) > 20 else [])
+    return VerificationCheck(
+        id="redaction.term_sweep", description=desc,
+        passed=not (lines or incomplete), evidence=evidence + incomplete,
+        pages=sorted(pages), unevaluated=bool(incomplete) and not lines,
+        object_paths=paths[:20])
 
 
 class SweepHit(NamedTuple):
