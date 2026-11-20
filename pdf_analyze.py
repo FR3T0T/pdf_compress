@@ -2455,7 +2455,7 @@ def write_name_tree(tree, items) -> None:
             del tree[stale]
 
 
-def remove_embedded_files(pdf: pikepdf.Pdf, wanted) -> int:
+def remove_embedded_files(pdf: pikepdf.Pdf, wanted, also=(), gone=()) -> int:
     """Remove whole every embedded file *wanted* picks — its file
     specification and its payload — and return how many went.
 
@@ -2470,9 +2470,24 @@ def remove_embedded_files(pdf: pikepdf.Pdf, wanted) -> int:
     name tree, which is written back as one sorted leaf so that no /Limits
     keeps the name. It leaves every /AF array. And a /FileAttachment
     annotation whose file it was leaves its page.
+
+    An action that opened a removed file goes with it: an embedded go-to
+    action (/GoToE) whose target, counted from this document, is a name the
+    attachment list no longer has, or a /FileAttachment annotation that has
+    just left its page. It names what it opened, and would be left pointing
+    at nothing. It is removed the way Sanitize removes an action
+    (_remove_actions, which is also what *also* is for), and is not counted:
+    the count is of files. *gone* are names the caller has already taken
+    out of the attachment list itself, as text; the actions into those go
+    too.
     """
     def emptied(d) -> bool:
         return isinstance(d, pikepdf.Dictionary) and not (set(d.keys()) - {"/Type"})
+
+    def carries_removed_file(annot) -> bool:
+        return (isinstance(annot, pikepdf.Dictionary)
+                and _as_str(annot.get("/Subtype")) == "/FileAttachment"
+                and emptied(annot.get("/FS")))
 
     chosen, seen = [], set()
 
@@ -2501,7 +2516,8 @@ def remove_embedded_files(pdf: pikepdf.Pdf, wanted) -> int:
                     choose(value)
     except Exception as exc:
         _trouble("the document's attachment list could not be read", exc)
-    if not chosen:
+    gone_names: set = {str(name) for name in gone}
+    if not chosen and not gone_names:
         return 0
 
     for d in chosen:
@@ -2512,6 +2528,42 @@ def remove_embedded_files(pdf: pikepdf.Pdf, wanted) -> int:
         except Exception as exc:
             _trouble("an embedded file could not be removed", exc)
 
+    # What a go-to action can name of the files that went, read before any
+    # list is rewritten: the key the attachment list filed one under (as its
+    # bytes and as text), or the annotation that carried one, by page and
+    # position or by page and /NM.
+    gone_annots: set = set()
+    try:
+        for key, value in items:
+            if isinstance(key, pikepdf.String) and emptied(value):
+                gone_names.update((bytes(key), str(key)))
+        for number, page in enumerate(pdf.pages):
+            annots = page.obj.get("/Annots")
+            for position, annot in enumerate(annots if isinstance(annots, pikepdf.Array) else []):
+                if carries_removed_file(annot):
+                    gone_annots.add((number, position))
+                    if isinstance(annot.get("/NM"), pikepdf.String):
+                        gone_annots.add((number, bytes(annot["/NM"])))
+    except Exception as exc:
+        _trouble("the actions that open a removed file could not be found", exc)
+
+    def opens_removed_file(action) -> Optional[str]:
+        # With /F the target is counted from some other file, not this one.
+        if _as_str(action.get("/S")) != "/GoToE" or "/F" in action:
+            return None
+        target = action.get("/T")
+        if not isinstance(target, pikepdf.Dictionary) or _as_str(target.get("/R")) != "/C":
+            return None
+        name, page, annot = target.get("/N"), target.get("/P"), target.get("/A")
+        if isinstance(name, pikepdf.String):
+            return ("embedded_goto" if bytes(name) in gone_names or str(name) in gone_names
+                    else None)
+        if isinstance(annot, pikepdf.String):
+            annot = bytes(annot)
+        if isinstance(page, int) and isinstance(annot, (int, bytes)):
+            return "embedded_goto" if (page, annot) in gone_annots else None
+        return None
+
     try:
         left = [(key, value) for key, value in items if not emptied(value)]
         if len(left) != len(items):
@@ -2521,6 +2573,8 @@ def remove_embedded_files(pdf: pikepdf.Pdf, wanted) -> int:
                 del names["/EmbeddedFiles"]
     except Exception as exc:
         _trouble("the document's attachment list could not be rewritten", exc)
+    if gone_names or gone_annots:
+        _remove_actions(pdf, opens_removed_file, also)
     for obj in list(_reachable(pdf)):
         try:
             af = obj.get("/AF")
@@ -2539,10 +2593,7 @@ def remove_embedded_files(pdf: pikepdf.Pdf, wanted) -> int:
             annots = page.get("/Annots")
             if not isinstance(annots, pikepdf.Array):
                 continue
-            keep = [a for a in annots
-                    if not (isinstance(a, pikepdf.Dictionary)
-                            and _as_str(a.get("/Subtype")) == "/FileAttachment"
-                            and emptied(a.get("/FS")))]
+            keep = [a for a in annots if not carries_removed_file(a)]
             if len(keep) != len(annots):
                 page["/Annots"] = pikepdf.Array(keep)
         except Exception as exc:

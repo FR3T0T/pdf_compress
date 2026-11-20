@@ -1222,6 +1222,372 @@ def _undecodable_attachment(pdf):
                                         EF=Dictionary(F=payload)))
 
 
+# ── The R1b review's small items ─────────────────────────────────────────
+#
+#  What was left when the rules above met real files: an action that names
+#  the attachment it opened, the original of a redacted form kept alive by
+#  the structure tree, the appearance of a note that is off its page, and
+#  the neutral names themselves.
+
+
+def _goto_embedded(target, **more):
+    """A go-to action into an attachment of this file: *target* is the name
+    the attachment list files it under, or a ready-made target dictionary."""
+    if not isinstance(target, Dictionary):
+        target = Dictionary(R=Name.C, N=String(target))
+    return Dictionary(S=Name.GoToE, D=Array([0, Name.Fit]), NewWindow=True, T=target, **more)
+
+
+def _link_targets(pdf) -> list:
+    """Where each link left on page 1 goes: the attachment name or the
+    annotation its go-to action names."""
+    found = []
+    for a in pdf.pages[0].obj.get("/Annots", []):
+        if str(a.get("/Subtype")) == "/Link":
+            target = a["/A"]["/T"]
+            found.append(str(target["/N"] if "/N" in target else target["/A"]))
+    return found
+
+
+@pytest.mark.integration
+class TestActionsIntoARemovedAttachment:
+    """(a) A go-to action into an attachment names it. When rule (h) removes
+    the attachment, the action goes with it — a real file's four links into
+    its one attachment went on naming it after it was gone."""
+
+    @pytest.mark.parametrize("home", ["a page link", "a bookmark", "after a harmless action",
+                                      "off the page"])
+    def test_the_action_goes_with_the_attachment(self, tmp_path, home):
+        gone, kept = f"{TERM}-annex.pdf", "other.pdf"
+
+        def plant(pdf):
+            _attach(pdf, _filespec(pdf, gone, b"%PDF-1.4 annex"),
+                    _filespec(pdf, kept, b"%PDF-1.4 other"))
+            _on_page(pdf, _annot(pdf, Name.Link, A=_goto_embedded(kept)))
+            if home == "a page link":
+                _on_page(pdf, _annot(pdf, Name.Link, A=_goto_embedded(gone)))
+            elif home == "a bookmark":
+                outlines = pdf.make_indirect(Dictionary(Count=1))
+                item = pdf.make_indirect(Dictionary(Title=String("Annex"), Parent=outlines,
+                                                    A=_goto_embedded(gone)))
+                outlines["/First"] = outlines["/Last"] = item
+                pdf.Root["/Outlines"] = outlines
+            elif home == "after a harmless action":
+                pdf.Root["/OpenAction"] = Dictionary(S=Name.Named, N=Name.NextPage,
+                                                     Next=_goto_embedded(gone))
+            else:
+                _held_by_structure(pdf, _annot(pdf, Name.Link, A=_goto_embedded(gone)))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("embedded_files") == 1
+        with pikepdf.open(out) as pdf:
+            assert _attached(pdf) == [kept]
+            assert _link_targets(pdf) == [kept]         # the link into the other one stays
+            if home == "a bookmark":
+                assert "/A" not in pdf.Root["/Outlines"]["/First"]
+            elif home == "after a harmless action":
+                assert "/Next" not in pdf.Root["/OpenAction"]
+
+    def test_one_removed_for_what_is_in_it_takes_its_links_too(self, tmp_path):
+        """Nothing in the action holds the term here; it would only be left
+        pointing at an attachment that is no longer there."""
+        def plant(pdf):
+            _attach(pdf, _filespec(pdf, "minutes.pdf", f"%PDF-1.4 minutes of {TERM}".encode()),
+                    _filespec(pdf, "other.pdf", b"%PDF-1.4 other"))
+            _on_page(pdf, _annot(pdf, Name.Link, A=_goto_embedded("minutes.pdf")),
+                     _annot(pdf, Name.Link, A=_goto_embedded("other.pdf")),
+                     # Into an attachment of some other file: not this one's.
+                     _annot(pdf, Name.Link, A=_goto_embedded("minutes.pdf",
+                                                             F=String("elsewhere.pdf"))))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("embedded_files") == 1
+        with pikepdf.open(out) as pdf:
+            assert _link_targets(pdf) == ["other.pdf", "minutes.pdf"]
+            assert "/F" in pdf.pages[0].obj["/Annots"][1]["/A"]
+
+    def test_a_target_given_as_the_annotation_that_carries_the_file(self, tmp_path):
+        def plant(pdf):
+            gone = _annot(pdf, Name.FileAttachment, NM=String("scan-1"), FS=_filespec(
+                pdf, "scan.txt", f"scan of the {TERM} contract".encode()))
+            kept = _annot(pdf, Name.FileAttachment, NM=String("scan-2"),
+                          FS=_filespec(pdf, "blank.txt", b"nothing"))
+            _on_page(pdf, gone, kept,
+                     _annot(pdf, Name.Link, A=_goto_embedded(Dictionary(R=Name.C, P=0, A=0))),
+                     _annot(pdf, Name.Link, A=_goto_embedded(
+                         Dictionary(R=Name.C, P=0, A=String("scan-1")))),
+                     _annot(pdf, Name.Link, A=_goto_embedded(
+                         Dictionary(R=Name.C, P=0, A=String("scan-2")))))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("embedded_files") == 1
+        with pikepdf.open(out) as pdf:
+            assert [str(a["/Subtype"]) for a in pdf.pages[0].obj["/Annots"]] == [
+                "/FileAttachment", "/Link"]
+            assert _link_targets(pdf) == ["scan-2"]
+
+
+#: A box drawn over the line the form of _tagged_form paints.
+_OVER_THE_FORM = {"page": 0, "x0": 60, "y0": 150, "x1": 400, "y1": 200}
+
+
+def _tagged_form(pdf, how: str, text: str = f"drawn by {TERM} here", page_no: int = 0):
+    """A form XObject painted on a page, its content tagged, with the
+    structure tree referring to it the way *how* says: by a marked-content
+    reference ("/Stm"), by one among other kids, or by an object reference
+    ("/Obj"). Returns the structure element."""
+    page = pdf.pages[page_no].obj
+    form = pdf.make_stream(
+        f"/P <</MCID 0>> BDC BT /F1 14 Tf 10 20 Td ({text}) Tj ET EMC".encode(),
+        Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 300, 40], StructParents=0,
+        Resources=Dictionary(Font=Dictionary(F1=_font(pdf))))
+    page["/Resources"]["/XObject"] = Dictionary(X1=form)
+    page["/Contents"] = pdf.make_stream(
+        page["/Contents"].read_bytes() + b"\nq 1 0 0 1 72 600 cm /X1 Do Q")
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    elem = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.P, P=root, Pg=page))
+    if how == "/Obj":
+        elem["/K"] = Dictionary(Type=Name.OBJR, Obj=form)
+    elif how == "/Stm":
+        elem["/K"] = Dictionary(Type=Name.MCR, MCID=0, Stm=form)
+    else:
+        elem["/K"] = Array([Dictionary(Type=Name.MCR, MCID=0, Stm=form),
+                            Dictionary(Type=Name.MCR, MCID=1, Pg=page), 2])
+    root["/K"] = Array([elem])
+    root["/ParentTree"] = Dictionary(Nums=Array([0, Array([elem])]))
+    pdf.Root["/StructTreeRoot"] = root
+    pdf.Root["/MarkInfo"] = Dictionary(Marked=True)
+    return elem
+
+
+def _structure_kids(pdf) -> list:
+    """The kids of the one structure element _tagged_form makes."""
+    kids = pdf.Root["/StructTreeRoot"]["/K"][0].get("/K")
+    if kids is None:
+        return []
+    return list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+
+
+@pytest.mark.integration
+class TestWhatTheStructureTreeKeepsAlive:
+    """(b) Redaction does not edit a form XObject in place: the page gets a
+    redacted copy and the original is dropped, when nothing refers to it any
+    more. A tagged file's structure tree does — and so kept the original,
+    unredacted, in the output."""
+
+    HOW = ["/Stm", "/Stm, among others", "/Obj"]
+
+    @pytest.mark.parametrize("how", HOW)
+    def test_the_original_of_a_redacted_form_is_not_kept(self, tmp_path, how):
+        res, out = _redact(tmp_path, lambda pdf: _tagged_form(pdf, how))
+        assert res.surface_counts.get("structure_refs") == 1
+        with fitz.open(out) as doc:
+            text = doc[0].get_text()
+        assert "drawn by" in text and "here" in text       # the rest of the form is still drawn
+        with pikepdf.open(out) as pdf:
+            kids = _structure_kids(pdf)
+            assert not any(isinstance(k, pikepdf.Dictionary) and ("/Stm" in k or "/Obj" in k)
+                           for k in kids)
+            assert len(kids) == (2 if how == "/Stm, among others" else 0)
+
+    @pytest.mark.parametrize("how", HOW)
+    def test_nor_under_a_box_drawn_by_hand(self, tmp_path, how):
+        """No term is given, so nothing searches the output for one: the
+        original went unnoticed."""
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: _tagged_form(pdf, how))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[_OVER_THE_FORM])
+        assert res.verification["verified"] is True
+        assert res.surface_counts == {"page_content": 1, "structure_refs": 1}
+        assert not _holds_term(out)
+
+    def test_a_reference_to_a_form_a_page_still_paints_is_kept(self, tmp_path):
+        """The term is on page 1 only; the tagged form is on page 2, which
+        is not touched."""
+        def plant(pdf):
+            pdf.pages[0].obj["/Contents"] = pdf.make_stream(_show(f"about {TERM}"))
+            _tagged_form(pdf, "/Stm", text="an ordinary figure", page_no=1)
+        src = _pdf(tmp_path / "src.pdf", plant, pages=2)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[TERM])
+        assert res.verification["verified"] is True and "structure_refs" not in res.surface_counts
+        with pikepdf.open(out) as pdf:
+            (kid,) = _structure_kids(pdf)
+            assert b"an ordinary figure" in kid["/Stm"].read_bytes()
+
+    def test_the_page_s_own_content_stream_named_by_a_reference(self, tmp_path):
+        """A page's content is not edited in place either: the page gets
+        new streams. A reference that names the old one kept the whole
+        unredacted page."""
+        def plant(pdf):
+            page = pdf.pages[0].obj
+            root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+            root["/K"] = Array([pdf.make_indirect(Dictionary(
+                Type=Name.StructElem, S=Name.P, P=root, Pg=page,
+                K=Dictionary(Type=Name.MCR, MCID=0, Stm=page["/Contents"])))])
+            pdf.Root["/StructTreeRoot"] = root
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("structure_refs") == 1
+        with pikepdf.open(out) as pdf:
+            assert _structure_kids(pdf) == []
+
+    def test_the_original_of_an_image_under_a_box_is_not_kept(self, tmp_path):
+        """An image is not edited in place either: the page gets a copy
+        with the pixels under the box blacked out. Eight pixels of the top
+        row spell a word here, so the original can be told from the copy."""
+        def plant(pdf):
+            page = pdf.pages[0].obj
+            image = pdf.make_stream(
+                b"SECRETPX" + b"\xc8" * 56, Type=Name.XObject, Subtype=Name.Image, Width=8,
+                Height=8, ColorSpace=Name.DeviceGray, BitsPerComponent=8, StructParent=0)
+            page["/Resources"]["/XObject"] = Dictionary(Im1=image)
+            page["/Contents"] = pdf.make_stream(
+                page["/Contents"].read_bytes() + b"\nq 200 0 0 200 100 400 cm /Im1 Do Q")
+            root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+            root["/K"] = Array([pdf.make_indirect(Dictionary(
+                Type=Name.StructElem, S=Name.Figure, P=root, Pg=page,
+                K=Dictionary(Type=Name.OBJR, Obj=image)))])
+            pdf.Root["/StructTreeRoot"] = root
+        src = _pdf(tmp_path / "src.pdf", plant)
+        assert b"SECRETPX" in _everything(src)             # the fixture is what it claims
+        out = str(tmp_path / "out.pdf")
+        # The top half of the image, in the page's top-down coordinates.
+        res = redact_pdf(src, out, rects=[{"page": 0, "x0": 90, "y0": 180, "x1": 310, "y1": 290}])
+        assert res.verification["verified"] is True
+        assert b"SECRETPX" not in _everything(out)
+        with fitz.open(out) as doc:
+            assert len(doc[0].get_images()) == 1           # the copy is still painted
+
+    def test_a_form_that_is_shared_with_a_page_left_alone_is_kept(self, tmp_path):
+        """Page 2 paints the same form and is not redacted: the original is
+        still that page's content, and the reference to it is still true."""
+        def plant(pdf):
+            _tagged_form(pdf, "/Stm")
+            second = pdf.pages[1].obj
+            second["/Resources"]["/XObject"] = Dictionary(
+                X1=pdf.pages[0].obj["/Resources"]["/XObject"]["/X1"])
+            second["/Contents"] = pdf.make_stream(b"q 1 0 0 1 72 600 cm /X1 Do Q")
+        src = _pdf(tmp_path / "src.pdf", plant, pages=2)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[_OVER_THE_FORM])
+        assert res.verification["verified"] is True and "structure_refs" not in res.surface_counts
+        with pikepdf.open(out) as pdf:
+            assert len(_structure_kids(pdf)) == 1
+
+
+@pytest.mark.integration
+class TestAnAppearanceOffThePage:
+    """(c) A note that redaction took off its page, kept alive by the
+    structure tree, has its text scrubbed. Its appearance stream drew that
+    text, and nothing shows it any more: it goes too."""
+
+    def _note(self, pdf, **entries):
+        return _annot(pdf, Name.FreeText, AP=Dictionary(N=_form(pdf, f"ask {TERM} first")),
+                      **entries)
+
+    @pytest.mark.parametrize("entry", ["/Contents", "/RC", "/Subj"])
+    def test_it_goes_with_the_text_it_drew(self, tmp_path, entry):
+        def plant(pdf):
+            text = f"<body><p>ask {TERM} first</p></body>" if entry == "/RC" else f"ask {TERM} first"
+            _held_by_structure(pdf, self._note(pdf, **{entry.lstrip("/"): String(text)}))
+        res, out = _redact(tmp_path, plant)
+        with pikepdf.open(out) as pdf:
+            note = pdf.Root["/StructTreeRoot"]["/K"][0]["/K"][0]["/Obj"]
+            assert "/AP" not in note and entry not in note
+            assert str(note["/Subtype"]) == "/FreeText"          # the note itself stays
+
+    def test_a_note_under_the_redacted_text_itself(self, tmp_path):
+        """The whole chain as it happens: the note sits over the text, the
+        box takes it off the page, the structure tree keeps it alive."""
+        def plant(pdf):
+            note = pdf.make_indirect(Dictionary(
+                Type=Name.Annot, Subtype=Name.FreeText, Rect=[60, 705, 420, 745],
+                Contents=String(f"ask {TERM} first"), DA=String("/Helv 12 Tf 0 g"),
+                AP=Dictionary(N=_form(pdf, f"ask {TERM} first"))))
+            _on_page(pdf, note)
+            _held_by_structure(pdf, note)
+        _redact(tmp_path, plant)
+
+    def test_a_note_on_its_page_keeps_its_appearance(self, tmp_path):
+        """On a page the appearance is what the reader sees. It is not
+        dropped for the note's text: if it draws the term, the run is
+        refused and the page is offered for flattening, as before."""
+        res, out = _redact(tmp_path, lambda pdf: _on_page(pdf, _annot(
+            pdf, Name.FreeText, Contents=String(f"ask {TERM} first"),
+            AP=Dictionary(N=_form(pdf, "a note drawn here")))))
+        assert res.surface_counts.get("annotations") == 1
+        with pikepdf.open(out) as pdf:
+            note = pdf.pages[0].obj["/Annots"][0]
+            assert "/Contents" not in note and "/AP" in note
+
+    def test_text_that_is_kept_keeps_its_appearance(self, tmp_path):
+        res, out = _redact(tmp_path, lambda pdf: _held_by_structure(pdf, _annot(
+            pdf, Name.FreeText, Contents=String("see page 4"),
+            AP=Dictionary(N=_form(pdf, "see page 4")))))
+        with pikepdf.open(out) as pdf:
+            note = pdf.Root["/StructTreeRoot"]["/K"][0]["/K"][0]["/Obj"]
+            assert "/AP" in note and str(note["/Contents"]) == "see page 4"
+
+
+@pytest.mark.integration
+class TestNeutralNamesCountUp:
+    """(d) Thirteen sibling fields of a real file came out as field1,
+    item-1, item1, entry-1 and so on: unique, and untidy. The names count
+    up within one stem, and the stem changes only when it holds a term."""
+
+    def _siblings(self, names):
+        def plant(pdf):
+            pdf.Root["/AcroForm"] = Dictionary(Fields=Array([pdf.make_indirect(Dictionary(
+                FT=Name.Tx, T=String(name))) for name in names]))
+        return plant
+
+    def test_sibling_fields_are_numbered_in_one_run(self, tmp_path):
+        res, out = _redact(tmp_path, self._siblings([f"{TERM} {n}" for n in range(1, 14)]))
+        assert res.surface_counts.get("field_names") == 13
+        with pikepdf.open(out) as pdf:
+            assert sorted(_fields(pdf)) == sorted(f"field-{n}" for n in range(1, 14))
+
+    def test_a_name_already_in_use_is_passed_over(self, tmp_path):
+        res, out = _redact(tmp_path, self._siblings(
+            [f"{TERM} a", "field-2", f"{TERM} b", f"{TERM} c"]))
+        with pikepdf.open(out) as pdf:
+            assert sorted(_fields(pdf)) == ["field-1", "field-2", "field-3", "field-4"]
+
+    def test_the_stem_changes_only_when_it_holds_a_term(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", self._siblings([f"Field {n}" for n in (1, 2, 3)]),
+                   body="a line about the Field here")
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=["Field"])
+        assert res.verification["verified"] is True
+        with pikepdf.open(out) as pdf:
+            assert sorted(_fields(pdf)) == ["item-1", "item-2", "item-3"]
+
+    def test_named_destinations_count_up_the_same_way(self, tmp_path):
+        def plant(pdf):
+            page = pdf.pages[0].obj
+            entries = Array()
+            for name in sorted(f"{TERM}-{part}" for part in ("a", "b", "c")):
+                entries.append(String(name))
+                entries.append(Array([page, Name.Fit]))
+            pdf.Root["/Names"] = Dictionary(Dests=pdf.make_indirect(Dictionary(Names=entries)))
+        res, out = _redact(tmp_path, plant)
+        assert res.surface_counts.get("destinations") == 3
+        with pikepdf.open(out) as pdf:
+            keys = pdf.Root["/Names"]["/Dests"]["/Names"]
+            assert [str(keys[i]) for i in (0, 2, 4)] == ["redacted-1", "redacted-2", "redacted-3"]
+
+    @pytest.mark.parametrize("terms, expected", [
+        (["-"], [b"field1", b"field2", b"field3"]),          # the separator holds a term
+        (["1"], [b"field-2", b"field-3", b"field-4"]),       # a number holds one
+        (["d-1"], [b"field-2", b"field-3", b"field-4"]),     # the join of stem and number
+        (["field", "item"], [b"entry-1", b"entry-2", b"entry-3"]),
+    ], ids=["a hyphen", "a digit", "across the join", "two stems"])
+    def test_no_name_holds_a_term(self, terms, expected):
+        import pdf_ops
+        from pdf_verify import TermFinder
+        finder, taken = TermFinder(terms), set()
+        names = [pdf_ops._neutral_name(("field", "item", "entry", "x"), taken, finder)
+                 for _ in expected]
+        assert names == expected and taken == set(expected)
+
+
 # ── D6: each stream of a page is read once ───────────────────────────────
 
 

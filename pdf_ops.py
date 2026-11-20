@@ -26,7 +26,7 @@ from pdf_analyze import (
     trailer_ids,
     write_name_tree,
 )
-from pdf_verify import TermFinder, WalkStatus, verify_redaction, walk_objects
+from pdf_verify import TermFinder, WalkStatus, term_boxes, verify_redaction, walk_objects
 
 log = logging.getLogger(__name__)
 
@@ -1539,7 +1539,9 @@ class RedactResult:
     pages_affected: int
     #: per-surface removal breakdown, e.g. {"page_content": 12, "docinfo": 1,
     #: "bookmarks": 2}. page_content mirrors redaction_count; the rest are the
-    #: document-level scrubs apply_redactions never touches (#99).
+    #: document-level scrubs apply_redactions never touches (#99, #119), and
+    #: structure_refs, the structure tree's references to an unredacted
+    #: original, which a run by box alone can have too.
     surface_counts: dict = field(default_factory=dict)
     #: verify_redaction(output).to_dict() — the proof-of-removal artifact.
     verification: dict | None = None
@@ -1591,13 +1593,19 @@ def _marker_for(finder) -> str:
 
 def _neutral_name(stems: tuple, taken: set, finder) -> bytes:
     """A name for something that has to keep one — a form field, a named
-    destination — that is not in *taken* and holds none of the terms:
-    ``field-1``, ``field-2``, ... or, when the term is "field", the same
-    with the next stem. Adds the name to *taken*."""
-    for serial in range(1, 100000):
-        for stem in stems:
-            for name in (f"{stem}-{serial}", f"{stem}{serial}"):
-                raw = name.encode()
+    destination — that is not in *taken* and holds none of the terms.
+
+    The names count up within one stem: ``field-1``, ``field-2``,
+    ``field-3``. A stem is left for the next one only when it holds a term
+    itself (the term is "field": ``item-1``, ``item-2``), and the hyphen
+    only when it does (``field1``, ``field2``); a number that would make
+    the name hold a term is skipped. Adds the name to *taken*."""
+    for stem in stems:
+        for lead in (f"{stem}-", stem):
+            if finder(lead.encode()):
+                continue
+            for serial in range(1, 10000):
+                raw = f"{lead}{serial}".encode()
                 if raw not in taken and not finder(raw):
                     taken.add(raw)
                     return raw
@@ -1833,6 +1841,25 @@ def _is_annotation(obj) -> bool:
                  or (bool(_name_of(obj, "/Subtype")) and "/Rect" in obj)))
 
 
+def _listed_annotations(pdf) -> set:
+    """(num, gen) of every annotation some page lists in its /Annots: the
+    ones that are on a page."""
+    listed: set = set()
+    for page in pdf.pages:
+        try:
+            annots = page.obj.get("/Annots")
+            entries = list(annots) if isinstance(annots, pikepdf.Array) else []
+        except Exception:
+            continue
+        for annot in entries:
+            try:
+                if annot.is_indirect:
+                    listed.add(tuple(annot.objgen))
+            except Exception:
+                continue
+    return listed
+
+
 def _field_tree(pdf) -> list:
     """Every field dictionary in the AcroForm tree, through /Kids, once."""
     try:
@@ -2036,8 +2063,133 @@ def _scrub_signatures(pdf, objects: list, finder) -> int:
     return n
 
 
+#: /Type of the dictionaries that make up the structure tree.
+_STRUCTURE_TYPES = ("/StructTreeRoot", "/StructElem", "/MCR", "/OBJR")
+
+
+def _structure_stream(kid):
+    """The stream a kid of a structure element names — the content stream
+    of a marked-content reference (/Stm), the XObject of an object
+    reference (/Obj) — or None."""
+    if isinstance(kid, pikepdf.Dictionary):
+        for key in ("/Stm", "/Obj"):
+            target = kid.get(key)
+            if isinstance(target, pikepdf.Stream):
+                return target
+    return None
+
+
+def _drop_stale_structure_refs(pdf) -> int:
+    """Remove every reference the structure tree makes to a stream that
+    nothing else in the file leads to; returns how many went.
+
+    Redaction does not edit a form XObject or an image in place. The page
+    is given a redacted copy, and the original is dropped when the file is
+    written — unless something still refers to it. In a tagged file the
+    structure tree does: a marked-content reference names the stream its
+    content is in (/Stm), an object reference names the XObject (/Obj).
+    Either one kept the original in the output, unredacted, where no page
+    paints it and no check of the pages sees it.
+
+    A kid of a structure element that names such a stream is taken out of
+    the element's /K. "Nothing else" is tested by walking the file from the
+    trailer without entering the structure tree: a stream that walk reaches
+    is still somebody's content (a page that was not redacted paints it,
+    say) and its reference is still true. This runs on every redaction, by
+    term or by box, as the last thing before the output is written; an
+    object reference to an annotation is not a stream and is not touched
+    (the scrub deals with those).
+    """
+    try:
+        root = pdf.Root.get("/StructTreeRoot")
+    except Exception:
+        return 0
+    if not isinstance(root, pikepdf.Dictionary):
+        return 0
+
+    def kids_of(elem) -> list:
+        kids = elem.get("/K")
+        return list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+
+    # Every dictionary of the tree that has kids naming a stream.
+    holders, named = [], set()
+    seen, stack = set(), [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            if not isinstance(cur, (pikepdf.Dictionary, pikepdf.Array)):
+                continue
+            if cur.is_indirect:
+                ident = tuple(cur.objgen)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            if isinstance(cur, pikepdf.Array):
+                stack.extend(cur)
+                continue
+            if _name_of(cur, "/Type") in ("/Page", "/Pages", "/Catalog"):
+                continue
+            if "/K" in cur:
+                streams = [s for s in map(_structure_stream, kids_of(cur)) if s is not None]
+                if streams:
+                    holders.append(cur)
+                    named.update(tuple(s.objgen) for s in streams)
+            stack.extend(cur[k] for k in cur.keys() if k not in _STRUCTURE_WAYS_OUT)
+        except Exception:
+            continue
+    if not named:
+        return 0
+
+    # Which of them the rest of the file still leads to.
+    alive: set = set()
+    seen, stack = set(), [pdf.trailer]
+    while stack and len(alive) < len(named):
+        cur = stack.pop()
+        try:
+            if not isinstance(cur, _CONTAINERS):
+                continue
+            if cur.is_indirect:
+                ident = tuple(cur.objgen)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                if ident in named:
+                    alive.add(ident)
+            if isinstance(cur, pikepdf.Array):
+                stack.extend(cur)
+                continue
+            if _name_of(cur, "/Type") in _STRUCTURE_TYPES:
+                continue
+            # /SE is a bookmark's way into the tree.
+            stack.extend(cur[k] for k in cur.keys() if k not in ("/StructTreeRoot", "/SE"))
+        except Exception:
+            continue
+
+    removed = 0
+    for holder in holders:
+        try:
+            kids = kids_of(holder)
+            keep = []
+            for kid in kids:
+                stream = _structure_stream(kid)
+                if stream is not None and tuple(stream.objgen) not in alive:
+                    removed += 1
+                else:
+                    keep.append(kid)
+            if len(keep) == len(kids):
+                continue
+            if keep and isinstance(holder.get("/K"), pikepdf.Array):
+                holder["/K"] = pikepdf.Array(keep)
+            else:
+                del holder["/K"]
+        except Exception:
+            continue
+    return removed
+
+
 def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
-                             password: str | None = None) -> dict[str, int]:
+                             password: str | None = None, *,
+                             gone_attachments: tuple | list = ()) -> dict[str, int]:
     """Whole-value removal of *terms* from every non-page-content surface, in
     place on *path* via pikepdf — the surfaces verify_redaction checks but
     apply_redactions never touches (#99). Returns a surface->count dict.
@@ -2090,10 +2242,16 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
       * ``signatures`` — a signature holding a term anywhere in it has its
         value removed, leaving the field unsigned.
 
+    Two things go with what a rule removes and are not counted on their
+    own. An annotation that is on no page and had its text scrubbed loses
+    its appearance stream, which drew that text (_scrub_objects). And a
+    go-to action into an attachment that has been removed — here, or by
+    name before this ran (*gone_attachments*) — is removed with it.
+
     There is no rule for anything else: web-capture names, an output
-    intent's strings, the document security store, an appearance stream or
-    a form no page paints. A term left there is found by the sweep, and the
-    redaction is refused.
+    intent's strings, the document security store, the appearance stream of
+    an annotation that is on a page, a form held by a private key. A term
+    left there is found by the sweep, and the redaction is refused.
     """
     if not terms:
         return {}
@@ -2187,7 +2345,7 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
         # -- annotations and form fields: text, rich text, names, values -
         try:
             bump_map = _scrub_objects(objects, annotations, fields, tree_ids, match, finder,
-                                      marker)
+                                      marker, _listed_annotations(pdf))
             for k, v in bump_map.items():
                 bump(k, v)
         except Exception:
@@ -2256,10 +2414,12 @@ def _scrub_document_surfaces(path: str, terms: list[str], case_sensitive: bool,
         # -- attachments: one whose name, description or bytes hold a term
         #    is removed whole. Bytes as stored: a zip, a docx or an xlsx is
         #    compressed inside and is not opened. One that cannot be read is
-        #    left for the verifier, which refuses the run. -------------------
+        #    left for the verifier, which refuses the run. A go-to action
+        #    that opened a removed attachment goes with it. ------------------
         try:
             bump("embedded_files", remove_embedded_files(
-                pdf, lambda thing: _holds_term(thing, finder, unreadable=False)))
+                pdf, lambda thing: _holds_term(thing, finder, unreadable=False),
+                also=owners, gone=gone_attachments))
         except Exception:
             pass
 
@@ -2327,7 +2487,8 @@ def _scrub_outline_items(items, match, marker: str = _REDACTED_MARKER, depth: in
 
 
 def _scrub_objects(objects: list, annotations: list, fields: list, tree_ids: set,
-                   match, finder, marker: str = _REDACTED_MARKER) -> dict[str, int]:
+                   match, finder, marker: str = _REDACTED_MARKER,
+                   listed: set | None = None) -> dict[str, int]:
     """Whole-value scrub (D2) of what annotations and form fields say, on
     every such dictionary in the file — on a page or off it.
 
@@ -2341,9 +2502,17 @@ def _scrub_objects(objects: list, annotations: list, fields: list, tree_ids: set
         appearances that drew it, on the field and on every widget below
         it, are dropped.
 
+    An annotation that had text scrubbed and is on no page — its id is not
+    in *listed*, the ids every page's /Annots holds — loses its appearance
+    (/AP) as well: it drew that text, no page shows it any more, and
+    nothing else would take it out of the file. One that is on a page keeps
+    its appearance; that is what the reader sees there, and if it draws a
+    term the verifier refuses the run and offers the page for flattening.
+
     Mirrors what verify_redaction reads on each surface.
     """
     counts: dict[str, int] = {}
+    scrubbed: list = []          # the annotations that had text removed
 
     def bump(key: str, n: int = 1):
         if n:
@@ -2358,6 +2527,7 @@ def _scrub_objects(objects: list, annotations: list, fields: list, tree_ids: set
                 if value is not None and _holds_term(value, finder):
                     del obj[key]
                     bump("rich_text")
+                    scrubbed.append(obj)
             except Exception:
                 pass
 
@@ -2370,6 +2540,16 @@ def _scrub_objects(objects: list, annotations: list, fields: list, tree_ids: set
                 if key in annot and match(annot[key]):
                     del annot[key]
                     bump("annotations")
+                    scrubbed.append(annot)
+            except Exception:
+                pass
+
+    if listed is not None:
+        for annot in scrubbed:
+            try:
+                if (_is_annotation(annot) and annot.is_indirect
+                        and tuple(annot.objgen) not in listed and "/AP" in annot):
+                    del annot["/AP"]
             except Exception:
                 pass
 
@@ -2418,24 +2598,26 @@ def _scrub_action_uri(action, match, depth: int = 0) -> int:
     return n
 
 
-def _scrub_embedded_file_names(doc, terms: list[str], case_sensitive: bool) -> int:
+def _scrub_embedded_file_names(doc, terms: list[str], case_sensitive: bool) -> list[str]:
     """Delete embedded files whose name matches a term (D2 whole-value),
     using PyMuPDF's embfile API — the exact names verify_redaction reads via
-    doc.embfile_names(). Returns the number removed. Runs on the open fitz
-    doc before save (fitz owns embedded-file structures cleanly)."""
+    doc.embfile_names(). Returns the names removed, so the actions that
+    opened those files can go with them (pdf_analyze.remove_embedded_files).
+    Runs on the open fitz doc before save (fitz owns embedded-file
+    structures cleanly)."""
     if not terms:
-        return 0
+        return []
     match = _make_term_matcher(terms, case_sensitive)
-    removed = 0
+    removed: list[str] = []
     try:
         names = list(doc.embfile_names())
     except Exception:
-        return 0
+        return []
     for name in names:
         try:
             if match(str(name)):
                 doc.embfile_del(name)
-                removed += 1
+                removed.append(str(name))
         except Exception:
             continue
     return removed
@@ -2526,6 +2708,48 @@ def _trailer_with_only_id(doc) -> str:
         tmp.close()
 
 
+#: How many times a page is searched and redacted: once, and then again for
+#: as long as removing text leaves new matches behind, up to this many.
+_REDACT_PASSES = 3
+
+
+def _box_key(rect) -> tuple:
+    return tuple(round(v, 2) for v in rect)
+
+
+def _redact_boxes(page, boxes: list) -> int:
+    """Redact *boxes* on *page* and return how many there were.
+
+    Form field (AcroForm widget) values live in /V and render via a
+    separate appearance stream -- apply_redactions() only strips page
+    CONTENT (text/images drawn in the content stream), so a redaction box
+    over a fillable field would otherwise leave the value fully intact and
+    extractable (verified: still readable via both the widget API and plain
+    get_text() after apply_redactions() alone). Any widget whose rect
+    intersects a box -- from a term match or a user-drawn rect -- is
+    neutralized before the content-level redaction runs.
+
+    PDF_REDACT_IMAGE_PIXELS blacks out only the pixels under each box;
+    PDF_REDACT_IMAGE_REMOVE deletes any image the box touches -- on a
+    scanned page (one full-page image) that blanks the WHOLE page while
+    still reporting success (RED-01).
+    """
+    if not boxes:
+        return 0
+    for box in boxes:
+        page.add_redact_annot(box, fill=(0, 0, 0))
+    for wdg in list(page.widgets()):
+        if any(r.intersects(wdg.rect) for r in boxes):
+            try:
+                wdg.field_value = ""
+                wdg.update()
+            except Exception:
+                pass
+            page.delete_widget(wdg)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
+    return len(boxes)
+
+
 def _refusal_message(failed) -> str:
     """One-line reason for a refused redaction, from its failed checks."""
     if failed and all(c.id == "redaction.file_id" for c in failed):
@@ -2565,8 +2789,12 @@ def redact_pdf(
     extractable from the "redacted" output.
 
     Two ways to select what to redact, combinable, at least one required:
-      * search_terms: text found via page.search_for() -- every match on
-        the page is redacted.
+      * search_terms: text found by the page-text matcher the verifier also
+        uses (pdf_verify.term_boxes, #119) -- the page's own characters
+        searched across line breaks, line-end hyphens, letter-spacing and
+        ligatures, with page.search_for()'s hits beside them. Every match
+        is redacted, widened to the whole words it touches, and the page is
+        searched again for as long as removing text leaves a new match.
       * rects: user-drawn boxes, each {"page": int (0-based), "x0", "y0",
         "x1", "y1": float} in PDF point coordinates -- for the visual
         redaction UI (Part 2); unused by the current search-term-only
@@ -2582,11 +2810,18 @@ def redact_pdf(
     what a form field says about itself, web addresses wherever they hang,
     pdfTeX's records, page labels, XFA data, attachments and signatures
     (#119; see _scrub_document_surfaces). A term anywhere else in the file
-    -- a stream held by a private key, an appearance no page shows -- has no
+    -- a stream held by a private key, an appearance a page shows -- has no
     rule: the verifier's whole-file sweep finds it and the run is refused,
     never passed. A form that exists only as XFA and holds a term in it
     raises RedactionNotPossibleError (a ValueError): it cannot be
     term-redacted.
+
+    On every run, by term or by box, the structure tree's references to the
+    original of a form or image the pages now have a redacted copy of are
+    removed (_drop_stale_structure_refs, counted as ``structure_refs``):
+    they kept the unredacted original in the output. And a file MuPDF
+    repairs while it is being saved, which undoes the redaction, is
+    redacted again from the repaired copy.
 
     Verify, then commit. The redacted candidate is written to a temp file
     beside output_path, given a fresh content-derived trailer /ID as its last
@@ -2627,76 +2862,62 @@ def redact_pdf(
         doc.close()
         raise ValueError(f"Could not read the source file's identity: {exc}") from exc
 
-    total = len(doc)
     rects_by_page: dict[int, list[dict]] = {}
     for r in (rects or []):
         rects_by_page.setdefault(int(r["page"]), []).append(r)
+    target = list(pages) if pages is not None else list(range(len(doc)))
 
-    target = list(pages) if pages is not None else list(range(total))
-    hit_count = 0
-    pages_touched: set[int] = set()
-
-    for i, pno in enumerate(target):
-        if cancel and cancel.is_set():
-            doc.close()
-            raise ValueError("Cancelled")
-        if on_progress:
-            on_progress(i + 1, len(target))
-        if pno < 0 or pno >= total:
-            continue
-
-        page = doc[pno]
-        added = 0
-        page_redaction_rects: list[fitz.Rect] = []
-        for term in (search_terms or []):
-            if not term.strip():
+    def redact_pages(doc) -> tuple[int, set]:
+        """Redact the page content of *doc*; returns (rectangles drawn,
+        pages touched)."""
+        total, drawn, touched = len(doc), 0, set()
+        for i, pno in enumerate(target):
+            if cancel and cancel.is_set():
+                doc.close()
+                raise ValueError("Cancelled")
+            if on_progress:
+                on_progress(i + 1, len(target))
+            if pno < 0 or pno >= total:
                 continue
-            # search_for() has no case-sensitivity flag in PyMuPDF -- it's
-            # always case-insensitive at the matching level (verified: no
-            # TEXT_* flag affects it). For case_sensitive=True, filter each
-            # match by re-extracting the exact text under its own rect and
-            # requiring an exact-case substring match, since the plain
-            # "flags" toggle this was originally written with does nothing.
-            for r in page.search_for(term, flags=fitz.TEXT_DEHYPHENATE):
-                if case_sensitive and term not in page.get_textbox(r):
-                    continue
-                page.add_redact_annot(r, fill=(0, 0, 0))
-                page_redaction_rects.append(r)
-                added += 1
-        for rr in rects_by_page.get(pno, []):
-            rect = fitz.Rect(rr["x0"], rr["y0"], rr["x1"], rr["y1"])
-            if not rect.is_empty and rect.is_valid:
-                page.add_redact_annot(rect, fill=(0, 0, 0))
-                page_redaction_rects.append(rect)
-                added += 1
 
-        if added:
-            # Form field (AcroForm widget) values live in /V and render via
-            # a separate appearance stream -- apply_redactions() only
-            # strips page CONTENT (text/images drawn in the content
-            # stream), so a redaction box over a fillable field would
-            # otherwise leave the value fully intact and extractable
-            # (verified: still readable via both the widget API and plain
-            # get_text() after apply_redactions() alone). Neutralize any
-            # widget whose rect intersects a redaction area -- from either
-            # a search-term match or a user-drawn rect -- before the
-            # content-level redaction runs.
-            for wdg in list(page.widgets()):
-                if any(r.intersects(wdg.rect) for r in page_redaction_rects):
-                    try:
-                        wdg.field_value = ""
-                        wdg.update()
-                    except Exception:
-                        pass
-                    page.delete_widget(wdg)
+            page = doc[pno]
+            # Term hits come from the one matcher the verifier also uses
+            # (pdf_verify.term_boxes): its own views of the page's
+            # characters, and search_for's hits beside them, each widened to
+            # the whole words it touches. It honours case_sensitive itself.
+            boxes: list[fitz.Rect] = term_boxes(page, scrub_terms, case_sensitive)
+            for rr in rects_by_page.get(pno, []):
+                rect = fitz.Rect(rr["x0"], rr["y0"], rr["x1"], rr["y1"])
+                if not rect.is_empty and rect.is_valid:
+                    boxes.append(rect)
 
-            # PDF_REDACT_IMAGE_PIXELS blacks out only the pixels under each
-            # redaction rect; PDF_REDACT_IMAGE_REMOVE deletes any image the
-            # rect touches -- on a scanned page (one full-page image) that
-            # blanks the WHOLE page while still reporting success (RED-01).
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
-            hit_count += added
-            pages_touched.add(pno)
+            added = _redact_boxes(page, boxes)
+            # Taking a word out can leave its neighbours reading as the term
+            # ("a" [removed] "b" for the term "a b"). The verifier would find
+            # that and refuse; look again and box it instead. Bounded: a box
+            # that was already applied and removed nothing is not tried twice.
+            applied = {_box_key(b) for b in boxes}
+            for _ in range(_REDACT_PASSES - 1):
+                if not (added and scrub_terms):
+                    break
+                again = [b for b in term_boxes(page, scrub_terms, case_sensitive)
+                         if _box_key(b) not in applied]
+                if not again:
+                    break
+                applied.update(map(_box_key, again))
+                added += _redact_boxes(page, again)
+            if added:
+                drawn += added
+                touched.add(pno)
+        return drawn, touched
+
+    # MuPDF checks a file's objects as it comes to read them. One it finds
+    # damaged makes it go back to the file and rebuild everything from there
+    # ("repairing PDF document") — and what had been changed in memory is
+    # gone, without a word. If that happens between here and the end of the
+    # save below, the redaction is what is gone.
+    repaired_at_start = bool(doc.is_repaired)
+    hit_count, pages_touched = redact_pages(doc)
 
     # The page-content redaction is done; now widen the scrub and write the
     # output atomically. Saved even when hit_count == 0 -- a term can live
@@ -2723,10 +2944,23 @@ def redact_pdf(
         # Embedded files are scrubbed on the open fitz doc (its embfile API
         # matches exactly what verify_redaction reads); every other
         # document-level surface is scrubbed via pikepdf on the saved temp.
-        emb_hits = _scrub_embedded_file_names(doc, scrub_terms, case_sensitive)
+        emb_gone = _scrub_embedded_file_names(doc, scrub_terms, case_sensitive)
         work = _mktmp()
         doc.save(work, garbage=4, deflate=True, clean=True)
+        lost = bool(doc.is_repaired) and not repaired_at_start
         doc.close()
+        if lost:
+            # Repaired on the way (see above): what was just written is the
+            # source, mended, with nothing redacted. It is a sound file now,
+            # so the same work done on it holds. Once: it cannot be repaired
+            # twice.
+            doc = fitz.open(work)
+            hit_count, pages_touched = redact_pages(doc)
+            emb_gone = _scrub_embedded_file_names(doc, scrub_terms, case_sensitive)
+            work = _mktmp()
+            doc.save(work, garbage=4, deflate=True, clean=True)
+            doc.close()
+        emb_hits = len(emb_gone)
 
         if hit_count:
             surface_counts["page_content"] = hit_count
@@ -2734,7 +2968,8 @@ def redact_pdf(
             surface_counts["embedded_files"] = emb_hits
         # The temp is fitz-saved from the authenticated doc — always
         # plaintext, so the scrub (and verify below) need no password.
-        doc_scrub = _scrub_document_surfaces(work, scrub_terms, case_sensitive)
+        doc_scrub = _scrub_document_surfaces(work, scrub_terms, case_sensitive,
+                                             gone_attachments=emb_gone)
         for k, v in doc_scrub.items():
             surface_counts[k] = surface_counts.get(k, 0) + v
 
@@ -2756,6 +2991,12 @@ def redact_pdf(
         # this pass the output stays linkable to the original.
         candidate = _mktmp()
         with pikepdf.open(final_src) as pdf:
+            # The original of a form or an image the pages now have a
+            # redacted copy of must not ride along on the structure tree.
+            # Here, not in the scrub: a box drawn by hand leaves one too.
+            stale = _drop_stale_structure_refs(pdf)
+            if stale:
+                surface_counts["structure_refs"] = stale
             save_with_content_id(pdf, candidate, fix_metadata_version=False)
 
         # Verify, then commit (fail-closed, #99): every target must be

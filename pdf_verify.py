@@ -32,6 +32,14 @@ transform raises, with the report, having touched nothing at the destination:
     data, a layer's name, a form no page paints. It does not read images,
     the internals of fonts and colour profiles, or PDF names (see the note
     above :func:`_term_sweep_check` for why, and for what that leaves).
+    Page text is searched by :class:`PageText`, the one matcher
+    ``redact_pdf`` also boxes by (:func:`term_boxes`): the page's
+    characters with their boxes, looked at in four views so that a term is
+    found across a line break, a line-end hyphen, letter-spacing and a
+    ligature, where PyMuPDF's search_for is not. It reads text a clipping
+    path hides. It cannot read text outside the page's visible box, or
+    remove what an annotation's appearance draws: those are left to the
+    raw-content check and the sweep, which refuse the run.
   - :func:`verify_sanitization` — re-runs the ``pdf_analyze`` audit on the
     output and asserts absent exactly the finding categories the enabled
     sanitize options promised to remove (expectations-based — anything else
@@ -95,6 +103,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional
@@ -448,17 +457,495 @@ class TermFinder:
         return bool(self.find(raw))
 
 
-def _term_in_page_text(page, text: str, term: str,
-                       case_sensitive: bool) -> tuple[bool, Optional[str]]:
+# ════════════════════════════════════════════════════════════════════
+#  The page-text matcher (#119, D3)
+# ════════════════════════════════════════════════════════════════════
+#
+#  One matcher for the text of a page, used on both sides: redact_pdf boxes
+#  what it finds, and verify_redaction confirms it finds nothing. It reads
+#  the page's characters with their boxes (PyMuPDF's "rawdict") and does
+#  its own matching, because search_for cannot be relied on for it. On
+#  PyMuPDF 1.27 search_for finds no term that is broken across a line after
+#  a hyphen, in any mode, and no letter-spaced one. On 2.1 it finds the
+#  typesetter's hyphenation only, and its hit can stop one letter short of
+#  the word.
+#
+#  A term is looked for in four views of the page's text:
+#
+#    spaced        every run of whitespace, a line break included, is one
+#                  space — "Dana" at the end of a line and "Whitfield" at
+#                  the start of the next;
+#    dehyphenated  as spaced, but a hyphen that ends a line goes, with the
+#                  break — "Dana Whit-" / "field";
+#    joined        as spaced, but the break after a hyphen that ends a line
+#                  goes and the hyphen stays — "4455-" / "887";
+#    solid         no whitespace at all — "C O N F I D E N T I A L", a
+#                  number printed in groups, an address broken at the end
+#                  of a line with no hyphen. Accepted only where the match
+#                  is whole words run together (PageText._solid_ok).
+#
+#  Both sides are folded the same way first: NFKC (a ligature is its
+#  letters, a full-width letter the plain one, a no-break space a space),
+#  the hyphen characters U+2010 and U+2011 become "-", and characters that
+#  take no room — the soft hyphen, zero-width spaces and joiners, direction
+#  marks — are dropped. Case is folded unless the search is case-sensitive.
+
+#: Characters with no width of their own, dropped before matching.
+_INVISIBLE = frozenset(map(chr, (
+    0x00AD, 0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF,                    # soft hyphen, zero width
+    0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,            # direction marks
+    0x2066, 0x2067, 0x2068, 0x2069)))
+_SOFT_HYPHEN = chr(0x00AD)
+_FOLD_TABLE = {0x2010: "-", 0x2011: "-", **{ord(c): None for c in _INVISIBLE}}
+
+#: PageText views.
+_SPACED, _DEHYPHENATED, _JOINED, _SOLID = range(4)
+
+#: Text flags for the matcher. What page.get_text() reads by default, less
+#: one: TEXT_MEDIABOX_CLIP, which also drops text a clipping path hides. A
+#: stamp cut off at "APPRO" by its clip still has "APPROVED" in the content
+#: stream, where any other extractor reads it — and search_for, as redact_pdf
+#: always called it, reads it too. Ligatures are kept whole (one character,
+#: one box) and folded here.
+_MATCH_FLAGS = (fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE
+                | getattr(fitz, "TEXT_CID_FOR_UNKNOWN_UNICODE", 0))    # not in old PyMuPDF
+
+
+#: What the matcher needs of one character, worked out once per character
+#: and not once per occurrence: (is whitespace, joins a word together). And
+#: the folded form of each character or accented letter, case-sensitively
+#: (True) and not. A page is some thousands of characters from an alphabet
+#: of a hundred.
+_CHAR_KINDS: dict = {}
+_FOLDS: dict = {False: {}, True: {}}
+
+
+def _fold_text(text: str, case_sensitive: bool) -> str:
+    """*text* as the matcher compares it (see the note above)."""
+    text = unicodedata.normalize("NFKC", text).translate(_FOLD_TABLE)
+    if not case_sensitive:
+        text = unicodedata.normalize("NFKC", text.casefold())
+    return text
+
+
+def _unspaced_script(ch: str) -> bool:
+    """True for a character of a script written without spaces between
+    words — Chinese, Japanese, Thai, Lao, Khmer, Burmese, Tibetan. A hit
+    there is not widened to "the whole word": the nearest spaces are the
+    ends of the sentence."""
+    o = ord(ch)
+    return (0x2E80 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF or 0xFF66 <= o <= 0xFF9F
+            or 0x20000 <= o <= 0x3FFFF or 0x0E00 <= o <= 0x0FFF
+            or 0x1000 <= o <= 0x109F or 0x1780 <= o <= 0x17FF)
+
+
+class PageText:
+    """The characters of one page with their boxes, and the views of them a
+    term is searched in. Built once per page; any number of terms can then
+    be looked for.
+
+    ``spans(term)`` gives the hits as (first, last) character positions;
+    ``boxes(spans)`` turns hits into rectangles, each hit widened to the
+    whole words it touches and cut into one rectangle per line;
+    ``find(term)`` is the verifier's question. ``placed(quad, term)`` puts
+    a hit found some other way (search_for) on the same characters.
+    """
+
+    def __init__(self, page, case_sensitive: bool = False):
+        self._case = case_sensitive
+        self._chars: list[str] = []
+        self._boxes: list[tuple] = []
+        self._line: list[int] = []          # which line each character is on
+        self._space: list[bool] = []
+        self._joins: list[bool] = []        # part of a word that runs to its neighbours
+        self._lines: list[tuple] = []       # (first, end, bbox) of each line
+        #: (kind, text, first character, last character). Kinds: "c" a
+        #: character or a base with its accents, folded; "s" whitespace; "h"
+        #: a soft hyphen; "b" a line break — its text says how the line
+        #: ended: "hard" on a hyphen, "soft" on a soft hyphen, or "".
+        self._toks: list[tuple] = []
+        self._views: dict = {}
+        self._cuts: list[tuple] = []        # see _spaced
+        self._broken = False                # some line ends on a hyphen
+        chars, boxes, line_of = self._chars, self._boxes, self._line
+        space, joins, kinds = self._space, self._joins, _CHAR_KINDS
+        raw = page.get_text("rawdict", flags=_MATCH_FLAGS)
+        for block in raw.get("blocks", ()):
+            if block.get("type", 0) != 0:
+                continue
+            for line in block.get("lines", ()):
+                first, number = len(chars), len(self._lines)
+                for span in line.get("spans", ()):
+                    for ch in span.get("chars", ()):
+                        c = ch.get("c")
+                        if not c:
+                            continue
+                        kind = kinds.get(c)
+                        if kind is None:
+                            white = unicodedata.normalize("NFKC", c).isspace()
+                            kind = kinds[c] = (white, not white and not _unspaced_script(c))
+                        chars.append(c)
+                        boxes.append(ch.get("bbox") or (0, 0, 0, 0))
+                        line_of.append(number)
+                        space.append(kind[0])
+                        joins.append(kind[1])
+                if len(chars) > first:
+                    self._add_line(first, len(chars))
+
+    def _add_line(self, first: int, end: int) -> None:
+        boxes = [b for b in self._boxes[first:end] if b[2] > b[0] and b[3] > b[1]]
+        bbox = ((min(b[0] for b in boxes), min(b[1] for b in boxes),
+                 max(b[2] for b in boxes), max(b[3] for b in boxes)) if boxes else None)
+        self._lines.append((first, end, bbox))
+        chars, folds, combining = self._chars, _FOLDS[self._case], unicodedata.combining
+        if len(folds) > 100000:             # a long-lived process, many documents
+            folds.clear()
+        toks, start, i = self._toks, len(self._toks), first
+        while i < end:
+            c = chars[i]
+            if c == _SOFT_HYPHEN:
+                toks.append(("h", "", i, i))
+                i += 1
+                continue
+            j = i + 1
+            while j < end and combining(chars[j]):
+                j += 1
+            if j > i + 1:
+                c = "".join(chars[i:j])
+            folded = folds.get(c)
+            if folded is None:
+                folded = _fold_text(c, self._case)
+                # " " for whitespace, "" for what folds away to nothing.
+                folded = folds[c] = " " if folded.isspace() else "".join(folded.split())
+            if folded == " ":
+                toks.append(("s", "", i, j - 1))
+            elif folded:
+                toks.append(("c", folded, i, j - 1))
+            i = j
+        # How the line ends decides what its break means in two of the views.
+        ending, k = "", len(toks) - 1
+        while k >= start and toks[k][0] == "s":
+            k -= 1
+        if k >= start and toks[k][0] == "h":
+            ending = "soft"
+        elif (k > start and toks[k][:2] == ("c", "-") and toks[k - 1][0] == "c"
+              and toks[k - 1][1][-1].isalnum()):
+            ending = "hard"
+        self._broken = self._broken or bool(ending)
+        toks.append(("b", ending, -1, -1))
+
+    # -- views ---------------------------------------------------------
+
+    def _spaced(self) -> tuple[str, list]:
+        """The spaced view, built from the tokens; the other three are cut
+        out of it. Notes in ``_cuts``, for each line that ends on a hyphen
+        and runs straight on into the next: where that hyphen is in the
+        text (-1 for a soft hyphen, which is not in it) and where the space
+        that stands for the line break is."""
+        text: list[str] = []
+        owner: list[int] = []
+        pending, hyphen = False, None       # hyphen: of a broken line, until the next character
+        for k, (kind, value, _a0, _a1) in enumerate(self._toks):
+            if kind == "c":
+                if pending and text:
+                    if hyphen is not None:
+                        self._cuts.append((hyphen, len(text)))
+                    text.append(" ")
+                    owner.append(-1)
+                pending, hyphen = False, None
+                if len(value) == 1:
+                    text.append(value)
+                    owner.append(k)
+                else:
+                    text.extend(value)
+                    owner.extend([k] * len(value))
+            elif kind == "s":
+                pending = True      # and a hyphen stays noted: the next line may be indented
+            elif kind == "b":
+                pending = True
+                if value and text:
+                    hyphen = len(text) - 1 if value == "hard" else -1
+        return "".join(text), owner
+
+    def _view(self, mode: int) -> tuple[str, list]:
+        """(text, owner): the page's text in view *mode*, and for each of its
+        characters the token it came from (-1 for a space)."""
+        if mode not in self._views:
+            if _SPACED not in self._views:
+                self._views[_SPACED] = self._spaced()
+            text, owner = self._views[_SPACED]
+            if mode == _SOLID:
+                self._views[mode] = (text.replace(" ", ""), [k for k in owner if k >= 0])
+            elif mode != _SPACED:
+                # Without the break's space; dehyphenated, without the hyphen too.
+                gone = sorted(i for hyphen, gap in self._cuts
+                              for i in ((hyphen, gap) if mode == _DEHYPHENATED else (gap,))
+                              if i >= 0)
+                parts, owners, prev = [], [], 0
+                for i in gone:
+                    parts.append(text[prev:i])
+                    owners.extend(owner[prev:i])
+                    prev = i + 1
+                parts.append(text[prev:])
+                owners.extend(owner[prev:])
+                self._views[mode] = ("".join(parts), owners)
+        return self._views[mode]
+
+    def _apart(self, k0: int, k1: int) -> bool:
+        """True if whitespace or a line break lies between tokens *k0* <
+        *k1*: they belong to different words."""
+        return any(self._toks[k][0] in "sb" for k in range(k0 + 1, k1))
+
+    def _solid_ok(self, at: int, end: int) -> bool:
+        """Is the match text[at:end] of the solid view to be believed?
+
+        With every space gone, any neighbours read as one word, so the view
+        is kept to whole words run together: the match has to start at the
+        first letter or digit of a word and end at the last one of a word,
+        a word being what stands between two spaces. Punctuation at the
+        edge of the word may be left outside the match ("(4111 1111)."),
+        letters and digits may not: the term "00000" is not in "1.0000
+        0.2000", though the digits are there in a row once the space is
+        gone. (Taking a full stop for the edge of a word found exactly that
+        in a real file's table of numbers, and nothing true.)
+        """
+        text, owner = self._view(_SOLID)
+        i = at
+        while i > 0 and (owner[i - 1] == owner[i] or not self._apart(owner[i - 1], owner[i])):
+            i -= 1
+            if text[i].isalnum():
+                return False
+        i = end - 1
+        while i + 1 < len(text) and (owner[i + 1] == owner[i]
+                                     or not self._apart(owner[i], owner[i + 1])):
+            i += 1
+            if text[i].isalnum():
+                return False
+        return True
+
+    # -- matching ------------------------------------------------------
+
+    def spans(self, term: str) -> list[tuple[int, int]]:
+        """Every hit for *term*, as (first, last) character positions, in
+        reading order. A hit found in more than one view is one hit."""
+        folded = _fold_text(term, self._case)
+        spaced, solid = " ".join(folded.split()), "".join(folded.split())
+        if not solid:
+            return []
+        found: set = set()
+        modes = (_SPACED, _DEHYPHENATED, _JOINED) if self._broken else (_SPACED,)
+        for mode in modes + (_SOLID,):
+            text, owner = self._view(mode)
+            needle = solid if mode == _SOLID else spaced
+            at = text.find(needle)
+            while at >= 0:
+                end = at + len(needle)
+                if mode != _SOLID or self._solid_ok(at, end):
+                    found.add((self._toks[owner[at]][2], self._toks[owner[end - 1]][3]))
+                at = text.find(needle, at + 1)
+        return sorted(found)
+
+    def find(self, term: str) -> bool:
+        """True if *term* is on the page, in any view."""
+        return bool(self.spans(term))
+
+    def text_of(self, span: tuple[int, int]) -> str:
+        """The page's own characters from *span*'s first to its last."""
+        return "".join(self._chars[span[0]:span[1] + 1])
+
+    def spans_under(self, quad) -> list[tuple[int, int]]:
+        """The characters whose centre is inside *quad* — a hit from
+        search_for(quads=True) — as runs: one span for each stretch of a
+        line that is inside without a break. The quad and not its bounding
+        rectangle: the rectangle round a hit in slanted text takes in
+        whatever else is printed near it."""
+        corners = [(p.x, p.y) for p in (quad.ul, quad.ur, quad.lr, quad.ll)]
+        x0, x1 = min(c[0] for c in corners), max(c[0] for c in corners)
+        y0, y1 = min(c[1] for c in corners), max(c[1] for c in corners)
+
+        def inside(i: int) -> bool:
+            if self._space[i]:
+                return False
+            b = self._boxes[i]
+            px, py = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            if not (x0 <= px <= x1 and y0 <= py <= y1):
+                return False
+            sides = [(bx - ax) * (py - ay) - (by - ay) * (px - ax)
+                     for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1],
+                                                   strict=True)]
+            return all(s >= -1e-6 for s in sides) or all(s <= 1e-6 for s in sides)
+
+        found = []
+        for first, end, bbox in self._lines:
+            if bbox is None or bbox[2] < x0 or bbox[0] > x1 or bbox[3] < y0 or bbox[1] > y1:
+                continue
+            start = last = None
+            for i in range(first, end):
+                if inside(i):
+                    start, last = (i if start is None else start), i
+                elif start is not None and not self._space[i]:
+                    found.append((start, last))
+                    start = None
+            if start is not None:
+                found.append((start, last))
+        return found
+
+    def placed(self, quad, term: str) -> list[tuple[int, int]]:
+        """Where a search_for hit for *term* lies on the page's characters:
+        the spans under *quad* that read as the term, or [] if none does.
+
+        A quad takes in whatever else is printed over the hit, and its edge
+        can catch a neighbour's last letter, so the characters are asked
+        what they say. A run that holds the whole term is cut down to the
+        term. Failing that, one hit can be a piece of the term — search_for
+        cuts a hit at each line, and into single glyphs in right-to-left
+        text — and the longest run that is a piece of it is taken, and only
+        that one.
+        """
+        key = "".join(_fold_text(term, self._case).split())
+        whole, pieces = [], []
+        for span in self.spans_under(quad):
+            text, owner = [], []
+            for i in range(span[0], span[1] + 1):
+                if not self._space[i]:
+                    folded = "".join(_fold_text(self._chars[i], self._case).split())
+                    text.extend(folded)
+                    owner.extend([i] * len(folded))
+            text = "".join(text)
+            at = text.find(key) if key else -1
+            if at >= 0:
+                whole.append((owner[at], owner[at + len(key) - 1]))
+            elif any(t and t in key for t in (text, text.rstrip("-"))):
+                pieces.append(span)
+        return whole or sorted(pieces, key=lambda s: s[0] - s[1])[:1]
+
+    # -- boxes ---------------------------------------------------------
+
+    def widened(self, span: tuple[int, int]) -> tuple[int, int]:
+        """*span* grown to the whole words it touches: out to the nearest
+        whitespace on the same line, on each side. Not through a script
+        written without spaces (_unspaced_script)."""
+        a0, a1 = span
+        line, joins = self._line, self._joins
+        while a0 > 0 and line[a0 - 1] == line[a0] and joins[a0 - 1] and joins[a0]:
+            a0 -= 1
+        last = len(line) - 1
+        while a1 < last and line[a1 + 1] == line[a1] and joins[a1 + 1] and joins[a1]:
+            a1 += 1
+        return a0, a1
+
+    def boxes(self, spans) -> list:
+        """One rectangle per line of each hit in *spans*, each hit widened
+        to whole words first. Hits that come to the same rectangle — two
+        views of one occurrence, a search_for hit and the matcher's own —
+        are one rectangle."""
+        rects, seen = [], set()
+        for span in sorted(set(spans)):
+            a0, a1 = self.widened(span)
+            i = a0
+            while i <= a1:
+                j = i
+                while j < a1 and self._line[j + 1] == self._line[i]:
+                    j += 1
+                part = [self._boxes[n] for n in range(i, j + 1) if not self._space[n]
+                        and self._boxes[n][2] > self._boxes[n][0]
+                        and self._boxes[n][3] > self._boxes[n][1]]
+                if part:
+                    rect = (min(b[0] for b in part), min(b[1] for b in part),
+                            max(b[2] for b in part), max(b[3] for b in part))
+                    key = tuple(round(v, 2) for v in rect)
+                    if key not in seen:
+                        seen.add(key)
+                        rects.append(fitz.Rect(rect))
+                i = j + 1
+        return rects
+
+
+def term_boxes(page, terms, case_sensitive: bool = False) -> list:
+    """The rectangles to redact on *page* for *terms*: the matcher's hits
+    and search_for's, together, each widened to the whole words it touches
+    (PageText.boxes).
+
+    search_for is kept beside the matcher because it is MuPDF's own reading
+    of the page and may see what the views do not. Each of its hits is put
+    back on the page's characters — those under the hit's quad that read as
+    the term or a piece of it (PageText.placed) — so that a hit that stops
+    short of the word (PyMuPDF 2.1 on a hyphenated word) is widened like
+    any other, and so that an occurrence found both ways is one rectangle.
+    A hit whose characters the matcher has already found adds nothing and
+    is dropped. One that cannot be placed on characters is passed on as the
+    rectangle search_for gave, unless every character under it is already
+    in a rectangle.
+
+    search_for has no case-sensitive mode. In a case-sensitive search the
+    characters are compared in their own case, so a hit in another case is
+    not placed, and is dropped; one with no character under it at all is
+    kept only if the text in its rectangle holds the term exactly. (That
+    last test alone, on every hit, is what redact_pdf used to do. A hit's
+    rectangle is as tall as the line and reaches into the next one, so the
+    term in the right case on the line below made a hit in the wrong case
+    pass.)
+    """
+    terms = [t for t in (terms or []) if t and t.strip()]
+    if not terms:
+        return []
+    text = PageText(page, case_sensitive)
+    spans: list = []
+    found: list = []        # search_for's hits, placed on characters
+    loose: list = []        # ... and the ones that could not be
+    for term in terms:
+        spans.extend(text.spans(term))
+        for quad in page.search_for(term, flags=fitz.TEXT_DEHYPHENATE, quads=True):
+            placed = text.placed(quad, term)
+            if placed:
+                found.extend(placed)
+            elif not case_sensitive:
+                loose.append(quad)
+            elif not text.spans_under(quad) and term in page.get_textbox(quad.rect):
+                # Nothing under it to ask. (With characters under it that
+                # do not read as the term, it is the term in another case.)
+                loose.append(quad)
+    covered: set = set()         # every character some rectangle will take
+
+    def cover(span) -> None:
+        a0, a1 = text.widened(span)
+        covered.update(i for i in range(a0, a1 + 1) if not text._space[i])
+
+    for span in spans:
+        cover(span)
+    for span in found:
+        if not all(i in covered or text._space[i] for i in range(span[0], span[1] + 1)):
+            spans.append(span)
+            cover(span)
+    rects = text.boxes(spans)
+    seen = {tuple(round(v, 2) for v in r) for r in rects}
+    for quad in loose:
+        under = [i for a0, a1 in text.spans_under(quad) for i in range(a0, a1 + 1)
+                 if not text._space[i]]
+        key = tuple(round(v, 2) for v in quad.rect)
+        if key in seen or (under and all(i in covered for i in under)):
+            continue
+        seen.add(key)
+        rects.append(fitz.Rect(quad.rect))
+    return rects
+
+
+def _term_in_page_text(page, text: str, term: str, case_sensitive: bool,
+                       chars: Optional[PageText] = None) -> tuple[bool, Optional[str]]:
     """(found, error) — is *term* extractable from *page*?
 
-    Three views of the extracted text are searched: as-is, whitespace-
-    normalized, and dehyphenated-then-normalized — a term wrapped across a
-    line break appears with '\\n' (or '-\\n') where the caller's term has a
-    space (or nothing), and without normalization an exact-case cross-line
-    occurrence would be invisible to case_sensitive matching (the per-rect
-    search_for confirm below sees only one line's fragment per hit rect, so
-    it can never confirm a multi-line match by itself).
+    The matcher is asked first (*chars*, the page's PageText): the same
+    views redact_pdf boxed by, so what it would have boxed and did not
+    remove is found here.
+
+    Behind it, the older checks. Three views of the extracted text are
+    searched: as-is, whitespace-normalized, and dehyphenated-then-
+    normalized — a term wrapped across a line break appears with '\\n' (or
+    '-\\n') where the caller's term has a space (or nothing), and without
+    normalization an exact-case cross-line occurrence would be invisible to
+    case_sensitive matching (the per-rect search_for confirm below sees only
+    one line's fragment per hit rect, so it can never confirm a multi-line
+    match by itself).
 
     search_for() (with TEXT_DEHYPHENATE, matching redact_pdf's own search)
     additionally catches kerned text the plain views miss. It is always
@@ -468,6 +955,8 @@ def _term_in_page_text(page, text: str, term: str,
     *error* is set when search_for itself raised, so the caller records a
     failed-verification line instead of passing vacuously (fail-closed).
     """
+    if chars is not None and chars.find(term):
+        return True, None
     norm_term = " ".join(term.split())
     views = (text,
              " ".join(text.split()),
@@ -616,6 +1105,14 @@ def _term_surface_checks(doc, output_path: str, terms: list[str],
             text = ""
             page_text_ev.append(f"page text on page {pno} could not be read "
                                 f"for verification: {exc}")
+        try:
+            chars = PageText(page, case_sensitive)
+        except Exception as exc:
+            # Not a pass: the matcher did not look. Page-attributed, like
+            # the line above, so the page can be offered for flattening.
+            chars = None
+            page_text_ev.append(f"page text on page {pno} could not be read character "
+                                f"by character for verification ({type(exc).__name__})")
         blobs = page_content_blobs(doc, page)
         good = [bytes(b) for b in blobs if isinstance(b, (bytes, bytearray))]
         if len(good) != len(blobs):
@@ -645,7 +1142,7 @@ def _term_surface_checks(doc, output_path: str, terms: list[str],
                              f"for verification: {exc}")
 
         for term in terms:
-            found, err = _term_in_page_text(page, text, term, case_sensitive)
+            found, err = _term_in_page_text(page, text, term, case_sensitive, chars)
             if err:
                 page_text_ev.append(f"page text on page {pno} could not be "
                                     f"fully verified for term '{term}': {err}")
