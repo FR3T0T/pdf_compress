@@ -15,8 +15,16 @@ pip install -r requirements.txt
 Or manually (core):
 
 ```bash
-pip install pikepdf pillow PySide6 PyMuPDF argon2-cffi pycryptodome cryptography
+pip install pikepdf pillow PySide6 "PyMuPDF==1.27.2.3" argon2-cffi pycryptodome cryptography
 ```
+
+**The PDF library is pinned to PyMuPDF 1.27.2.3.** Redaction is tested on
+that version and supported on it alone. PyMuPDF 1.28 removes other text from
+a page when it redacts — in some files, thousands of words that had nothing
+to do with what was redacted — so Redact refuses to run on it. On 2.x Redact
+runs, but the text that follows a removed word on its line can move along
+it, and the result says so. The test suite also runs on 2.1 as an early
+warning.
 
 **Optional dependencies:**
 - [Ghostscript](https://www.ghostscript.com/releases/gsdnld.html) — font subsetting (auto-detected if on PATH)

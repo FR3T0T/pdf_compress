@@ -385,7 +385,8 @@ class TestAnAnnotationUnderABox:
         res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
         assert res.verification["verified"] is True
         assert _subtypes(out) == ["/Link"] * 200
-        assert "annotations_removed" not in res.surface_counts      # a link is not counted
+        assert "annotations_removed" not in res.surface_counts      # a link is counted apart
+        assert res.surface_counts.get("links_removed") == 2         # R4
 
     def test_a_hidden_one_goes_too(self, tmp_path):
         src = _pdf(tmp_path / "src.pdf", lambda pdf: _on_page(pdf, _stamp(pdf, F=2)))
@@ -761,6 +762,194 @@ class TestNoStreamIsKeptByTheStructureTreeAlone:
         failed = [c["id"] for c in ei.value.report["checks"] if not c["passed"]]
         assert failed == [self.CHECK] and ei.value.flatten_pages is None
         assert not os.path.exists(out)
+
+
+# ── R4. Nothing that left a page is kept by the structure tree ───────────
+
+#: The word each of these annotations holds, and the kinds of annotation.
+HELD = "Harbour"
+KINDS = ["stamp", "link", "field", "field shown by a kid widget"]
+
+
+def _annotation(pdf, kind: str):
+    """An annotation of *kind* where _stamp puts its stamp, holding HELD in
+    everything it has: its text, its appearance, its address or its value."""
+    if kind == "stamp":
+        return _stamp(pdf, f"approved {HELD}", Contents=String(f"note {HELD}"))
+    if kind == "link":
+        return pdf.make_indirect(Dictionary(
+            Type=Name.Annot, Subtype=Name.Link, Rect=STAMP_RECT, Contents=String(f"go to {HELD}"),
+            A=Dictionary(S=Name.URI, URI=String(f"https://example.com/{HELD}")),
+            AP=Dictionary(N=_drawn(pdf, f"link {HELD}"))))
+    form = Dictionary(DA=String("/Helv 12 Tf 0 g"), DR=Dictionary(Font=Dictionary(Helv=_font(pdf))))
+    widget = pdf.make_indirect(Dictionary(
+        Type=Name.Annot, Subtype=Name.Widget, Rect=STAMP_RECT, DA=String("/Helv 12 Tf 0 g"),
+        P=pdf.pages[0].obj, AP=Dictionary(N=_drawn(pdf, f"{HELD} Ltd"))))
+    if kind == "field":
+        widget["/FT"], widget["/T"], widget["/V"] = Name.Tx, String("who"), String(f"{HELD} Ltd")
+        form["/Fields"] = Array([widget])
+    else:
+        parent = pdf.make_indirect(Dictionary(FT=Name.Tx, T=String("who"), V=String(f"{HELD} Ltd"),
+                                              Kids=Array([widget])))
+        widget["/Parent"] = parent
+        form["/Fields"] = Array([parent])
+    pdf.Root["/AcroForm"] = form
+    return widget
+
+
+def _tag(pdf, annot) -> None:
+    """A tagged file's structure tree, with an element whose content is
+    *annot* (an object reference to it)."""
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    elem = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Annot, P=root,
+                                        Pg=pdf.pages[0].obj,
+                                        K=Dictionary(Type=Name.OBJR, Obj=annot,
+                                                     Pg=pdf.pages[0].obj)))
+    root["/K"] = Array([elem])
+    root["/ParentTree"] = Dictionary(Nums=Array([0, elem]))
+    annot["/StructParent"] = 0
+    pdf.Root["/StructTreeRoot"] = root
+    pdf.Root["/MarkInfo"] = Dictionary(Marked=True)
+
+
+def _object_refs(path) -> int:
+    """How many object references the structure tree still makes."""
+    with pikepdf.open(path) as pdf:
+        stack, found = [pdf.Root.get("/StructTreeRoot")], 0
+        while stack:
+            elem = stack.pop()
+            if not isinstance(elem, pikepdf.Dictionary):
+                continue
+            kids = elem.get("/K")
+            for kid in (kids if isinstance(kids, pikepdf.Array) else [kids]):
+                if isinstance(kid, pikepdf.Dictionary):
+                    found += "/Obj" in kid
+                    stack.append(kid)
+        return found
+
+
+def _annotations_in_the_file(path) -> list:
+    """The /Subtype of every annotation dictionary the file still holds,
+    on a page or not — a look of this file's own."""
+    with pikepdf.open(path) as pdf:
+        return sorted(str(o.get("/Subtype")) for o in pdf.objects
+                      if isinstance(o, pikepdf.Dictionary) and "/Rect" in o
+                      and str(o.get("/Subtype", "")) in ("/Stamp", "/Link", "/Widget"))
+
+
+@pytest.mark.integration
+class TestNothingThatLeftAPageIsKeptByTheTree:
+    """An annotation or a form field taken off its page stayed in a tagged
+    file, whole, because the structure tree pointed at it: a stamp's
+    appearance and text, a link's address, a field's value. The run
+    verified. Every object reference to an annotation or field that is on
+    no page is now dropped (counted as structure_refs), by term and by
+    box."""
+
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_under_a_box_drawn_by_hand(self, tmp_path, kind):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: (lambda a: (_on_page(pdf, a), _tag(pdf, a)))(
+            _annotation(pdf, kind)))
+        assert _holds(src, HELD) and _object_refs(src) == 1
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
+        assert res.verification["verified"] is True
+        assert res.surface_counts.get("structure_refs") == 1
+        assert _object_refs(out) == 0 and _annotations_in_the_file(out) == []
+        assert not _holds(out, HELD)
+
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_in_a_search(self, tmp_path, kind):
+        """What held the term was scrubbed, or the run was refused (the
+        field shown by a kid widget: its appearance was kept by the tree).
+        Now the annotation leaves the file."""
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: (lambda a: (_on_page(pdf, a), _tag(pdf, a)))(
+            _annotation(pdf, kind)))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, search_terms=[HELD])
+        assert res.verification["verified"] is True
+        assert res.surface_counts.get("structure_refs") == 1
+        assert _object_refs(out) == 0 and _annotations_in_the_file(out) == []
+        assert not _holds(out, HELD)
+
+    def test_one_that_was_on_no_page_to_begin_with(self, tmp_path):
+        """A reference the tree made to an annotation no page lists is
+        dropped on every run, whatever the boxes are over."""
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: _tag(pdf, _stamp(pdf, "approved")))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_NOTHING])
+        assert res.verification["verified"] is True
+        assert res.surface_counts == {"page_content": 1, "structure_refs": 1}
+        assert _annotations_in_the_file(out) == []
+
+    def test_one_written_into_the_reference_itself(self, tmp_path):
+        """An annotation can be written into the object reference itself,
+        not an object of its own: no page can list it, and only the tree
+        has it. Found by a hostile shape."""
+        def plant(pdf):
+            root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+            root["/K"] = Array([pdf.make_indirect(Dictionary(
+                Type=Name.StructElem, S=Name.Annot, P=root, K=Dictionary(
+                    Type=Name.OBJR, Obj=Dictionary(Type=Name.Annot, Subtype=Name.Stamp,
+                                                   Rect=STAMP_RECT,
+                                                   Contents=String(f"note {HELD}")))))])
+            pdf.Root["/StructTreeRoot"] = root
+        src = _pdf(tmp_path / "src.pdf", plant)
+        check = _check(verify_redaction(src, rects=[OVER_NOTHING]), "redaction.structure_streams")
+        assert check.passed is False
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_NOTHING])
+        assert res.verification["verified"] is True
+        assert res.surface_counts.get("structure_refs") == 1 and not _holds(out, HELD)
+
+    def test_one_still_on_its_page_keeps_its_reference(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: (lambda a: (_on_page(pdf, a), _tag(pdf, a)))(
+            _stamp(pdf, "approved")))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_NOTHING])
+        assert "structure_refs" not in res.surface_counts
+        assert _object_refs(out) == 1 and _annotations_in_the_file(out) == ["/Stamp"]
+
+
+@pytest.mark.integration
+class TestTheVerifierLooksForWhatOnlyTheTreeKeeps:
+    CHECK = "redaction.structure_streams"
+
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_an_annotation_on_no_page_only_the_tree_reaches_fails_it(self, tmp_path, kind):
+        def plant(pdf):
+            annot = _annotation(pdf, kind)
+            _tag(pdf, annot)
+            if "/AcroForm" in pdf.Root:
+                del pdf.Root["/AcroForm"]          # nothing but the tree leads to it
+        src = _pdf(tmp_path / "src.pdf", plant)
+        report = verify_redaction(src, rects=[OVER_NOTHING])
+        check = _check(report, self.CHECK)
+        assert check.passed is False and check.is_document_level
+        assert check.evidence == ["1 annotation or form field in the file can be reached only "
+                                  "through the structure tree: it is on no page (document-level)"]
+        assert report.flatten_target_pages() is None
+
+    def test_one_on_a_page_passes(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: (lambda a: (_on_page(pdf, a), _tag(pdf, a)))(
+            _stamp(pdf, "approved")))
+        assert _check(verify_redaction(src, rects=[OVER_NOTHING]), self.CHECK).passed is True
+
+    def test_a_field_the_form_still_lists_passes(self, tmp_path):
+        """On no page, but not kept by the tree alone: the form lists it."""
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: _tag(pdf, _annotation(pdf, "field")))
+        assert _check(verify_redaction(src, rects=[OVER_NOTHING]), self.CHECK).passed is True
+
+    def test_a_redaction_that_left_one_is_refused(self, tmp_path, monkeypatch):
+        import pdf_ops
+        monkeypatch.setattr(pdf_ops, "_drop_stale_structure_refs", lambda pdf: 0)
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: (lambda a: (_on_page(pdf, a), _tag(pdf, a)))(
+            _stamp(pdf, "approved")))
+        out = str(tmp_path / "out.pdf")
+        with pytest.raises(RedactionVerificationError) as ei:
+            redact_pdf(src, out, rects=[OVER_THE_STAMP])
+        failed = [c["id"] for c in ei.value.report["checks"] if not c["passed"]]
+        assert failed == [self.CHECK] and ei.value.flatten_pages is None
 
 
 # ── 4. Page thumbnails ───────────────────────────────────────────────────
@@ -1434,6 +1623,143 @@ class TestWhatLeavesAPageIsCounted:
         by_box = redact_pdf(src, str(tmp_path / "b.pdf"), rects=[OVER_THE_STAMP])
         assert by_search.surface_counts["annotations_removed"] == 2
         assert by_box.surface_counts["annotations_removed"] == 2
+
+    @pytest.mark.parametrize("mode", ["box", "search"])
+    def test_a_link_under_a_box_is_counted_as_one(self, tmp_path, mode):
+        """MuPDF takes off the page every link a redaction rectangle lies
+        over, a term's or one drawn by hand. Counted as "links_removed";
+        a link elsewhere stays and is not."""
+        def plant(pdf):
+            page = pdf.pages[0].obj
+            page["/Contents"] = pdf.make_stream(
+                f"BT /F1 14 Tf 72 600 Td (see {TERM} here) Tj ET".encode())
+            _on_page(pdf, *[pdf.make_indirect(Dictionary(
+                Type=Name.Annot, Subtype=Name.Link, Rect=rect, Dest=Array([0, Name.Fit])))
+                for rect in ([70, 595, 300, 615], [70, 300, 300, 320])])
+        src = _pdf(tmp_path / "src.pdf", plant)
+        out = str(tmp_path / "out.pdf")
+        if mode == "box":
+            res = redact_pdf(src, out, rects=[{"page": 0, "x0": 60, "y0": 170, "x1": 320, "y1": 200}])
+        else:
+            res = redact_pdf(src, out, search_terms=[TERM])
+        assert res.verification["verified"] is True
+        assert res.surface_counts == {"page_content": 1, "links_removed": 1}
+        assert _subtypes(out) == ["/Link"]
+
+    def test_a_link_written_into_the_page_list_is_counted_too(self, tmp_path):
+        """No object number of its own; MuPDF removes it all the same.
+        Found by a hostile shape."""
+        def plant(pdf):
+            pdf.pages[0].obj["/Annots"] = Array([Dictionary(
+                Type=Name.Annot, Subtype=Name.Link, Rect=STAMP_RECT, Dest=Array([0, Name.Fit]))])
+        src = _pdf(tmp_path / "src.pdf", plant)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
+        assert res.surface_counts == {"page_content": 1, "links_removed": 1}
+        assert _subtypes(out) == []
+
+
+@pytest.mark.integration
+@pytest.mark.filterwarnings("ignore:This document has 1 form widget")         # the fixture's own
+class TestAFieldWithNothingLeftToShowIt:
+    """A field shown by a widget below it keeps its value on itself. Under
+    a box, PyMuPDF 1.27 took the widget off the page and out of the field's
+    kids, and left the field in the form, value and all, shown nowhere: the
+    run verified with what the field said still in the file (2.1 removed
+    the field too)."""
+
+    def test_its_value_leaves_the_file(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: _on_page(
+            pdf, _annotation(pdf, "field shown by a kid widget")))
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
+        assert res.verification["verified"] is True
+        assert res.surface_counts == {"page_content": 1, "fields_removed": 1}
+        assert not _holds(out, HELD)
+        with pikepdf.open(out) as pdf:
+            assert list(pdf.Root["/AcroForm"]["/Fields"]) == []
+
+    def test_two_levels_down_and_in_the_calculation_order(self, tmp_path):
+        """The form's calculation order lists the field too, and kept it
+        alive after it had left the tree (on 2.1, where MuPDF takes it out
+        of its parent's kids itself). Found by a hostile shape."""
+        def plant(pdf):
+            top = pdf.make_indirect(Dictionary(T=String("form")))
+            fld = pdf.make_indirect(Dictionary(FT=Name.Tx, T=String("who"),
+                                               V=String(f"{HELD} Ltd"), Parent=top))
+            widget = pdf.make_indirect(Dictionary(
+                Type=Name.Annot, Subtype=Name.Widget, Parent=fld, Rect=STAMP_RECT,
+                DA=String("/Helv 12 Tf 0 g"), AP=Dictionary(N=_drawn(pdf, f"{HELD} Ltd"))))
+            fld["/Kids"], top["/Kids"] = Array([widget]), Array([fld])
+            pdf.Root["/AcroForm"] = Dictionary(
+                Fields=Array([top]), CO=Array([fld]), DA=String("/Helv 12 Tf 0 g"),
+                DR=Dictionary(Font=Dictionary(Helv=_font(pdf))))
+            _on_page(pdf, widget)
+        src = _pdf(tmp_path / "src.pdf", plant)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
+        assert res.verification["verified"] is True and not _holds(out, HELD)
+        with pikepdf.open(out) as pdf:
+            assert list(pdf.Root["/AcroForm"]["/CO"]) == []
+
+    def test_a_field_still_shown_elsewhere_stays(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _field_in_two_places)
+        out = str(tmp_path / "out.pdf")
+        redact_pdf(src, out, rects=[OVER_THE_STAMP])
+        with pikepdf.open(out) as pdf:
+            (field,) = pdf.Root["/AcroForm"]["/Fields"]
+            assert len(field["/Kids"]) == 1 and str(field["/T"]) == "who"
+
+    def test_a_form_no_box_touched_is_left_as_it_was(self, tmp_path):
+        """A field with no kids at all, in a form nothing was removed from,
+        is not tidied away."""
+        def plant(pdf):
+            pdf.Root["/AcroForm"] = Dictionary(Fields=Array([pdf.make_indirect(Dictionary(
+                FT=Name.Tx, T=String("spare"), Kids=Array()))]))
+        src = _pdf(tmp_path / "src.pdf", plant)
+        out = str(tmp_path / "out.pdf")
+        redact_pdf(src, out, rects=[OVER_THE_STAMP])
+        with pikepdf.open(out) as pdf:
+            assert len(pdf.Root["/AcroForm"]["/Fields"]) == 1
+
+
+def _field_in_two_places(pdf):
+    """A field shown in two places: one under OVER_THE_STAMP, one below."""
+    parent = pdf.make_indirect(Dictionary(FT=Name.Tx, T=String("who"), V=String("Whitfield")))
+    kids = [pdf.make_indirect(Dictionary(Type=Name.Annot, Subtype=Name.Widget, Parent=parent,
+                                         Rect=rect, DA=String("/Helv 12 Tf 0 g"),
+                                         AP=Dictionary(N=_drawn(pdf, "Whitfield"))))
+            for rect in (STAMP_RECT, [72, 300, 372, 330])]
+    parent["/Kids"] = Array(kids)
+    pdf.Root["/AcroForm"] = Dictionary(Fields=Array([parent]), DA=String("/Helv 12 Tf 0 g"),
+                                       DR=Dictionary(Font=Dictionary(Helv=_font(pdf))))
+    _on_page(pdf, *kids)
+
+
+@pytest.mark.integration
+@pytest.mark.filterwarnings("ignore:This document has 1 form widget")         # the fixture's own
+class TestTheSourceIsLetGo:
+    """PyMuPDF keeps a page and an annotation it has loaded alive in a
+    cycle, and the document with them, after the document is closed. On
+    Windows the source file stayed open, and redacting in place failed:
+    the redacted copy could not replace it."""
+
+    def test_redacting_in_place_a_field_shown_in_two_places(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _field_in_two_places)
+        res = redact_pdf(src, src, rects=[OVER_THE_STAMP])
+        assert res.verification["verified"] is True and res.output_path == src
+        assert _subtypes(src) == ["/Widget"]
+
+    @pytest.mark.parametrize("shape", ["a field shown in two places", "a stamp", "nothing"])
+    def test_nothing_holds_the_source_open_afterwards(self, tmp_path, shape):
+        plant = {"a field shown in two places": _field_in_two_places,
+                 "a stamp": lambda pdf: _on_page(pdf, _stamp(pdf, "approved")),
+                 "nothing": None}[shape]
+        src = _pdf(tmp_path / "src.pdf", plant)
+        redact_pdf(src, str(tmp_path / "out.pdf"), rects=[OVER_THE_STAMP])
+        moved = str(tmp_path / "moved.pdf")
+        os.replace(src, moved)                  # fails on Windows if it is still open
+        assert os.path.exists(moved)
 
     def test_a_box_drawn_by_hand_is_not_trimmed(self, tmp_path):
         src = _pdf(tmp_path / "src.pdf", _content(TIGHT))

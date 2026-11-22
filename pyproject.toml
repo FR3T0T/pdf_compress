@@ -10,7 +10,8 @@ dependencies = [
     "pikepdf>=8.0.0",
     "Pillow>=10.0.0",
     "PySide6>=6.5.0",
-    "PyMuPDF>=1.23.0",
+    # Pinned: 1.28 removes other text when it redacts; 2.x can move text after a removed word (#119)
+    "PyMuPDF==1.27.2.3",
     "argon2-cffi>=23.1.0",
     "pycryptodome>=3.19.0",
     "cryptography>=41.0.0",

@@ -306,6 +306,20 @@
   save-failure) and `tests/test_pdf_verify.py` (D1 flatten targeting).
 
 ### Changed
+- **PyMuPDF is pinned to 1.27.2.3, and redaction refuses 1.28 (#119).** The
+  same code on the same files: on 1.27.2.3 every redaction that verifies is
+  clean. On 1.28.0 and 1.28.2, redacting a word removed thousands of other
+  words from the page in some files — some such runs were refused, some
+  verified. On 2.0 and 2.1 the text that follows a removed word on its line
+  can move along it. `requirements.txt` and `pyproject.toml` now name
+  `PyMuPDF==1.27.2.3`, with a comment saying why; CI installs from them.
+  `redact_pdf` refuses to start on 1.28.x, before anything is opened
+  (`RedactionNotPossibleError`: "Redaction is turned off: the PDF library
+  installed here ... removes other text from a page when it redacts").
+  On 2.x it runs and the result carries a note of a new kind,
+  `text_may_move`, with the version. A CI job runs the suite on PyMuPDF 2.1
+  as an early warning; its failure does not fail the workflow. Tests:
+  `TestTheLibraryVersion` in `tests/test_redact_notes.py`.
 - **Redaction scrubs six more surfaces, and refuses what it has no rule for
   (#119).** So that an ordinary file passes the whole-file search above, a
   term redaction now also: replaces structure-tree text holding a term
@@ -664,6 +678,53 @@
   code with no remaining callers.
 
 ### Fixed
+- **Redaction: a box drawn on a turned page (#119).** The app shows each
+  page as a picture of the page as it is shown and sends a box as it lies on
+  that picture. `redact_pdf` works on the page before its `/Rotate`, so on a
+  page turned 90, 180 or 270 degrees the box was applied somewhere else: the
+  word under it stayed and the run verified. The redact slot now hands the
+  boxes to `pdf_ops.rects_from_page_pictures`, which puts each one back with
+  the page's derotation matrix (a moved crop box needs nothing more: page
+  space already starts at the crop box). `redact_pdf` and the verifier keep
+  the space they had, and say so. A box that cannot be read is passed on as
+  it came, for the verifier to refuse as before. Tests:
+  `tests/test_redact_page_pictures.py`, which finds the box on the rendered
+  page itself.
+- **Redaction: nothing that left a page is kept by the structure tree
+  (#119).** A tagged file's structure tree can point at an annotation (an
+  object reference). An annotation or form field taken off its page — a
+  stamp under a box, a link or a field MuPDF removes under one, an
+  annotation that drew a term — stayed in the file whole when the tree
+  pointed at it: a stamp's appearance and text, a link's address, a field's
+  value. Every such reference to an annotation or field that is on no page
+  — one written into the reference itself included — is now dropped, on
+  every run (counted as `structure_refs`), and `redaction.structure_streams`
+  fails when an annotation or field is left that only the structure tree
+  leads to. An annotation on no page whose text the scrub removed, which
+  used to stay with its appearance dropped, now leaves the file whole. A
+  field shown by a widget below it could also lose its widget under a box
+  and stay in the form, value and all, shown nowhere (PyMuPDF 1.27), or
+  stay in the form's calculation order after MuPDF took it out of the tree
+  (2.1). When a field has left a page, a field with no widgets left is
+  taken out of the form, and the calculation order keeps only fields still
+  in the tree. Tests: `TestNothingThatLeftAPageIsKeptByTheTree`,
+  `TestTheVerifierLooksForWhatOnlyTheTreeKeeps`,
+  `TestAFieldWithNothingLeftToShowIt`, and three older tests of
+  `TestAnAppearanceOffThePage` changed to the new rule.
+- **Redaction in place on Windows (#119).** PyMuPDF keeps a page and an
+  annotation it has loaded alive in a cycle, and the document with them,
+  after the document is closed. When a form field shown in two places lost
+  one of them under a box, the source stayed open, and redacting in place
+  failed: the redacted copy could not replace it. What PyMuPDF still holds
+  is released before the copy takes the source's place, and after a
+  refusal. Tests: `TestTheSourceIsLetGo`.
+- **Redaction counts the links it removes (#119).** MuPDF takes off the page
+  every link a redaction rectangle lies over, a term's or one drawn by hand,
+  one written into the page's list itself included. They are now counted,
+  as `links_removed` (`links` stays the count of web addresses holding a
+  term that the scrub removed). Tests:
+  `test_a_link_under_a_box_is_counted_as_one`,
+  `test_a_link_written_into_the_page_list_is_counted_too`.
 - **Redaction: a straight line through a box drawn by hand hides nothing
   (#119).** `redaction.rect_line_art` failed for any drawing with an edge
   inside a box, and so for a rule across the page, the border of a table or

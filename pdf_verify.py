@@ -1465,28 +1465,59 @@ def structure_kids(elem) -> list:
     return list(kids) if isinstance(kids, pikepdf.Array) else [kids]
 
 
-def structure_stream_refs(pdf) -> tuple[list, set, set]:
-    """(holders, named, alive) for the structure tree of *pdf*: the
-    dictionaries of the tree that have a kid naming a stream, the (num,
-    gen) of every stream so named, and those of them something outside the
-    tree leads to as well.
+def annotation_or_field(obj) -> bool:
+    """An annotation or a form field, by what it is: it says it is an
+    annotation, it has a field type, it has a /Subtype and a /Rect, or it
+    is a parent field (a name and kids). Not by where it is listed."""
+    if not isinstance(obj, pikepdf.Dictionary) or isinstance(obj, pikepdf.Stream):
+        return False
+    try:
+        if _type_name(obj) == "/Annot" or "/FT" in obj:
+            return True
+        if "/Subtype" in obj and "/Rect" in obj:
+            return True
+        return "/T" in obj and "/Kids" in obj and _type_name(obj) != "/Pages"
+    except Exception:
+        return False
 
-    A stream that is named and not alive is in the file for the structure
-    tree alone. After a redaction that is the unredacted original of a
-    form, an image or a page's content, which the page has a redacted copy
-    of: redact_pdf removes the reference (pdf_ops._drop_stale_structure_refs)
-    and verify_redaction checks that none is left. "Outside the tree" is
-    tested by walking the file from the trailer without entering the tree,
-    not through the catalog and not through a bookmark's /SE.
+
+def structure_object(kid):
+    """The annotation or form field a kid of a structure element names —
+    the target of an object reference (/Obj) — or None."""
+    if isinstance(kid, pikepdf.Dictionary):
+        target = kid.get("/Obj")
+        if annotation_or_field(target):
+            return target
+    return None
+
+
+def structure_refs(pdf) -> tuple[list, set, set, set]:
+    """(holders, named, alive, objects) for the structure tree of *pdf*:
+    the dictionaries of the tree that have a kid naming a stream, an
+    annotation or a form field; the (num, gen) of everything so named; those
+    of them something outside the tree leads to as well; and which of the
+    named are annotations or fields (the rest are streams).
+
+    What is named and not alive is in the file for the structure tree
+    alone. After a redaction a stream like that is the unredacted original
+    of a form, an image or a page's content, which the page has a redacted
+    copy of; an annotation or field like that is one that was taken off its
+    page — a stamp under a box, a link or a field MuPDF removed — with
+    everything it held. redact_pdf removes such references
+    (pdf_ops._drop_stale_structure_refs) and verify_redaction checks that
+    none is left. "Outside the tree" is tested by walking the file from the
+    trailer without entering the tree, not through the catalog and not
+    through a bookmark's /SE.
     """
     holders: list = []
     named: set = set()
+    objects: set = set()
     try:
         root = pdf.Root.get("/StructTreeRoot")
     except Exception:
         root = None
     if not isinstance(root, pikepdf.Dictionary):
-        return holders, named, set()
+        return holders, named, set(), objects
 
     seen, stack = set(), [root]
     while stack:
@@ -1505,16 +1536,24 @@ def structure_stream_refs(pdf) -> tuple[list, set, set]:
             if _type_name(cur) in ("/Page", "/Pages", "/Catalog"):
                 continue
             if "/K" in cur:
-                streams = [s for s in map(structure_stream, structure_kids(cur)) if s is not None]
-                if streams:
+                kids = structure_kids(cur)
+                streams = [s for s in map(structure_stream, kids) if s is not None]
+                things = [o for o in map(structure_object, kids) if o is not None]
+                if streams or things:
                     holders.append(cur)
                     named.update(tuple(s.objgen) for s in streams)
+                    for o in things:
+                        # One written into the reference itself has no number
+                        # to be reached by, and nothing outside the tree has it.
+                        key = tuple(o.objgen) if o.is_indirect else ("direct", len(objects))
+                        named.add(key)
+                        objects.add(key)
             stack.extend(cur[k] for k in cur.keys() if k not in STRUCTURE_WAYS_OUT)
         except Exception:
             continue
     alive: set = set()
     if not named:
-        return holders, named, alive
+        return holders, named, alive, objects
 
     containers = (pikepdf.Dictionary, pikepdf.Stream, pikepdf.Array)
     seen, stack = set(), [pdf.trailer]
@@ -1538,15 +1577,16 @@ def structure_stream_refs(pdf) -> tuple[list, set, set]:
             stack.extend(cur[k] for k in cur.keys() if k not in ("/StructTreeRoot", "/SE"))
         except Exception:
             continue
-    return holders, named, alive
+    return holders, named, alive, objects
 
 
 def _whole_file_checks(output_path: str, password: Optional[str] = None) -> list[VerificationCheck]:
     """Two checks every redaction gets, by term or by box, read with pikepdf
     from the output as a whole (#119, R3).
 
-    ``redaction.structure_streams``: no stream is in the file for the
-    structure tree alone (structure_stream_refs). ``redaction.thumbnails``:
+    ``redaction.structure_streams``: nothing is in the file for the
+    structure tree alone (structure_refs) — no stream, and no annotation or
+    form field, which is then on no page. ``redaction.thumbnails``:
     no page carries a /Thumb, a small picture of the page as it was. Both
     are document-level: making a page a picture does not mend either. An
     output that cannot be read fails both, marked unevaluated.
@@ -1557,12 +1597,18 @@ def _whole_file_checks(output_path: str, password: Optional[str] = None) -> list
     kwargs = {"password": password} if password else {}
     try:
         with pikepdf.open(output_path, **kwargs) as pdf:
-            _holders, named, alive = structure_stream_refs(pdf)
-            if named - alive:
-                n = len(named - alive)
-                kept.append(f"{n} stream{'' if n == 1 else 's'} in the file can be reached only "
-                            f"through the structure tree: the original of content a page now "
-                            f"has a redacted copy of (document-level)")
+            _holders, named, alive, objects = structure_refs(pdf)
+            streams = len(named - alive - objects)
+            things = len((objects & named) - alive)
+            if streams:
+                kept.append(f"{streams} stream{'' if streams == 1 else 's'} in the file can be "
+                            f"reached only through the structure tree: the original of content "
+                            f"a page now has a redacted copy of (document-level)")
+            if things:
+                kept.append(f"{things} annotation{'' if things == 1 else 's'} or form "
+                            f"field{'' if things == 1 else 's'} in the file can be reached only "
+                            f"through the structure tree: {'it is' if things == 1 else 'they are'}"
+                            f" on no page (document-level)")
             in_tree = set()
             for number, page in enumerate(pdf.pages, 1):
                 in_tree.add(tuple(page.obj.objgen))
@@ -1583,7 +1629,7 @@ def _whole_file_checks(output_path: str, password: Optional[str] = None) -> list
     return [
         VerificationCheck(
             id="redaction.structure_streams",
-            description="No stream is kept in the file by the structure tree alone",
+            description="Nothing is kept in the file by the structure tree alone",
             passed=not (kept or problem), evidence=kept or ([problem] if problem else []),
             unevaluated=bool(problem)),
         VerificationCheck(

@@ -1484,8 +1484,18 @@ class TestWhatTheStructureTreeKeepsAlive:
 @pytest.mark.integration
 class TestAnAppearanceOffThePage:
     """(c) A note that redaction took off its page, kept alive by the
-    structure tree, has its text scrubbed. Its appearance stream drew that
-    text, and nothing shows it any more: it goes too."""
+    structure tree, had its text scrubbed and its appearance, which drew
+    that text, dropped; it stayed in the file. Since R4 the tree's
+    reference to an annotation that is on no page is dropped on every run,
+    and the note leaves the file whole, what it said and what it drew."""
+
+    @staticmethod
+    def _what_is_left(out) -> list:
+        with pikepdf.open(out) as pdf:
+            elem = pdf.Root["/StructTreeRoot"]["/K"][0]
+            assert "/K" not in elem                       # the reference went
+            return [o for o in pdf.objects if isinstance(o, pikepdf.Dictionary)
+                    and str(o.get("/Subtype", "")) == "/FreeText"]
 
     def _note(self, pdf, **entries):
         return _annot(pdf, Name.FreeText, AP=Dictionary(N=_form(pdf, f"ask {TERM} first")),
@@ -1497,10 +1507,8 @@ class TestAnAppearanceOffThePage:
             text = f"<body><p>ask {TERM} first</p></body>" if entry == "/RC" else f"ask {TERM} first"
             _held_by_structure(pdf, self._note(pdf, **{entry.lstrip("/"): String(text)}))
         res, out = _redact(tmp_path, plant)
-        with pikepdf.open(out) as pdf:
-            note = pdf.Root["/StructTreeRoot"]["/K"][0]["/K"][0]["/Obj"]
-            assert "/AP" not in note and entry not in note
-            assert str(note["/Subtype"]) == "/FreeText"          # the note itself stays
+        assert self._what_is_left(out) == []
+        assert res.surface_counts.get("structure_refs") == 1
 
     def test_a_note_under_the_redacted_text_itself(self, tmp_path):
         """The whole chain as it happens: the note sits over the text, the
@@ -1526,13 +1534,14 @@ class TestAnAppearanceOffThePage:
             note = pdf.pages[0].obj["/Annots"][0]
             assert "/Contents" not in note and "/AP" in note
 
-    def test_text_that_is_kept_keeps_its_appearance(self, tmp_path):
+    def test_a_note_that_holds_no_term_goes_too(self, tmp_path):
+        """It was kept, appearance and all, when its text held no term. On
+        no page, it is now dropped with the reference whatever it says."""
         res, out = _redact(tmp_path, lambda pdf: _held_by_structure(pdf, _annot(
             pdf, Name.FreeText, Contents=String("see page 4"),
             AP=Dictionary(N=_form(pdf, "see page 4")))))
-        with pikepdf.open(out) as pdf:
-            note = pdf.Root["/StructTreeRoot"]["/K"][0]["/K"][0]["/Obj"]
-            assert "/AP" in note and str(note["/Contents"]) == "see page 4"
+        assert self._what_is_left(out) == []
+        assert res.surface_counts.get("structure_refs") == 1
 
 
 @pytest.mark.integration

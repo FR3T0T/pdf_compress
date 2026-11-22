@@ -10,6 +10,8 @@ word; none of them is a failure:
   attachments   attachments, which are searched as stored and never opened
   flattened     pages that were turned into pictures
   boxes_only    a run by boxes alone searched for nothing
+  text_may_move the run was made with PyMuPDF 2.x, which can move the text
+                after a removed word (R4; and 1.28 is refused outright)
 
 Every fixture is built here, by hand. Qt-free, like the module it
 exercises (see CLAUDE.md).
@@ -17,11 +19,14 @@ exercises (see CLAUDE.md).
 
 import dataclasses
 import json
+import os
+import pathlib
 
 import pikepdf
 import pytest
 from pikepdf import Array, Dictionary, Name, String
 
+import pdf_ops
 from pdf_ops import RedactionVerificationError, redact_pdf
 
 fitz = pytest.importorskip("fitz")
@@ -80,6 +85,12 @@ def _note(result, kind: str):
     return found[0] if found else None
 
 
+def _plain(notes: list) -> list:
+    """*notes* without the one about the PDF library itself (R4), which a
+    run on PyMuPDF 2.x adds to every result; TestTheLibraryVersion has it."""
+    return [n for n in notes if n["kind"] != "text_may_move"]
+
+
 BOX = {"page": 0, "x0": 60, "y0": 50, "x1": 400, "y1": 90}
 
 
@@ -108,7 +119,7 @@ class TestPagesWithNoText:
     def test_a_file_of_ordinary_pages_has_no_such_note(self, tmp_path):
         src = _pdf(tmp_path / "src.pdf", WORDS, OTHER_WORDS)
         res = redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM])
-        assert res.notes == []
+        assert _plain(res.notes) == []
 
     def test_a_search_that_finds_nothing_says_which_pages_it_could_not_read(self, tmp_path):
         """The run ends without a result, so the fact goes in the message."""
@@ -140,7 +151,7 @@ class TestATextLayerOverAPicture:
         most of its text is there to be seen."""
         src = _pdf(tmp_path / "src.pdf", LETTERHEAD)
         res = redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM])
-        assert res.notes == []
+        assert _plain(res.notes) == []
 
     def test_a_hidden_layer_with_no_picture_is_not_one(self, tmp_path):
         hidden = f"BT 3 Tr /F1 14 Tf 72 720 Td (a line about {TERM} here) Tj ET".encode()
@@ -204,7 +215,7 @@ class TestARunByBoxesOnly:
         src = _pdf(tmp_path / "src.pdf", WORDS, WORDS, SCAN,
                    plant=lambda pdf: _attach(pdf, notes__txt=b"plain words"))
         res = redact_pdf(src, str(tmp_path / "out.pdf"), rects=[BOX, dict(BOX, page=2)])
-        assert res.notes == [{"kind": "boxes_only", "pages": [1, 3]}]
+        assert _plain(res.notes) == [{"kind": "boxes_only", "pages": [1, 3]}]
 
     def test_a_run_by_terms_and_boxes_did_search(self, tmp_path):
         src = _pdf(tmp_path / "src.pdf", WORDS, OTHER_WORDS)
@@ -223,7 +234,7 @@ class TestTheNotesReachTheApp:
             pdf, bundle__zip=b"PK\x03\x04" + b"\x00" * 40))
         res = redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM])
         sent = json.loads(json.dumps(dataclasses.asdict(res), ensure_ascii=False))
-        assert sent["notes"] == [
+        assert _plain(sent["notes"]) == [
             {"kind": "no_text", "pages": [2]},
             {"kind": "text_layer", "pages": [1], "hits": {"1": 2}},
             {"kind": "attachments", "names": ["bundle.zip"], "compressed": ["bundle.zip"]}]
@@ -232,5 +243,51 @@ class TestTheNotesReachTheApp:
         src = _pdf(tmp_path / "src.pdf", LAYER, SCAN)
         res = redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM])
         for note in res.notes:
-            assert set(note) <= {"kind", "pages", "hits", "names", "compressed", "areas"}
+            assert set(note) <= {"kind", "pages", "hits", "names", "compressed", "areas",
+                                 "version"}
             assert all(isinstance(p, int) and p >= 1 for p in note.get("pages", []))
+
+
+@pytest.mark.integration
+class TestTheLibraryVersion:
+    """PyMuPDF 1.28 removes other text from a page when it redacts: on
+    real files, thousands of words a page had nothing to do with the term.
+    Redaction refuses to start on it. On 2.x it runs, and the result says
+    that text after a removed word can move along its line. The version is
+    faked here; the tests run on whatever is installed."""
+
+    @pytest.mark.parametrize("version", ["1.28.0", "1.28.2"])
+    def test_1_28_is_refused_before_anything_is_written(self, tmp_path, monkeypatch, version):
+        monkeypatch.setattr(fitz, "VersionBind", version)
+        src = _pdf(tmp_path / "src.pdf", WORDS)
+        out = str(tmp_path / "out.pdf")
+        for kw in ({"search_terms": [TERM]}, {"rects": [BOX]}):
+            with pytest.raises(pdf_ops.RedactionNotPossibleError) as ei:
+                redact_pdf(src, out, **kw)
+            assert str(ei.value) == (
+                f"Redaction is turned off: the PDF library installed here (PyMuPDF {version}) "
+                f"removes other text from a page when it redacts. Install PyMuPDF 1.27.2.3 "
+                f"to redact. Nothing was saved.")
+            assert not os.path.exists(out)
+
+    @pytest.mark.parametrize("version", ["2.0.0", "2.1"])
+    def test_2_x_runs_and_says_text_can_move(self, tmp_path, monkeypatch, version):
+        monkeypatch.setattr(fitz, "VersionBind", version)
+        src = _pdf(tmp_path / "src.pdf", WORDS)
+        for kw in ({"search_terms": [TERM]}, {"rects": [BOX]}):
+            res = redact_pdf(src, str(tmp_path / "out.pdf"), **kw)
+            assert res.verification["verified"] is True
+            assert _note(res, "text_may_move") == {"kind": "text_may_move", "version": version}
+            assert res.notes[-1]["kind"] == "text_may_move"
+
+    def test_1_27_has_no_such_note(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(fitz, "VersionBind", "1.27.2.3")
+        src = _pdf(tmp_path / "src.pdf", WORDS)
+        res = redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM])
+        assert res.notes == []
+
+    def test_the_pin(self):
+        """requirements.txt and pyproject.toml name the one version."""
+        root = pathlib.Path(__file__).resolve().parents[1]
+        assert "PyMuPDF==1.27.2.3" in (root / "requirements.txt").read_text(encoding="utf-8")
+        assert '"PyMuPDF==1.27.2.3"' in (root / "pyproject.toml").read_text(encoding="utf-8")

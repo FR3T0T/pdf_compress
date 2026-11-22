@@ -65,3 +65,30 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q --cov=. --cov-report=term-missing
+
+  next-pdf-library:
+    # PyMuPDF is pinned to 1.27.2.3 in requirements.txt (#119): 1.28 removes
+    # other text when it redacts, and 2.x can move the text after a removed
+    # word. The suite also runs on 2.1 as an early warning; a failure here
+    # does not fail the workflow.
+    name: Tests on PyMuPDF 2.1 (early warning)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies, then PyMuPDF 2.1 over the pin
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip install "PyMuPDF==2.1"
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q

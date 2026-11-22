@@ -72,6 +72,7 @@ from pdf_ops import (
     pdf_to_word,
     protect_pdf,
     read_metadata,
+    rects_from_page_pictures,
     redact_pdf,
     repair_pdf,
     split_pdf,
@@ -1734,14 +1735,18 @@ class Bridge(QObject):
         progress_cb = self._make_progress_callback(tool_key)
 
         def _work():
+            # Boxes drawn in the app's Draw-boxes mode, a JSON array of
+            # {page, x0, y0, x1, y1}, come as they lie on the page pictures
+            # getPageImages renders: on a page turned by /Rotate that is not
+            # the page's own space, which redact_pdf works in (#119).
+            rects = p.get("rects")
+            if rects:
+                rects = rects_from_page_pictures(p["inputPath"], rects, p.get("password"))
             return redact_pdf(
                 input_path=p["inputPath"],
                 output_path=p["outputPath"],
                 search_terms=p.get("searchTerms"),
-                # Coordinate boxes for the visual redaction UI (Part 2):
-                # JSON array of {page, x0, y0, x1, y1}. Unused until that
-                # UI sends it, but wired through end-to-end now.
-                rects=p.get("rects"),
+                rects=rects,
                 case_sensitive=p.get("caseSensitive", False),
                 pages=p.get("pages"),
                 password=p.get("password"),
