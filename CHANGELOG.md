@@ -2,6 +2,28 @@
 ## Unreleased
 
 ### Added
+- **Redaction: a result says what the run did not look at (#119).** A
+  redaction that verifies has removed what it was asked to remove from
+  everything it can read. It has not read a picture. `RedactResult.notes`
+  carries the plain facts about that, for the app to word; none is a
+  failure. One entry per kind, each a small dictionary with page numbers
+  counted from 1: `no_text` — searched pages that draw something, none of it
+  text (a scan with no text layer, type drawn as outlines): a search finds
+  no words there; `text_layer` — pages that show a picture and whose text is
+  mostly drawn in the invisible mode, the way OCR lays what it read over a
+  scan, with the number of hits on each: the search read that layer, and a
+  word the layer got wrong is still in the picture; `attachments` — the
+  attachments in the output by name, and which of them hold their contents
+  packed (zip, docx, xlsx, gzip, 7-Zip, another PDF): an attachment is
+  searched as stored and never opened; `flattened` — the pages turned into
+  pictures and the areas filled on each; `boxes_only` — a run by boxes
+  alone, which searched for nothing. A search that finds nothing at all has
+  no result to carry a note, so "No matching content found to redact." now
+  goes on to name the pages that had no text to search. The bridge sends a
+  result as it is, so the notes reach the app with no change there; wording
+  them is the app's (next cluster). New: `pdf_analyze.embedded_files`. Not
+  noticed: text hidden by a picture drawn over it, rather than by the
+  invisible mode. Tests: `tests/test_redact_notes.py`.
 - **Redaction: a whole-file search for every target term (#119).** A term
   redaction could finish verified with the term still in the file, in a
   place the verifier's surface checks have no name for: structure-tree
@@ -642,6 +664,73 @@
   code with no remaining callers.
 
 ### Fixed
+- **Redaction: a straight line through a box drawn by hand hides nothing
+  (#119).** `redaction.rect_line_art` failed for any drawing with an edge
+  inside a box, and so for a rule across the page, the border of a table or
+  the edge of a shaded row that a box happened to lie over. Such a line goes
+  in one side of the box and out another, and the part under the box is
+  fixed by the parts outside it. A straight line both of whose ends are
+  outside the box is no longer counted as under it; each edge of a rectangle
+  is judged as one line. A line that ends under the box, a corner under it,
+  any curve that runs through it and anything wholly inside it still are.
+  The line is left in place. It is still never the price of removing
+  something else: where a curve under the box could only go by the setting
+  that deletes whatever touches the box, the rule would go with it from one
+  end of the page to the other, so the default stays and the page is
+  refused and offered for flattening, as before. On 554 real files with one
+  box each (the first place the file's word stands, grown 3 pt), 35 were
+  refused for line art; 19 of them now verify. The check also looks only at
+  drawings whose bounding rectangle reaches a box. Tests:
+  `TestLineArtUnderABoxDrawnByHand`,
+  `TestTheVerifierLooksForLineArtInsideABox`.
+- **Redaction: a letter on the edge of a box drawn by hand (#119).** MuPDF
+  removes a character when a box reaches a tenth of the way into the letter,
+  and leaves it otherwise. The check then asked for no trace of any letter
+  in the box (`page.get_text(clip=...)`, which returns a character as soon
+  as the clip touches its drawn shape), so a box a point too tall, on the
+  tails of the line above, was refused for letters that were rightly left.
+  One rule now, for removing and for checking (`pdf_verify.chars_under`): a
+  character is under a box when the centre of its text box is inside the
+  box, or a fifth or more of the text box is. What MuPDF's pass leaves of
+  those is boxed and removed, text only — it happens in fonts whose widths
+  in the PDF differ from the font's own, where MuPDF measures a narrower
+  letter than the text box: first by the middle half of the text box, and
+  if the letter is still there by all of it, and only for a character that
+  was under the box before anything was redacted (PyMuPDF 2.1 can move the
+  text that follows a removed letter along its line; what slides under a
+  box that way is refused, not removed). `redaction.rect_regions` looks for
+  exactly the characters of that rule, so nothing half under a box passes.
+  On the same 554 boxes, 39 files were refused for a letter on the edge;
+  all 39 now pass this check, and with the line-art change the run goes
+  from 479 verified and 72 refused to 534 and 17 (PyMuPDF 1.27). The second
+  step had letters to remove in three files: twelve, four and one. Tests:
+  `TestALetterOnTheEdgeOfABoxDrawnByHand`.
+- **Redaction: what leaves a page is counted (#119).** Two things left a
+  page uncounted. A form field removed because a box lay over it, drawn by
+  hand or a term's: now `fields_removed` in `surface_counts`, one for each
+  place a field is shown that left. And a free-text note that any redaction
+  rectangle touches, which MuPDF takes off the page itself while it redacts
+  (no other kind of annotation): a search that removed such a note with its
+  popup and a reply said one annotation was removed, and under a box drawn
+  by hand the reply was left on the page, replying to nothing. What MuPDF
+  takes off is now counted under `annotations_removed` like what this code
+  takes off, its replies go with it and are counted, and annotations under
+  a box drawn by hand are taken off before the box is applied. A popup is
+  not counted, as before. Tests: `TestWhatLeavesAPageIsCounted`.
+- **Redaction: links on a page with a box drawn by hand (#119).** Two
+  faults in how links under a box were taken off the page, both from
+  earlier in this work and neither in a release. On a page with `/Rotate`,
+  the links were compared with the box in the turned page's coordinates and
+  the box in the page's own, so links nowhere near the box were deleted (40
+  of 200 in the test's page). And PyMuPDF's `get_links()` goes through the
+  page's whole list again for every link it returns, and reads the list
+  again after each link it deletes, so one box on a page with some
+  thousands of links ran for minutes. MuPDF removes the links a box
+  overlaps itself, all at once; what is left for this code is a look
+  afterwards for any it missed, with the page's list read once and each
+  link's rectangle put into the box's coordinates with the page's own
+  matrix, as the verifier does it. Tests:
+  `test_links_under_the_box_go_and_the_others_stay`.
 - **Redaction: a term box takes only its own characters (#119).** PyMuPDF
   removes a character if its box overlaps a redaction rectangle at all, and
   a character's box is as tall as its line. In type set close, the box of a

@@ -1065,6 +1065,46 @@ def _filespec_dicts(pdf: pikepdf.Pdf):
             _trouble("an object could not be searched for file specifications", exc)
 
 
+#: How a file that holds its contents packed begins: the zip family (zip,
+#: docx, xlsx, pptx, odt, epub), gzip, bzip2, xz, 7-Zip, RAR, Zstandard —
+#: and another PDF, whose text is in compressed streams of its own.
+_PACKED_STARTS = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08", b"\x1f\x8b", b"BZh",
+                  b"\xfd7zXZ\x00", b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07", b"\x28\xb5\x2f\xfd",
+                  b"%PDF-")
+
+
+def embedded_files(pdf: pikepdf.Pdf) -> list[tuple[str, bool]]:
+    """(name, packed) for every file embedded in *pdf*, sorted by name: the
+    file specifications that carry a payload, wherever they hang (the
+    attachment list, a /FileAttachment annotation, an /AF array).
+
+    *packed* says the payload starts the way a compressed container does
+    (_PACKED_STARTS). Redaction's notes are what this is for (#119): its
+    search reads an attachment's bytes as stored and opens nothing, so in a
+    packed one it could have read no text at all. One whose bytes cannot be
+    read counts as packed, for the same reason. A file with no name is
+    listed as "(unnamed)".
+    """
+    found: dict = {}
+    for n, d in enumerate(_filespec_dicts(pdf)):
+        try:
+            if not _has_payload(d):
+                continue
+            key = tuple(d.objgen) if d.is_indirect else ("inline", n)
+            if key in found:
+                continue
+            stream = next(d["/EF"][k] for k in _EF_STREAM_KEYS
+                          if isinstance(d["/EF"].get(k), pikepdf.Stream))
+            try:
+                packed = stream.read_bytes()[:8].startswith(_PACKED_STARTS)
+            except Exception:
+                packed = True
+            found[key] = (_filespec_name(d) or "(unnamed)", packed)
+        except Exception as exc:
+            _trouble("an embedded file could not be listed", exc)
+    return sorted(found.values())
+
+
 def _scan_embedded_files(pdf: pikepdf.Pdf, res: AnalysisResult) -> None:
     """Embedded files (attachments), and references to files outside the PDF."""
     names: list[str] = []

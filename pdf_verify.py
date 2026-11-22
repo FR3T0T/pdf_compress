@@ -40,11 +40,16 @@ transform raises, with the report, having touched nothing at the destination:
     path hides. It cannot read text outside the page's visible box, or
     remove what an annotation's appearance draws: those are left to the
     raw-content check and the sweep, which refuse the run. For boxes drawn
-    by hand there are, besides the clipped extraction of each box, two
-    checks of what a box leaves that is not text: no annotation lies over
-    it (``redaction.rect_annotations``; an annotation is painted above the
+    by hand, no character may be left under a box
+    (``redaction.rect_regions``; :func:`chars_under` is the rule, the one
+    ``redact_pdf`` removes by: the character's centre is in the box, or a
+    fifth or more of its text box is). And there are two checks of what a
+    box leaves that is not text: no annotation lies over it
+    (``redaction.rect_annotations``; an annotation is painted above the
     page) and no drawing has an edge inside it
-    (``redaction.rect_line_art``). And every redaction, by term or by box,
+    (``redaction.rect_line_art``; a straight line that runs right through
+    the box hides nothing under it and is not counted,
+    :func:`has_edge_inside`). And every redaction, by term or by box,
     is checked for a stream the structure tree alone keeps in the file
     (``redaction.structure_streams``) and for page thumbnails
     (``redaction.thumbnails``).
@@ -1325,8 +1330,71 @@ def _term_surface_checks(doc, output_path: str, terms: list[str],
     ]
 
 
+#: A character is under a box drawn by hand when its centre is inside the
+#: box, or this share of its text box is.
+UNDER_SHARE = 0.2
+
+
+def _page_characters(page) -> list[tuple]:
+    """(character, text box) for every character of *page*, read the way
+    the matcher reads the page. White space is given as (" ", None): it is
+    under nothing, and keeps words apart in what is quoted."""
+    found = []
+    for block in page.get_text("rawdict", flags=_MATCH_FLAGS).get("blocks", ()):
+        if block.get("type", 0) != 0:
+            continue
+        for line in block.get("lines", ()):
+            for span in line.get("spans", ()):
+                for ch in span.get("chars", ()):
+                    c, box = ch.get("c"), ch.get("bbox")
+                    if not c or not box or unicodedata.normalize("NFKC", c).isspace():
+                        found.append((" ", None))
+                    else:
+                        found.append((c, tuple(box)))
+            found.append((" ", None))
+    return found
+
+
+def _is_under(b: tuple, box) -> bool:
+    """Is the character with text box *b* under *box*? Its centre is in the
+    box, or a fifth or more of its text box is. (A text box with no width
+    — a font whose widths are nought — is the upright line the letter is
+    written from, and a fifth of that is a fifth of its height; likewise
+    one with no height.)"""
+    if box.x0 <= (b[0] + b[2]) / 2 <= box.x1 and box.y0 <= (b[1] + b[3]) / 2 <= box.y1:
+        return True
+    share = 1.0
+    for low, high, start, end in ((b[0], b[2], box.x0, box.x1), (b[1], b[3], box.y0, box.y1)):
+        if high > low:
+            share *= max(0.0, min(high, end) - max(low, start)) / (high - low)
+        elif not start <= low <= end:
+            return False
+    return share >= UNDER_SHARE
+
+
+def chars_under(page, boxes: list) -> list[tuple]:
+    """The characters of *page* that are under one of *boxes* — rectangles
+    the user drew, as fitz.Rect — each as (character, text box).
+
+    The one rule redact_pdf removes by and the verifier checks by: a
+    character is under a box when the centre of its text box is inside the
+    box, or a fifth or more of the text box is. MuPDF's own measure for
+    removing a character is another (the box must reach a tenth of the way
+    into the letter, from any side), and what page.get_text(clip=...)
+    returns is a third (the box touches the letter's drawn shape). A box
+    drawn a point too tall reaches the tails of the line above and the tops
+    of the line below; MuPDF leaves those letters, rightly, and a check
+    that asked for no trace of any letter in the box refused the run for
+    them. By this rule they are not under the box, and a letter that is —
+    half of it, or its middle — is never passed.
+    """
+    return [(c, b) for c, b in _page_characters(page)
+            if b is not None and any(_is_under(b, box) for box in boxes)]
+
+
 def _rect_region_check(doc, rects: list[dict]) -> VerificationCheck:
-    """Clipped extraction over each redaction rectangle must yield no text.
+    """No character is left under a redaction rectangle (chars_under: its
+    centre in the rectangle, or a fifth or more of its text box).
 
     Rect entries mirror redact_pdf's shape: {"page": int (0-based), "x0",
     "y0", "x1", "y1"} in PDF points. A malformed, out-of-range, inverted,
@@ -1336,6 +1404,7 @@ def _rect_region_check(doc, rects: list[dict]) -> VerificationCheck:
     hand an unredacted region a passing proof.
     """
     ev: list[str] = []
+    read: dict[int, list] = {}          # the characters of each page, read once
     for r in rects:
         try:
             pno = int(r["page"])
@@ -1353,7 +1422,11 @@ def _rect_region_check(doc, rects: list[dict]) -> VerificationCheck:
                       f"verified (redaction would have skipped it)")
             continue
         try:
-            found = doc[pno].get_text(clip=rect).strip()
+            if pno not in read:
+                read[pno] = _page_characters(doc[pno])
+            # What is under it, words kept apart as they are on the page.
+            found = "".join(c if b is not None and _is_under(b, rect) else " "
+                            for c, b in read[pno]).strip()
         except Exception as exc:
             ev.append(f"rect on page {pno + 1} could not be verified: {exc}")
             continue
@@ -1604,23 +1677,25 @@ def _rect_annotation_check(doc, output_path: str, rects: list[dict],
         passed=not ev, evidence=_dedupe(ev))
 
 
-def path_lines(drawing: dict, steps: int = 24) -> list[list[tuple]]:
+def path_pieces(drawing: dict, steps: int = 24) -> list[tuple[bool, list[tuple]]]:
     """The path of one PyMuPDF drawing (an entry of page.get_drawings()) as
-    lists of points, one list per line, rectangle, quad or curve of it. A
-    curve is walked in *steps* straight pieces: where it runs, not where
-    its control points are."""
-    lines = []
+    (straight, points) pairs, one per line, rectangle, quad or curve of it.
+    The points of a straight piece are its corners, each pair of neighbours
+    one edge. A curve is walked in *steps* straight pieces: where it runs,
+    not where its control points are."""
+    pieces = []
     for item in drawing.get("items", ()):
         try:
             kind = item[0]
             if kind == "l":
-                lines.append([(item[1].x, item[1].y), (item[2].x, item[2].y)])
+                pieces.append((True, [(item[1].x, item[1].y), (item[2].x, item[2].y)]))
             elif kind == "re":
                 r = item[1]
-                lines.append([(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1), (r.x0, r.y0)])
+                pieces.append((True, [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1),
+                                      (r.x0, r.y0)]))
             elif kind == "qu":
                 q = item[1]
-                lines.append([(p.x, p.y) for p in (q.ul, q.ur, q.lr, q.ll, q.ul)])
+                pieces.append((True, [(p.x, p.y) for p in (q.ul, q.ur, q.lr, q.ll, q.ul)]))
             elif kind == "c":
                 p = item[1:5]
                 points = []
@@ -1630,10 +1705,15 @@ def path_lines(drawing: dict, steps: int = 24) -> list[list[tuple]]:
                     w = (u ** 3, 3 * u * u * s, 3 * u * s * s, s ** 3)
                     points.append((sum(k * q.x for k, q in zip(w, p, strict=True)),
                                    sum(k * q.y for k, q in zip(w, p, strict=True))))
-                lines.append(points)
+                pieces.append((False, points))
         except Exception:
             continue
-    return lines
+    return pieces
+
+
+def path_lines(drawing: dict, steps: int = 24) -> list[list[tuple]]:
+    """The points of path_pieces, without which pieces are straight."""
+    return [points for _straight, points in path_pieces(drawing, steps)]
 
 
 def _passes_inside(p: tuple, q: tuple, box) -> bool:
@@ -1663,10 +1743,39 @@ def is_plain_black(drawing: dict) -> bool:
 
 
 def has_edge_inside(drawing: dict, box) -> bool:
-    """True if any piece of *drawing*'s path passes through the inside of
-    *box* (a fitz.Rect), or lies inside it."""
-    return any(_passes_inside(a, b, box)
-               for line in path_lines(drawing) for a, b in zip(line, line[1:], strict=False))
+    """True if something of *drawing*'s path is under *box* (a fitz.Rect):
+    a piece of it passes through the inside of the box and is not a
+    straight line that runs right through.
+
+    A straight line both of whose ends are outside the box's interior hides
+    nothing under it: it goes in one side and out another, and the part the
+    box covers is fixed by the parts it does not — a rule across the page,
+    the border of a table, the edge of a shaded row. Each edge of a
+    rectangle is judged as such a line. A line that ends under the box, a
+    corner under it, any curve that runs through it, and anything wholly
+    inside it are under the box: where the line ends, where the corner is
+    and how the curve bends there is what the box was drawn to hide.
+    """
+    def inside(p) -> bool:
+        return box.x0 < p[0] < box.x1 and box.y0 < p[1] < box.y1
+
+    for straight, points in path_pieces(drawing):
+        for a, b in zip(points, points[1:], strict=False):
+            if _passes_inside(a, b, box) and not (straight and not inside(a) and not inside(b)):
+                return True
+    return False
+
+
+def _reaches(drawing: dict, box) -> bool:
+    """Can *drawing* have anything inside *box* at all? By its bounding
+    rectangle — which holds its path, and a curve's control points with it
+    — so that a page of ten thousand drawings is not walked point by point
+    for the few that are near a box."""
+    try:
+        r = drawing["rect"]
+        return r.x0 < box.x1 and r.x1 > box.x0 and r.y0 < box.y1 and r.y1 > box.y0
+    except Exception:
+        return True
 
 
 def _rect_line_art_check(doc, rects: list[dict]) -> VerificationCheck:
@@ -1677,10 +1786,11 @@ def _rect_line_art_check(doc, rects: list[dict]) -> VerificationCheck:
     PyMuPDF removes a drawing that lies wholly inside the box, as it
     measures that (by a curve's control points, not by where it runs), and
     redact_pdf lets it remove whatever touches the box only when nothing
-    else would go with it. What is left with an edge inside a box fails
-    this check. It is page content, so the page can be flattened, and the
-    box is then black on the picture. A solid black rectangle is passed
-    over: every box's own fill is one, and it shows nothing.
+    else would go with it. What is left under a box (has_edge_inside: not
+    a straight line that only runs through it) fails this check. It is page
+    content, so the page can be flattened, and the box is then black on the
+    picture. A solid black rectangle is passed over: every box's own fill
+    is one, and it shows nothing.
     """
     ev: list[str] = []
     by_page: dict[int, list] = {}
@@ -1693,8 +1803,8 @@ def _rect_line_art_check(doc, rects: list[dict]) -> VerificationCheck:
             ev.append(f"the drawings on page {pno + 1} could not be read for "
                       f"verification ({type(exc).__name__})")
             continue
-        if any(has_edge_inside(d, box) for d in drawings if not is_plain_black(d)
-               for box in boxes):
+        if any(_reaches(d, box) and has_edge_inside(d, box)
+               for d in drawings if not is_plain_black(d) for box in boxes):
             ev.append(f"a drawing still has an edge inside a redaction rectangle "
                       f"on page {pno + 1}")
     return VerificationCheck(
@@ -1715,9 +1825,10 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
     Mirrors redact_pdf's selection model: *terms* (search-term redactions)
     and/or *rects* (user-drawn boxes, same dict shape) — at least one
     required. Term mode searches every extractable surface; rect mode
-    verifies via clipped extraction so rect-only redactions aren't a blind
-    spot. *input_path* is carried into the report verbatim for the caller
-    (#99) — verification itself never reads the input file.
+    looks under each box for characters (chars_under), annotations and
+    line art, so rect-only redactions aren't a blind spot. *input_path* is
+    carried into the report verbatim for the caller (#99) — verification
+    itself never reads the input file.
 
     *source_ids* (the source's trailer /ID elements, hex) and
     *source_sha256* are plain values the caller captured while it had the

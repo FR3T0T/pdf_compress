@@ -17,6 +17,7 @@ import fitz  # PyMuPDF
 import pikepdf
 
 from pdf_analyze import (
+    embedded_files,
     file_sha256,
     id_elements,
     name_tree_items,
@@ -33,6 +34,7 @@ from pdf_verify import (
     PageText,
     TermFinder,
     WalkStatus,
+    chars_under,
     path_lines,
     structure_kids,
     structure_stream,
@@ -1557,9 +1559,11 @@ class RedactResult:
     #: document-level scrubs apply_redactions never touches (#99, #119), and
     #: what a run by box alone can have too: structure_refs (the structure
     #: tree's references to an unredacted original), structure_text,
-    #: thumbnails and annotations_removed. "annotations" is text scrubbed
-    #: inside an annotation; "annotations_removed" is annotations taken off
-    #: a page.
+    #: thumbnails, annotations_removed and fields_removed. "annotations" is
+    #: text scrubbed inside an annotation; "annotations_removed" is
+    #: annotations taken off a page, replies with them (a popup is not
+    #: counted); "fields_removed" is form fields taken off a page because a
+    #: box, drawn by hand or a term's, lay over them.
     surface_counts: dict = field(default_factory=dict)
     #: verify_redaction(output).to_dict() — the proof-of-removal artifact.
     verification: dict | None = None
@@ -1569,6 +1573,25 @@ class RedactResult:
     #: page before it replaced the page} — what could still be found on it,
     #: and the user's own boxes (#119). Empty when nothing was flattened.
     flattened_areas: dict = field(default_factory=dict)
+    #: What this run did not look at: plain facts for the app to word, none
+    #: of them a failure (#119). One entry per kind, in this order, each a
+    #: dict of plain values with page numbers counted from 1:
+    #:   {"kind": "no_text", "pages": [...]} — searched pages with no text
+    #:     at all (a scan with no text layer, text drawn as outlines): a
+    #:     search finds no words on them;
+    #:   {"kind": "text_layer", "pages": [...], "hits": {page: n}} — pages
+    #:     whose text is an invisible layer over a picture (OCR). The search
+    #:     read that layer, and a word the layer got wrong is still in the
+    #:     picture; n is how many hits the search had on the page;
+    #:   {"kind": "attachments", "names": [...], "compressed": [...]} — the
+    #:     attachments in the output. A search reads each as stored and
+    #:     opens none; "compressed" are those that hold their contents
+    #:     packed (zip, docx, gzip, another PDF), where it could read nothing;
+    #:   {"kind": "flattened", "pages": [...], "areas": {page: n}} — pages
+    #:     turned into pictures, with flattened_areas;
+    #:   {"kind": "boxes_only", "pages": [...]} — a run by boxes alone: the
+    #:     words under the boxes were not searched for anywhere else.
+    notes: list = field(default_factory=list)
 
 
 class RedactionVerificationError(Exception):
@@ -3221,7 +3244,88 @@ def _box_key(rect) -> tuple:
     return tuple(round(v, 2) for v in rect)
 
 
-def _redact_boxes(page, boxes: list, graphics: int | None = None, text: int | None = None) -> int:
+#: Kinds of annotation that are not counted when they leave a page: a link
+#: and a popup draw nothing of their own, a form field's widget is counted
+#: as a field, and a redaction mark is this code's own.
+_UNCOUNTED_KINDS = (fitz.PDF_ANNOT_LINK, fitz.PDF_ANNOT_POPUP, fitz.PDF_ANNOT_WIDGET,
+                    fitz.PDF_ANNOT_REDACT)
+
+
+def _annotations_on(page) -> tuple[set, int]:
+    """(object numbers, how many with none) of the annotations on *page*
+    that are counted when they leave it."""
+    xrefs, unnumbered = set(), 0
+    for xref, kind, _name in page.annot_xrefs():
+        if kind in _UNCOUNTED_KINDS:
+            continue
+        if xref:
+            xrefs.add(xref)
+        else:
+            unnumbered += 1
+    return xrefs, unnumbered
+
+
+def _fields_on(page) -> int:
+    """How many form-field widgets *page* lists."""
+    return sum(1 for _xref, kind, _name in page.annot_xrefs() if kind == fitz.PDF_ANNOT_WIDGET)
+
+
+def _replies_to(page, gone: set) -> set:
+    """The annotations on *page* that reply to one of *gone* (object
+    numbers), or to a reply to one, however deep."""
+    doc, replies, grew = page.parent, set(), True
+    while grew:
+        grew = False
+        for xref, _kind, _name in page.annot_xrefs():
+            if not xref or xref in gone or xref in replies:
+                continue
+            kind, value = doc.xref_get_key(xref, "IRT")
+            if kind == "xref" and (int(value.split()[0]) in gone
+                                   or int(value.split()[0]) in replies):
+                replies.add(xref)
+                grew = True
+    return replies
+
+
+def _take_off(page, xrefs) -> None:
+    """Delete the annotations with these object numbers from *page*
+    (PyMuPDF takes each one's popup with it)."""
+    for xref in sorted(xrefs):
+        try:
+            annot = page.load_annot(xref)
+        except Exception:
+            continue                     # it went with the one it replied to
+        if annot is not None:
+            page.delete_annot(annot)
+
+
+def _apply(page, **options) -> int:
+    """page.apply_redactions(**options); returns how many annotations left
+    the page with it.
+
+    MuPDF takes one kind of annotation off the page itself while it
+    redacts: a free-text note that any redaction rectangle touches (probed
+    on 1.27 and 2.1; every other kind stays). It is counted here like one
+    this code takes off, and whatever replied to it goes too and is counted
+    — left behind, it would be a reply to nothing.
+    """
+    try:
+        before, unnumbered = _annotations_on(page)
+    except Exception:
+        before, unnumbered = set(), 0
+    page.apply_redactions(**options)
+    try:
+        after, unnumbered_after = _annotations_on(page)
+        gone = before - after
+        replies = _replies_to(page, gone) if gone else set()
+        _take_off(page, replies)
+        return len(gone) + len(replies) + max(0, unnumbered - unnumbered_after)
+    except Exception:
+        return 0
+
+
+def _redact_boxes(page, boxes: list, graphics: int | None = None, text: int | None = None,
+                  tally: dict | None = None) -> int:
     """Redact *boxes* on *page* and return how many there were.
 
     Form field (AcroForm widget) values live in /V and render via a
@@ -3241,31 +3345,43 @@ def _redact_boxes(page, boxes: list, graphics: int | None = None, text: int | No
     *graphics* and *text* are passed to apply_redactions when given: how
     line art under the boxes is treated (_line_art_mode), and whether text
     is removed at all (_redact_term_boxes keeps it in its second step).
+
+    *tally*, when given, is added to: "fields" by the form fields that left
+    the page here (counted by how many fewer the page then lists: PyMuPDF
+    1.27 does not delete a widget that has no object number, and that one
+    is redact_pdf's to take off and count later), "annotations" by what
+    _apply reports.
     """
     if not boxes:
         return 0
     for box in boxes:
         page.add_redact_annot(box, fill=(0, 0, 0))
-    for wdg in list(page.widgets()):
-        if any(r.intersects(wdg.rect) for r in boxes):
-            try:
-                wdg.field_value = ""
-                wdg.update()
-            except Exception:
-                pass
-            page.delete_widget(wdg)
+    under = [wdg for wdg in page.widgets() if any(r.intersects(wdg.rect) for r in boxes)]
+    fields = _fields_on(page) if under else 0
+    for wdg in under:
+        try:
+            wdg.field_value = ""
+            wdg.update()
+        except Exception:
+            pass
+        page.delete_widget(wdg)
+    if under and tally is not None:
+        tally["fields"] += max(0, fields - _fields_on(page))
     options = {"images": fitz.PDF_REDACT_IMAGE_PIXELS}
     if graphics is not None:
         options["graphics"] = graphics
     if text is not None:
         options["text"] = text
-    page.apply_redactions(**options)
+    left = _apply(page, **options)
+    if tally is not None:
+        tally["annotations"] += left
     return len(boxes)
 
 
-def _redact_term_boxes(page, hits: list) -> int:
+def _redact_term_boxes(page, hits: list, tally: dict | None = None) -> int:
     """Redact the term hits *hits* — (box, trimmed box) pairs from
-    pdf_verify.term_hits — and return how many there were.
+    pdf_verify.term_hits — and return how many there were. *tally* is
+    _redact_boxes'.
 
     In two steps, so that a term box takes only its own characters. A
     character is removed if its box overlaps a redaction rectangle at all,
@@ -3287,12 +3403,74 @@ def _redact_term_boxes(page, hits: list) -> int:
     whole = [box for box, _trimmed in hits]
     keep_text = getattr(fitz, "PDF_REDACT_TEXT_NONE", None)
     if keep_text is None:
-        return _redact_boxes(page, whole)
+        return _redact_boxes(page, whole, tally=tally)
     for _box, trimmed in hits:
         page.add_redact_annot(trimmed, fill=False)
-    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
-                          graphics=fitz.PDF_REDACT_LINE_ART_NONE)
-    return _redact_boxes(page, whole, text=keep_text)
+    left = _apply(page, images=fitz.PDF_REDACT_IMAGE_NONE,
+                  graphics=fitz.PDF_REDACT_LINE_ART_NONE)
+    if tally is not None:
+        tally["annotations"] += left
+    return _redact_boxes(page, whole, text=keep_text, tally=tally)
+
+
+def _under_keys(page, boxes: list) -> set:
+    """What identifies each character now under *boxes* (chars_under): the
+    character and where its text box is, to a tenth of a point."""
+    if not boxes:
+        return set()
+    try:
+        return {(c, tuple(round(v, 1) for v in b)) for c, b in chars_under(page, boxes)}
+    except Exception:
+        return set()
+
+
+def _redact_chars_left_under(page, boxes: list, were_under: set,
+                             tally: dict | None = None) -> None:
+    """Remove the characters the first pass left under *boxes*, boxes the
+    user drew (pdf_verify.chars_under: its centre in a box, or a fifth or
+    more of its text box). *were_under* is _under_keys of the page before
+    anything on it was redacted.
+
+    MuPDF removes a character when a box reaches a tenth of the way into
+    the letter as it measures the letter: by the font's own advance, not
+    the width the PDF gives it, and by the font's own height. Where the
+    two disagree — a font with wider /Widths than its letters, one with no
+    metrics of its own — the text box can be half under a box that MuPDF
+    finds clear of the letter. Such a character is boxed and removed here,
+    text only: nothing is filled, no image or drawing is touched. First by
+    the middle half of its text box, which takes nothing of a neighbour's;
+    if it is still there, by the whole of it. Bounded like the term
+    re-search; what cannot be removed is the verifier's to refuse.
+
+    Only a character that was under a box to begin with, and is still where
+    it was. Removing text can move the text after it on the line (MuPDF
+    1.28, PyMuPDF 2.1, does not always keep its place; 1.27 does), and a
+    letter that slides under a box that way was never the user's to
+    remove: taking it would move the next one in. It is left, and the
+    verifier, which goes by where things are, refuses the page.
+    """
+    if not boxes or not were_under:
+        return
+    tried: dict = {}
+    for _ in range(_REDACT_PASSES - 1):
+        marks = []
+        for key in sorted(_under_keys(page, boxes) & were_under):
+            b = key[1]
+            attempt = tried.get(key, 0)
+            tried[key] = attempt + 1
+            w, h = b[2] - b[0], b[3] - b[1]
+            if attempt > 1 or w <= 0 or h <= 0:
+                continue                 # tried both ways, or nothing to box
+            marks.append(fitz.Rect(b) if attempt else
+                         fitz.Rect(b[0] + w / 4, b[1] + h / 4, b[2] - w / 4, b[3] - h / 4))
+        if not marks:
+            return
+        for mark in marks:
+            page.add_redact_annot(mark, fill=False)
+        lifted = _apply(page, images=fitz.PDF_REDACT_IMAGE_NONE,
+                        graphics=fitz.PDF_REDACT_LINE_ART_NONE)
+        if tally is not None:
+            tally["annotations"] += lifted
 
 
 def _line_art_mode(page, boxes: list) -> int | None:
@@ -3308,8 +3486,15 @@ def _line_art_mode(page, boxes: list) -> int | None:
     frame or a long rule included. So it is used only when nothing else
     would go: when every drawing that reaches a box (its bounding box,
     widened by its line width) lies wholly inside one, by where its path
-    runs. Otherwise the default stays, and what is left with an edge inside
-    a box fails the verifier's line-art check.
+    runs. Otherwise the default stays, and what is left under a box fails
+    the verifier's line-art check.
+
+    A straight line that runs right through a box is not under it
+    (pdf_verify.has_edge_inside), and needs no removing. It still keeps
+    the default here: "remove if touched" would delete that line whole,
+    from one end of the page to the other, to be rid of something else
+    under the box. So a rule through a box verifies when nothing else is
+    under it, and is never the price of removing what is.
     """
     touched = getattr(fitz, "PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED", None)
     if touched is None or not boxes:
@@ -3337,6 +3522,24 @@ def _line_art_mode(page, boxes: list) -> int | None:
     return touched if reached else None
 
 
+def _annotation_area(page, xref: int):
+    """The rectangle of the annotation with object number *xref*, read
+    from its own /Rect and put into the coordinates boxes are given in
+    (the page before any /Rotate) with the page's own matrix, as the
+    verifier reads it. None if it has no plain array there."""
+    try:
+        what, value = page.parent.xref_get_key(xref, "Rect")
+        if what != "array":
+            return None
+        area = fitz.Rect(*(float(v) for v in value.strip("[]").split()))
+        area.normalize()
+        area = area * page.transformation_matrix
+        area.normalize()
+        return area
+    except Exception:
+        return None
+
+
 def _annotations_under(page, boxes: list) -> int:
     """Take off *page* every annotation whose rectangle overlaps one of
     *boxes* — boxes the user drew — and return how many went.
@@ -3346,33 +3549,36 @@ def _annotations_under(page, boxes: list) -> int:
     of a signature or a note's icon lying over a box is painted above the
     box. With each goes its popup and whatever replies to it, however deep
     (PyMuPDF takes the popup and the first level of replies itself).
-    Widgets have been dealt with by _redact_boxes; a popup is not judged by
-    its own rectangle, it draws nothing on the page. Links are MuPDF's to
-    remove, and are removed here too in case it did not.
+    Widgets are _redact_boxes' to deal with; a popup is not judged by its
+    own rectangle, it draws nothing on the page. Links are MuPDF's to
+    remove, and _links_under's after it.
+
+    Called before the boxes are applied: MuPDF takes a free-text note that
+    a box touches off the page itself, and then nothing here could find
+    what replied to it. And once more after: an annotation that has no
+    object number is placed by PyMuPDF's own measure of it, and for one
+    with nothing but a rectangle (a highlight with no quads, an ink note
+    with no strokes) that measure is no rectangle at all until the page
+    has been redrawn. One that has an object number is placed by its own
+    /Rect (_annotation_area), before and after alike.
     """
     if not boxes:
         return 0
-    doc = page.parent
-    doomed = {annot.xref for annot in list(page.annots() or [])
-              if any(box.intersects(annot.rect) for box in boxes)}
-    if doomed:
-        grew = True
-        while grew:                      # replies, and replies to replies
-            grew = False
-            for xref, _kind, _name in page.annot_xrefs():
-                if xref in doomed:
-                    continue
-                kind, value = doc.xref_get_key(xref, "IRT")
-                if kind == "xref" and int(value.split()[0]) in doomed:
-                    doomed.add(xref)
-                    grew = True
-        for xref in sorted(doomed):
+    doomed = set()
+    for xref, kind, _name in page.annot_xrefs():
+        if not xref or kind in _UNCOUNTED_KINDS:
+            continue
+        area = _annotation_area(page, xref)
+        if area is None:
             try:
-                annot = page.load_annot(xref)
+                area = page.load_annot(xref).rect
             except Exception:
-                continue                 # it went with the one it replied to
-            if annot is not None:
-                page.delete_annot(annot)
+                continue
+        if any(box.intersects(area) for box in boxes):
+            doomed.add(xref)
+    if doomed:
+        doomed |= _replies_to(page, doomed)
+        _take_off(page, doomed)
     # One written into the page's /Annots array itself has no object number,
     # and page.annots() leaves it out. Walking from the first annotation
     # reaches it; it is judged the same, and nothing can reply to it.
@@ -3390,20 +3596,43 @@ def _annotations_under(page, boxes: list) -> int:
             break
         page.delete_annot(target)
         direct += 1
-    for link in page.get_links():
-        try:
-            if any(box.intersects(link["from"]) for box in boxes):
-                page.delete_link(link)
-        except Exception:
-            continue
     return len(doomed) + direct
 
 
-def _unlisted_annotations_under(pdf, boxes: dict) -> int:
+def _links_under(page, boxes: list) -> None:
+    """Take off *page* any link whose rectangle still overlaps one of
+    *boxes*, boxes the user drew, after they have been applied.
+
+    MuPDF removes the links a redaction rectangle overlaps itself, all at
+    once (probed on 1.27 and 2.1: wholly under, half under, a corner
+    under); this is for one it should leave. After, not before: PyMuPDF
+    reads the page's whole list of links again after each one it deletes,
+    and asking it for the links (page.get_links()) goes through that list
+    once per link, so on a page with thousands of links, a box over a
+    few hundred of them ran for minutes. Here the list is read once, and a
+    link's rectangle is put into the boxes' coordinates with the page's
+    own matrix, as the verifier does it (get_links() gives it on the page
+    as turned, and on a turned page links nowhere near a box were taken).
+    """
+    if not boxes:
+        return
+    for xref, kind, name in page.annot_xrefs():
+        if kind != fitz.PDF_ANNOT_LINK or not xref:
+            continue
+        try:
+            area = _annotation_area(page, xref)
+            if area is not None and any(box.intersects(area) for box in boxes):
+                page.delete_link({"xref": xref, "id": name})
+        except Exception:
+            continue
+
+
+def _unlisted_annotations_under(pdf, boxes: dict) -> tuple[int, int]:
     """Take out of each page's /Annots array every annotation that is
     written into the array itself — not an object of its own — and overlaps
-    one of the user's boxes on that page; returns how many went. *boxes* is
-    {page index: [(x0, y0, x1, y1)]} in the page's own PDF coordinates.
+    one of the user's boxes on that page; returns (annotations, form
+    fields) that went. *boxes* is {page index: [(x0, y0, x1, y1)]} in the
+    page's own PDF coordinates.
 
     The pikepdf side of _annotations_under, for what PyMuPDF does not take
     off the page: 1.27 does not delete a form field's widget that has no
@@ -3411,7 +3640,7 @@ def _unlisted_annotations_under(pdf, boxes: dict) -> int:
     Nothing can refer to such a dictionary, so nothing goes with it; a
     popup is not judged by its own rectangle here either.
     """
-    removed = 0
+    removed, fields = 0, 0
     for pno, rects in boxes.items():
         try:
             page = pdf.pages[pno].obj
@@ -3432,13 +3661,85 @@ def _unlisted_annotations_under(pdf, boxes: dict) -> int:
                     under = False
                 if not under:
                     keep.append(entry)
-                elif _name_of(entry, "/Subtype") != "/Widget":
-                    removed += 1        # a widget under a box is not counted anywhere
+                elif _name_of(entry, "/Subtype") == "/Widget":
+                    fields += 1
+                else:
+                    removed += 1
             if len(keep) != len(annots):
                 page["/Annots"] = pikepdf.Array(keep)
         except Exception:
             continue
-    return removed
+    return removed, fields
+
+
+def _search_fact(page) -> str | None:
+    """What a search cannot read of *page*, if anything: "no_text" — it
+    draws something and none of it is text (a scan with no text layer,
+    type drawn as outlines) — or "text_layer": it shows a picture and most
+    of its text is drawn in the invisible mode, the way OCR lays what it
+    read over a scan. The search reads that layer; a word the layer got
+    wrong is still in the picture.
+
+    From MuPDF's own account of what the page draws, in order (the same
+    reading the matcher has: an annotation's text is the page's text
+    here too). An empty page is neither; nor is ordinary type beside a
+    picture with a hidden word somewhere. A fact for RedactResult.notes,
+    never a check: a page that cannot be read this way is simply not noted.
+    """
+    try:
+        drawn = page.get_bboxlog()
+        kinds = {entry[0] for entry in drawn}
+        if not any(kind.endswith("text") for kind in kinds):
+            return "no_text" if drawn else None
+        if "ignore-text" not in kinds or "fill-image" not in kinds:
+            return None
+        hidden = shown = 0
+        for span in page.get_texttrace():
+            letters = sum(1 for ch in span.get("chars", ()) if ch[0] > 32)
+            if span.get("type") == 3:            # the invisible mode
+                hidden += letters
+            else:
+                shown += letters
+        return "text_layer" if hidden > shown else None
+    except Exception:
+        return None
+
+
+def _page_ranges(numbers) -> str:
+    """Page numbers as text, runs joined: [1, 2, 3, 7] -> "1-3, 7"."""
+    runs: list[list[int]] = []
+    for n in sorted(set(numbers)):
+        if runs and n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
+
+
+def _notes(seen: dict | None, attached: list, flattened: list, flattened_areas: dict,
+           boxed_only: list) -> list[dict]:
+    """RedactResult.notes for one run (see the field for each kind).
+    *seen* is what redact_pages told of a search's pages, None for a run
+    with no search; *attached* is pdf_analyze.embedded_files of the output;
+    *boxed_only* the 0-based pages the boxes were on in a run by boxes
+    alone."""
+    notes: list[dict] = []
+    if seen is not None:
+        if seen["no_text"]:
+            notes.append({"kind": "no_text", "pages": sorted(p + 1 for p in seen["no_text"])})
+        if seen["text_layer"]:
+            layer = sorted(seen["text_layer"].items())
+            notes.append({"kind": "text_layer", "pages": [p + 1 for p, _n in layer],
+                          "hits": {p + 1: n for p, n in layer}})
+        if attached:
+            notes.append({"kind": "attachments", "names": [name for name, _packed in attached],
+                          "compressed": [name for name, packed in attached if packed]})
+    if flattened:
+        notes.append({"kind": "flattened", "pages": list(flattened),
+                      "areas": dict(flattened_areas)})
+    if boxed_only:
+        notes.append({"kind": "boxes_only", "pages": [p + 1 for p in boxed_only]})
+    return notes
 
 
 def _refusal_message(failed) -> str:
@@ -3490,12 +3791,16 @@ def redact_pdf(
         characters, so that words on the lines above and below are not
         taken with it; the fill is the whole box (_redact_term_boxes).
       * rects: user-drawn boxes, each {"page": int (0-based), "x0", "y0",
-        "x1", "y1": float} in PDF point coordinates -- for the visual
-        redaction UI (Part 2); unused by the current search-term-only
-        frontend but wired through end-to-end. A box takes everything it
-        covers: every annotation that overlaps it leaves the page
-        (_annotations_under), and line art under it is removed where that
-        takes nothing else with it (_line_art_mode).
+        "x1", "y1": float} in PyMuPDF's point coordinates: from the page's
+        top left, on the page as it is before any /Rotate. A box takes
+        everything it covers. Every character under it goes
+        (pdf_verify.chars_under: its centre in the box, or a fifth or more
+        of its text box; what MuPDF's own pass leaves of those is removed
+        by _redact_chars_left_under). Every annotation that overlaps it
+        leaves the page, with its replies (_annotations_under), and so
+        does a form field. Line art under it is removed where that takes
+        nothing else with it (_line_art_mode); a straight line that runs
+        right through the box is left, and hides nothing.
 
     Beyond the page content apply_redactions() reaches, search_terms are also
     scrubbed WHOLE-VALUE from every document-level surface verification checks
@@ -3538,7 +3843,12 @@ def redact_pdf(
 
     Returns a RedactResult with redaction_count (page-content redactions --
     unchanged meaning), pages_affected, a per-surface surface_counts
-    breakdown, the verification report dict, and any flattened_pages.
+    breakdown, the verification report dict, any flattened_pages, and
+    ``notes``: what the run did not look at, as plain facts for the app to
+    word (pages with no text, pages whose text is a layer over a picture,
+    attachments, pages turned into pictures, a run by boxes alone; see
+    RedactResult). A search that finds nothing at all has no result to
+    carry a note, so its ValueError names the pages it could not read.
     """
     scrub_terms = [t for t in (search_terms or []) if t and t.strip()]
     if not scrub_terms and not rects:
@@ -3568,10 +3878,14 @@ def redact_pdf(
     #: for the one thing under a box that only pikepdf can take off the page.
     hand_boxes: dict[int, list] = {}
 
-    def redact_pages(doc) -> tuple[int, set, int]:
+    def redact_pages(doc) -> tuple[int, set, dict]:
         """Redact the page content of *doc*; returns (rectangles drawn,
-        pages touched, annotations taken from under the user's boxes)."""
-        total, drawn, touched, lifted = len(doc), 0, set(), 0
+        pages touched, what else is to be told of the pages): the
+        "annotations" and form "fields" that left a page, and for a search
+        the pages with "no_text" and the hits on each page whose text is a
+        "text_layer" over a picture (_search_fact)."""
+        total, drawn, touched = len(doc), 0, set()
+        seen: dict = {"annotations": 0, "fields": 0, "no_text": [], "text_layer": {}}
         hand_boxes.clear()
         for i, pno in enumerate(target):
             if cancel and cancel.is_set():
@@ -3583,6 +3897,8 @@ def redact_pdf(
                 continue
 
             page = doc[pno]
+            # What a search cannot read of this page, before it is changed.
+            fact = _search_fact(page) if scrub_terms else None
             # Term hits come from the one matcher the verifier also uses
             # (pdf_verify.term_hits): its own views of the page's
             # characters, and search_for's hits beside them, each widened to
@@ -3593,17 +3909,22 @@ def redact_pdf(
                 rect = fitz.Rect(rr["x0"], rr["y0"], rr["x1"], rr["y1"])
                 if not rect.is_empty and rect.is_valid:
                     drawn_by_hand.append(rect)
+            were_under = _under_keys(page, drawn_by_hand)
 
-            # A term box takes only its own characters; a box drawn by hand
-            # takes all it covers, and line art with it where that costs
-            # nothing else on the page.
-            added = _redact_term_boxes(page, hits)
-            added += _redact_boxes(page, drawn_by_hand,
-                                   graphics=_line_art_mode(page, drawn_by_hand))
+            # A term box takes only its own characters.
+            added = found = _redact_term_boxes(page, hits, seen)
             # Nothing is drawn above a box: what lies over one drawn by hand
-            # goes. (What draws a term is found by what it draws, later, in
-            # the scrub.)
-            lifted += _annotations_under(page, drawn_by_hand)
+            # goes, before the box is applied (see _annotations_under). What
+            # draws a term is found by what it draws, later, in the scrub.
+            seen["annotations"] += _annotations_under(page, drawn_by_hand)
+            # A box drawn by hand takes all it covers: line art where that
+            # costs nothing else on the page, and any character the first
+            # pass leaves under it.
+            added += _redact_boxes(page, drawn_by_hand,
+                                   graphics=_line_art_mode(page, drawn_by_hand), tally=seen)
+            _redact_chars_left_under(page, drawn_by_hand, were_under, seen)
+            seen["annotations"] += _annotations_under(page, drawn_by_hand)
+            _links_under(page, drawn_by_hand)
             if drawn_by_hand:
                 to_pdf = ~page.transformation_matrix
                 hand_boxes[pno] = [tuple((box * to_pdf).normalize()) for box in drawn_by_hand]
@@ -3623,13 +3944,18 @@ def redact_pdf(
                 if not again:
                     break
                 applied.update(map(_box_key, again))
-                _redact_boxes(page, again)
-                added += sum(1 for b in again if _box_key(b) not in counted)
+                _redact_boxes(page, again, tally=seen)
+                new = sum(1 for b in again if _box_key(b) not in counted)
+                added, found = added + new, found + new
                 counted.update(map(_box_key, again))
             if added:
                 drawn += added
                 touched.add(pno)
-        return drawn, touched, lifted
+            if fact == "no_text":
+                seen["no_text"].append(pno)
+            elif fact == "text_layer":
+                seen["text_layer"][pno] = found
+        return drawn, touched, seen
 
     # MuPDF checks a file's objects as it comes to read them. One it finds
     # damaged makes it go back to the file and rebuild everything from there
@@ -3637,7 +3963,7 @@ def redact_pdf(
     # gone, without a word. If that happens between here and the end of the
     # save below, the redaction is what is gone.
     repaired_at_start = bool(doc.is_repaired)
-    hit_count, pages_touched, lifted = redact_pages(doc)
+    hit_count, pages_touched, seen = redact_pages(doc)
 
     # The page-content redaction is done; now widen the scrub and write the
     # output atomically. Saved even when hit_count == 0 -- a term can live
@@ -3676,7 +4002,7 @@ def redact_pdf(
             # so the same work done on it holds. Once: it cannot be repaired
             # twice.
             doc = fitz.open(work)
-            hit_count, pages_touched, lifted = redact_pages(doc)
+            hit_count, pages_touched, seen = redact_pages(doc)
             emb_gone = _scrub_embedded_file_names(doc, scrub_terms, case_sensitive)
             work = _mktmp()
             doc.save(work, garbage=4, deflate=True, clean=True)
@@ -3687,8 +4013,10 @@ def redact_pdf(
             surface_counts["page_content"] = hit_count
         if emb_hits:
             surface_counts["embedded_files"] = emb_hits
-        if lifted:
-            surface_counts["annotations_removed"] = lifted
+        if seen["annotations"]:
+            surface_counts["annotations_removed"] = seen["annotations"]
+        if seen["fields"]:
+            surface_counts["fields_removed"] = seen["fields"]
         # The temp is fitz-saved from the authenticated doc — always
         # plaintext, so the scrub (and verify below) need no password.
         doc_scrub = _scrub_document_surfaces(work, scrub_terms, case_sensitive,
@@ -3697,7 +4025,13 @@ def redact_pdf(
             surface_counts[k] = surface_counts.get(k, 0) + v
 
         if hit_count == 0 and emb_hits == 0 and sum(doc_scrub.values()) == 0:
-            raise ValueError("No matching content found to redact.")
+            # No result to carry a note, so the one fact that explains an
+            # empty search goes in the message: pages it could not read.
+            unread = _page_ranges(p + 1 for p in seen["no_text"])
+            raise ValueError("No matching content found to redact." + (
+                f" {'Pages' if len(seen['no_text']) > 1 else 'Page'} {unread} "
+                f"{'have' if len(seen['no_text']) > 1 else 'has'} no text: a search cannot "
+                f"read words in a scan or a picture." if unread else ""))
 
         final_src = work
         if flatten_pages:
@@ -3730,16 +4064,18 @@ def redact_pdf(
             # Here, not in the scrub: a box drawn by hand leaves one too.
             # First what the tree says in words of content a box removed
             # (it is told from the originals), then the thumbnails.
-            unlisted = _unlisted_annotations_under(pdf, hand_boxes)
-            if unlisted:
-                surface_counts["annotations_removed"] = (
-                    surface_counts.get("annotations_removed", 0) + unlisted)
+            for key, n in zip(("annotations_removed", "fields_removed"),
+                              _unlisted_annotations_under(pdf, hand_boxes), strict=True):
+                if n:
+                    surface_counts[key] = surface_counts.get(key, 0) + n
             for key, n in (("structure_text", _drop_structure_text(
                                pdf, input_path, password, pages_touched)),
                            ("structure_refs", _drop_stale_structure_refs(pdf)),
                            ("thumbnails", _drop_thumbnails(pdf))):
                 if n:
                     surface_counts[key] = n
+            # What a search did not open: the attachments still in the file.
+            attached = embedded_files(pdf) if scrub_terms else []
             save_with_content_id(pdf, candidate, fix_metadata_version=False)
 
         # Verify, then commit (fail-closed, #99): every target must be
@@ -3786,4 +4122,6 @@ def redact_pdf(
         verification=report.to_dict(),
         flattened_pages=flattened,
         flattened_areas=flattened_areas,
+        notes=_notes(seen if scrub_terms else None, attached, flattened, flattened_areas,
+                     sorted(hand_boxes) if not scrub_terms else []),
     )
