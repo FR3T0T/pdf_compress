@@ -5,9 +5,15 @@ import {
   MOCK_SANITIZE_DEFAULTS,
   MOCK_TOOL_REGISTRY,
   MOCK_PRESETS,
+  MOCK_REDACT_NOT_POSSIBLE,
+  MOCK_REDACT_REFUSAL_DOCUMENT_LEVEL,
+  MOCK_REDACT_REFUSAL_LINE_ART,
+  MOCK_REDACT_SUMMARY,
+  MOCK_REDACT_SUMMARY_EVERYTHING,
+  MOCK_REDACT_SUMMARY_FLATTENED,
   mockSanitizeResult,
 } from './mockData';
-import { simulateOperation, type MockFileLike } from './mockEventBus';
+import { simulateFailure, simulateOperation, type MockFileLike } from './mockEventBus';
 import { safeJsonParse } from './safeJsonParse';
 
 export const isRealBridge = (): boolean => typeof window !== 'undefined' && !!window.BridgeAPI;
@@ -621,17 +627,35 @@ export const bridgeApi = {
     if (window.BridgeAPI) window.BridgeAPI.startRedact(params);
     else {
       const outputPath = String(params.output_path ?? params.outputPath ?? '');
-      const termCount = Array.isArray(params.search_terms) ? params.search_terms.length : 1;
+      const terms = Array.isArray(params.search_terms) ? (params.search_terms as string[]) : [];
+      const termCount = terms.length || 1;
       const flattened = Array.isArray(params.flatten_pages) ? (params.flatten_pages as number[]) : [];
+      // Browser-dev mock: a search word picks the state to show (#119).
+      const asked = terms.map((t) => t.toLowerCase());
+      if (!flattened.length && asked.includes('lineart')) {
+        simulateFailure(TOOL_KEYS.redact, 'Redaction could not be verified.', { ...MOCK_REDACT_REFUSAL_LINE_ART, documentLevel: false });
+        return;
+      }
+      if (asked.includes('refuse')) {
+        simulateFailure(TOOL_KEYS.redact, 'Redaction could not be verified.', { ...MOCK_REDACT_REFUSAL_DOCUMENT_LEVEL, documentLevel: true });
+        return;
+      }
+      if (asked.includes('xfa')) {
+        simulateFailure(TOOL_KEYS.redact, MOCK_REDACT_NOT_POSSIBLE, { notPossible: true });
+        return;
+      }
+      const everything = asked.includes('everything');
       simulateOperation(TOOL_KEYS.redact, mockFilesFromParams(params), () => ({
         input_path: String(params.file ?? ''),
         output_path: outputPath,
-        redaction_count: termCount * 3,
-        pages_affected: Math.min(termCount * 2, 5),
+        redaction_count: everything ? 32768 : termCount * 3,
+        pages_affected: everything ? 1200 : Math.min(termCount * 2, 5),
         surface_counts: { page_content: termCount * 3 },
-        // Browser-dev mock always "verifies" (no real backend to refuse).
+        // Otherwise the browser-dev mock always "verifies".
         verification: { verified: true, checks: [], flattenTargetPages: null },
         flattened_pages: flattened,
+        summary: everything ? MOCK_REDACT_SUMMARY_EVERYTHING
+          : flattened.length ? MOCK_REDACT_SUMMARY_FLATTENED : MOCK_REDACT_SUMMARY,
       }));
     }
   },

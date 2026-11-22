@@ -39,7 +39,12 @@ exist. The bridge module (`src/bridge/bridgeApi.ts`) detects that and serves
 realistic mock responses instead, so every page is reviewable standalone
 (drop zones fall back to a real `<input type="file">`). On the Analyze page
 the mock Sanitize is verified, and lists what the ticked options left alone;
-tick "External links" to see a refusal instead. Route `#/gallery` is a
+tick "External links" to see a refusal instead. On the Redact page the
+search word picks the answer: `everything` (every count and note, at large
+numbers), `lineart` (a refusal with a flatten offer; accept it to see the
+flattened result), `refuse` (a refusal with nothing to offer) and `xfa` (a
+file that cannot be redacted); any other word is redacted plainly. The
+mock's words are made by the real Python functions. Route `#/gallery` is a
 dev-only component gallery, not shown in the sidebar.
 
 ## Project structure

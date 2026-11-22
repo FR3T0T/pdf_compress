@@ -11,7 +11,7 @@ import secrets
 import tempfile
 import threading
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Callable
 
 import fitz  # PyMuPDF
@@ -37,8 +37,10 @@ from pdf_verify import (
     WalkStatus,
     chars_under,
     page_to_picture_matrix,
+    pages_in_words,
     path_lines,
     pdf_to_page_matrix,
+    redaction_refusal_detail,
     structure_kids,
     structure_object,
     structure_refs,
@@ -1619,16 +1621,19 @@ class RedactionVerificationError(Exception):
     those, so no offer). Nothing was written to the destination: the
     candidate lived in a temp file, now deleted, and whatever was at
     output_path before — the input itself, when redacting in place — is
-    untouched.
+    untouched. ``detail`` is the same thing in plain words for the window
+    (pdf_verify.redaction_refusal_detail): a headline, what was found and
+    where, and what can be done.
     """
 
     def __init__(self, message: str, *, report: dict | None = None,
                  flatten_pages: list | None = None,
-                 document_level: bool = False):
+                 document_level: bool = False, detail: dict | None = None):
         super().__init__(message)
         self.report = report
         self.flatten_pages = flatten_pages
         self.document_level = document_level
+        self.detail = detail
 
 
 # Whole-value redaction marker (D2): a matched title/annotation value is
@@ -1864,8 +1869,8 @@ def _rename_destinations(pdf, objects, finder) -> int:
 #  page, but a tagged file's structure tree goes on pointing at it, and at
 #  everything it says.
 
-_XFA_ONLY = ("This form exists only as XFA data, and that data holds a search "
-             "term. An XFA-only form cannot be term-redacted. Nothing was saved.")
+_XFA_ONLY = ("This file's form is stored in a format (XFA) that redaction cannot "
+             "change, and what you searched for is in that form. Nothing was saved.")
 
 
 class RedactionNotPossibleError(ValueError):
@@ -4031,6 +4036,163 @@ def _let_go() -> None:
     gc.collect()
 
 
+# ── What a finished redaction says (#119, R4) ────────────────────────
+
+#: surface_counts key -> (one, many): what else a run removed, in words. In
+#: the order the window lists them; page_content is the headline.
+_REMOVED_WORDS = {
+    "annotations_removed": ("note, stamp or other mark taken off a page",
+                            "notes, stamps or other marks taken off the pages"),
+    "fields_removed": ("form field taken off a page", "form fields taken off the pages"),
+    "links_removed": ("link taken off a page", "links taken off the pages"),
+    "thumbnails": ("small preview picture of a page", "small preview pictures of pages"),
+    "structure_text": ("description of removed content, the kind screen readers read aloud",
+                       "descriptions of removed content, the kind screen readers read aloud"),
+    "structure_refs": ("hidden copy of removed content that the file still pointed to",
+                       "hidden copies of removed content that the file still pointed to"),
+    "docinfo": ("entry in the document's details, such as the title or author",
+                "entries in the document's details, such as the title or author"),
+    "xmp": ("set of hidden document details (XMP)", "sets of hidden document details (XMP)"),
+    "metadata": ("other block of hidden details", "other blocks of hidden details"),
+    "bookmarks": ("bookmark title", "bookmark titles"),
+    "annotations": ("piece of text in a note or comment", "pieces of text in notes or comments"),
+    "form_fields": ("value typed into a form field", "values typed into form fields"),
+    "field_text": ("piece of text about a form field, such as its tooltip",
+                   "pieces of text about form fields, such as their tooltips"),
+    "field_names": ("form field name", "form field names"),
+    "rich_text": ("piece of formatted text in a note or field",
+                  "pieces of formatted text in notes or fields"),
+    "links": ("web address", "web addresses"),
+    "embedded_files": ("attached file", "attached files"),
+    "structure": ("piece of text in the file's structure",
+                  "pieces of text in the file's structure"),
+    "layers": ("layer name", "layer names"),
+    "piece_info": ("block of data left by another program",
+                   "blocks of data left by other programs"),
+    "scripts": ("script", "scripts"),
+    "destinations": ("named place in the file", "named places in the file"),
+    "pdftex": ("record left by the program that made the file",
+               "records left by the program that made the file"),
+    "page_labels": ("page label", "page labels"),
+    "xfa": ("set of XFA form data", "sets of XFA form data"),
+    "signatures": ("digital signature", "digital signatures"),
+}
+
+
+def _how_many(n: int, one: str, many: str) -> str:
+    return f"{n:,} {one if n == 1 else many}"
+
+
+def _names_in_words(names: list, cap: int = 5) -> str:
+    names = [str(n) for n in names]
+    if len(names) > cap:
+        return ", ".join(names[:cap]) + f" and {len(names) - cap:,} more"
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _total(by_page) -> int:
+    try:
+        return sum(int(v) for v in dict(by_page or {}).values())
+    except Exception:
+        return 0
+
+
+def _note_in_words(note: dict) -> str | None:
+    """One note of RedactResult.notes as a sentence; None for a kind this
+    does not know (it is not shown as code)."""
+    kind, pages = note.get("kind"), note.get("pages") or []
+    many = len(set(pages)) > 1
+    where = pages_in_words(pages)
+    Where = where[:1].upper() + where[1:]
+    if kind == "no_text":
+        return (f"{Where} {'have' if many else 'has'} no text to search. "
+                f"{'They may be scans or pictures' if many else 'It may be a scan or a picture'}"
+                f", so any words in {'them' if many else 'it'} were not searched.")
+    if kind == "text_layer":
+        hits = _total(note.get("hits"))
+        found = ("found no matches" if hits == 0 else
+                 f"found {_how_many(hits, 'match', 'matches')}")
+        return (f"{Where} {'are scans' if many else 'is a scan'} with a hidden text layer. "
+                f"The search read that layer and {found} there. If the layer misread a word, "
+                f"that word is still in the picture.")
+    if kind == "attachments":
+        names, packed = list(note.get("names") or []), list(note.get("compressed") or [])
+        if not names:
+            return None
+        line = (f"This file has {_how_many(len(names), 'attached file', 'attached files')}: "
+                f"{_names_in_words(names)}. Attached files were searched as they are stored, "
+                f"and were not opened.")
+        if packed:
+            who = (_names_in_words(packed) if len(packed) <= 5
+                   else f"{len(packed):,} of them")
+            several = len(packed) > 1
+            line += (f" {who} {'are' if several else 'is'} packed (like a zip or Word file), "
+                     f"so nothing inside {'them' if several else 'it'} could be searched.")
+        return line
+    if kind == "flattened":
+        areas = _total(note.get("areas"))
+        # No area on the picture when what was found had already been
+        # removed (and filled black) from the page, or lay off it.
+        blacked = (f", with {_how_many(areas, 'area', 'areas')} blacked out on "
+                   f"{'them' if many else 'it'}" if areas else "")
+        return (f"{Where} {'were' if many else 'was'} turned into "
+                f"{'pictures' if many else 'a picture'}{blacked}"
+                f". {'Their' if many else 'Its'} text can no longer be selected or searched.")
+    if kind == "field_still_shown":
+        return (f"A form field under one of your boxes is also shown elsewhere, on {where}. "
+                f"It is still shown there, and anything filled into it is still in the file.")
+    if kind == "boxes_only":
+        return ("Only the boxes you drew were redacted. The words under them were not searched "
+                "for anywhere else in the file.")
+    if kind == "text_may_move":
+        return (f"This run used version {note.get('version', '')} of the PDF library. With "
+                f"this version, text after a removed word can shift along its line.")
+    return None
+
+
+def redaction_summary(result: "RedactResult") -> dict:
+    """A finished redaction in plain words, for the window (#119, R4).
+
+    ``headline``
+        How many places were redacted, on how many pages.
+    ``checked``
+        That the new file was checked before it was saved.
+    ``removed``
+        What else was removed, one line per kind, with how many; a count
+        can be 1 or 32,768, and large numbers are grouped by thousands.
+    ``notes``
+        What to know about what the run did not look at, one sentence per
+        note of RedactResult.notes, in their order.
+
+    Like the words of a refusal (pdf_verify.redaction_refusal_detail), made
+    here so that they are in one place and tested; the window shows the
+    lines it is given.
+    """
+    count, pages = int(result.redaction_count or 0), int(result.pages_affected or 0)
+    headline = (f"Redacted {_how_many(count, 'place', 'places')} on "
+                f"{_how_many(pages, 'page', 'pages')}." if count else
+                "Nothing on the pages matched. What you searched for was removed from other "
+                "parts of the file.")
+    counts = dict(result.surface_counts or {})
+    removed = [_how_many(int(counts[key]), *words) for key, words in _REMOVED_WORDS.items()
+               if counts.get(key)]
+    removed += [_how_many(int(n), "other item", "other items") + f" ({key.replace('_', ' ')})"
+                for key, n in counts.items()
+                if n and key != "page_content" and key not in _REMOVED_WORDS]
+    notes = [line for line in map(_note_in_words, result.notes or []) if line]
+    return {"headline": headline,
+            "checked": "Checked before saving: what you asked to remove is gone from the new "
+                       "file.",
+            "removed": removed, "notes": notes}
+
+
+def redact_result_payload(result: "RedactResult") -> dict:
+    """What the redact slot hands the window for a finished run: the result,
+    as plain data, with its plain-words summary (redaction_summary) under
+    ``summary``."""
+    return {**asdict(result), "summary": redaction_summary(result)}
+
+
 def _refusal_message(failed) -> str:
     """One-line reason for a refused redaction, from its failed checks."""
     if failed and all(c.id == "redaction.file_id" for c in failed):
@@ -4404,6 +4566,7 @@ def redact_pdf(
                 report=report.to_dict(),
                 flatten_pages=offer,
                 document_level=doc_level,
+                detail=redaction_refusal_detail(report, offer),
             )
         # Nothing may still hold the source open when the copy takes its
         # place (redacting in place, on Windows): see _let_go.

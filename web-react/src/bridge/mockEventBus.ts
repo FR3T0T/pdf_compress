@@ -72,3 +72,17 @@ export function simulateOperation(
     300 * (items.length + 1) + 250
   );
 }
+
+/**
+ * Simulate an operation that ends refused: a short progress, then a "done"
+ * event with success false, *message*, and *extra* merged in at the top
+ * level — the shape ui/bridge.py's _done_payload gives a refusal.
+ */
+export function simulateFailure(toolKey: string, message: string, extra: Record<string, unknown>): void {
+  setTimeout(() => {
+    mockEventBus.emit('progress', { toolKey, current: 1, total: 1, pct: 100, filename: 'document.pdf' });
+  }, 300);
+  setTimeout(() => {
+    mockEventBus.emit('done', { toolKey, success: false, message, ...extra });
+  }, 550);
+}

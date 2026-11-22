@@ -53,6 +53,7 @@ from epdf_crypto import (
 )
 from pdf_analyze import DEFAULT_SANITIZE, analyze_file, sanitize_payload
 from pdf_ops import (
+    RedactionNotPossibleError,
     RedactionVerificationError,
     add_page_numbers,
     add_watermark,
@@ -74,6 +75,7 @@ from pdf_ops import (
     read_metadata,
     rects_from_page_pictures,
     redact_pdf,
+    redact_result_payload,
     repair_pdf,
     split_pdf,
     unlock_pdf,
@@ -126,7 +128,20 @@ class _Worker(QThread):
                     "verification": exc.report,
                     "flattenablePages": exc.flatten_pages,
                     "documentLevel": exc.document_level,
+                    # The same in plain words, for the window (#119).
+                    "refusal": exc.detail,
                 }),
+                ensure_ascii=False,
+            ))
+        except RedactionNotPossibleError as exc:
+            # A file that cannot be redacted at all (a form stored only as
+            # XFA; a PDF library that removes other text when it redacts):
+            # a plain refusal, not a crash. Its message says why in plain
+            # words; the log gets one line and no stack trace (#119).
+            log.info("Operation %s refused: the file cannot be redacted", self.tool_key)
+            self.finished.emit(json.dumps(
+                _done_payload(self.tool_key, False, message=str(exc),
+                              extra={"notPossible": True}),
                 ensure_ascii=False,
             ))
         except (CancelledError, InterruptedError):
@@ -1742,7 +1757,8 @@ class Bridge(QObject):
             rects = p.get("rects")
             if rects:
                 rects = rects_from_page_pictures(p["inputPath"], rects, p.get("password"))
-            return redact_pdf(
+            # The result with its plain-words summary for the window (#119).
+            return redact_result_payload(redact_pdf(
                 input_path=p["inputPath"],
                 output_path=p["outputPath"],
                 search_terms=p.get("searchTerms"),
@@ -1755,6 +1771,6 @@ class Bridge(QObject):
                 flatten_pages=p.get("flattenPages"),
                 on_progress=progress_cb,
                 cancel=cancel,
-            )
+            ))
 
         self._run_in_thread(tool_key, _work)

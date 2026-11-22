@@ -129,7 +129,7 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 ### Security
 - **Protect PDF** — add password and set permissions (AES-256)
 - **Unlock PDF** — remove password protection
-- **Redact PDF** — permanently remove sensitive text via search terms or a visual box-drawing mode; true content destruction (including form-field values, metadata, bookmarks, annotations, link URLs, and attachment names), not a cosmetic overlay. **Fail-closed:** every redaction is verified *before* it is saved and *refused* if any target is still extractable — a page-content leak can be force-removed by flattening the affected page(s) to image; nothing is ever saved with a residual, and a refused run leaves the destination untouched (including the original, when redacting in place). The output gets a new content-derived file identifier, so it cannot be matched to its source through the PDF `/ID`
+- **Redact PDF** — permanently remove sensitive text via search terms or a visual box-drawing mode; true content destruction (including form-field values, metadata, bookmarks, annotations, link URLs, and attachment names), not a cosmetic overlay. **Fail-closed:** every redaction is verified *before* it is saved and *refused* if any target is still extractable — a page-content leak can be force-removed by flattening the affected page(s) to image; nothing is ever saved with a residual, and a refused run leaves the destination untouched (including the original, when redacting in place). The output gets a new content-derived file identifier, so it cannot be matched to its source through the PDF `/ID`. What it removes, what it reports and its known limits: [Redaction](#redaction)
 - **Enhanced encryption** — custom `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 and Argon2id key derivation
 
 ### Page Operations
@@ -151,6 +151,104 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 - **Repair PDF** — fix corrupted PDF files
 - **Compare PDFs** — find differences between two PDFs
 - **Analyze Document** — offline privacy & security audit; finds embedded JavaScript (including scripts on bookmarks and form fields), auto-run/launch actions, external trackers, embedded files and references to external files, hidden layers, invisible text, and identifying metadata (document, page or object level), and says so when part of a file could not be checked. One-click sanitizing writes a clean copy that is verified before it is saved: it reports what it removed and what the ticked options left alone, or refuses and says what is still there
+
+---
+
+## Redaction
+
+Redact works in one of two ways. **Search terms**: every place a word or
+phrase stands is found and removed, on the pages and everywhere else in the
+file. **Draw boxes**: what lies under each box you draw on a page is
+removed, and nothing is searched for.
+
+**What it removes.**
+- *On the page*: the text of each hit or under each box, the pixels of a
+  picture under it, and a drawing under a box (a straight line that only
+  passes through a box hides nothing and stays). Each place is filled black.
+- *Over the page*: notes, stamps and other annotations lying over a box, or
+  whose own appearance shows the term, with their pop-ups and replies; links
+  under a hit or a box; a form field shown under a hit or a box.
+- *Elsewhere in the file* (search terms): the document's details and XMP
+  metadata, bookmark titles, the text a tagged file keeps for screen readers
+  (`/Alt`, `/ActualText`), layer names, an application's private data
+  (`/PieceInfo`), metadata streams, scripts, named destinations, page-label
+  prefixes, form-field text (values, defaults, tooltips, options, captions,
+  names), rich text, link addresses, attachments that hold the term,
+  signatures that hold it, and an XFA form's data.
+- *Always*: page thumbnails, a tagged file's description of content that
+  was removed, anything the structure tree still points at after it left
+  its page, and the file's identifier (a new one is written).
+
+**Checked before saving.** The new file is written beside the destination
+and checked there: the page text, the page code, annotations, form fields,
+links, the document's details, bookmarks, attachments, the structure tree,
+thumbnails, what is under each box you drew, and a search of every string
+and stream in the file. It is saved only if every check passes. Otherwise
+nothing is saved, and the original is untouched, even when redacting in
+place.
+
+**What it reports.** When the run is saved, the Redact page says how many
+places on how many pages were redacted, what else was removed, and what is
+good to know: pages with no text to search (a scan or a picture: any words
+in it were not searched), a scan's hidden text layer that was searched (a
+word the layer misread is still in the picture), attachments, which are
+searched as they are stored and never opened (a zip or a Word file is
+packed, so nothing inside it is searched), pages turned into pictures, a
+run by boxes alone, a form field under a box that is still shown in another
+place, and, on PyMuPDF 2.x, that text after a removed word may have moved.
+When the run is refused, the page says what was found and where, and what
+can be done. When what is left is drawn on a page, that page can be turned
+into a picture: it keeps its look, with what was found blacked out first,
+but its text can no longer be selected or searched. When it is not on a page
+(the document's details, the file's identifier), the page says that turning
+pages into pictures would not help. A form stored only as XFA that holds a
+search term, and PyMuPDF 1.28 (see Install), are refused before anything is
+written.
+
+**Supported PDF library.** PyMuPDF 1.27.2.3. Redact refuses to run on 1.28,
+and runs on 2.x with a note (see Install).
+
+**Known limits.** Each of these is refused, reported in the result, or as
+described here.
+- Text outside the visible page, and a word that is only a PDF name in a
+  page's code (`/Subtype /Watermark`), have no text on the page to box: the
+  run is refused and the page offered as a picture.
+- Characters drawn out of reading order are not put back in order, so a word
+  drawn that way may not be found (no match, or a refusal; never passed).
+- Slanted text is boxed by its bounding rectangle, which takes in what is
+  printed near it.
+- Where a box changes content inside a form XObject, the redacted copy is
+  not put back in the structure tree: that content is no longer tagged.
+- A form field under a hit is removed whole, with all of its text.
+- A form field under a box you draw that is also shown elsewhere keeps its
+  value there. The run says so.
+- Lines printed over each other by more than half their height lose
+  letters to a term box: the box is trimmed to its own line, but never past
+  the middle half of its height.
+- Text running up or down the page is not trimmed, so a term box there can
+  take letters from the next column.
+- Two words that spell the term between them are taken as the term ("now
+  here" for "nowhere").
+- A box you draw that reaches a fifth of the way into a letter of the next
+  line takes that letter, in a font whose widths in the PDF differ from the
+  font's own.
+- In a font whose widths are all zero, a letter is judged by the point it is
+  drawn from: a box over the letter's shape that misses that point leaves
+  its text in the file, under the black.
+- Text hidden under a picture drawn over it (not in the invisible mode) is
+  not noticed as a text layer, so the run does not warn that a misread word
+  may still be in the picture.
+- A straight line written as a curve is treated as a curve: a box over it
+  is refused and the page offered as a picture.
+- On a page with a user unit (a page drawn larger than its numbers say), the
+  black fill reaches past the box you drew. It hides more than you asked;
+  it removes nothing extra.
+- On PyMuPDF 2.x the text after a removed word can move along its line. The
+  run says so.
+- Words inside a picture are not read. Attachments are searched as stored
+  and never opened. A few places have no rule yet (web-capture names, an
+  output intent's strings, certificates in the document security store):
+  a term there is refused.
 
 ---
 

@@ -216,3 +216,40 @@ three shapes (`SanitizeResponse` in `src/types/analyze.ts`):
   `redaction.file_id` as what it is (the copy would still be linked to the
   original) instead of "Sensitive content was still detectable". No contract
   change. `web-react/dist/` rebuilt.
+
+### #119 — Redact answers in plain words; boxes are read as drawn (2026-11-22)
+
+`startRedact` keeps its name and arguments. What it is sent and what it
+answers:
+
+- **Boxes are read as they lie on the page picture.** `rects` were always
+  drawn on a picture of the page as it is shown, turned by its `/Rotate`.
+  The slot now puts each one back into the page's own space with the Qt-free
+  `pdf_ops.rects_from_page_pictures` before `redact_pdf` sees it. On an
+  upright page nothing changes; on a turned page a box used to land
+  somewhere else. The shape of `rects` is unchanged.
+- **Success.** Built by the Qt-free `pdf_ops.redact_result_payload`: the
+  `RedactResult` fields as before, which now include `notes` (`[{kind,
+  ...}]`: `no_text`, `text_layer`, `attachments`, `flattened`,
+  `boxes_only`, `text_may_move`, `field_still_shown`), `flattened_areas`
+  (`{page: areas}`) and more `surface_counts` keys, plus the **new
+  `summary`**: `{headline, checked, removed: string[], notes: string[]}`,
+  worded in Python (`pdf_ops.redaction_summary`).
+- **Refusal.** As before (`verification`, `flattenablePages`,
+  `documentLevel`), plus the **new top-level `refusal`**: `{headline, found:
+  string[], nextStep}`, worded in Python
+  (`pdf_verify.redaction_refusal_detail`).
+- **Not possible.** A form stored only as XFA that holds a term, and
+  PyMuPDF 1.28, raise `RedactionNotPossibleError`. It used to arrive as any
+  failure, with a stack trace in the log; it is now `success:false` with the
+  plain `message` and the **new top-level `notPossible: true`**, and the log
+  gets one line.
+- **Frontend.** `RedactPage.tsx` shows `summary` (headline, checked line,
+  "Also removed", "Good to know"), for a workspace run too; a refusal from
+  `refusal` (headline, what was found, the next step, a "Turn page N into a
+  picture" button when pages are offered, and the raw evidence folded under
+  "Technical details"); and a not-possible refusal as a plain note with a
+  warning toast. "Please report this file — the scrubber should have removed
+  it." is gone, and the page's other words are plainer. The browser-dev mock
+  answers from the search word: `everything`, `lineart` (and its flatten
+  retry), `refuse`, `xfa`. `web-react/dist/` rebuilt.

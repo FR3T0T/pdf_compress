@@ -2,6 +2,16 @@
 ## Unreleased
 
 ### Added
+- **Sample files for trying Redact in the app (#119).**
+  `python tests/manual/make_redact_samples.py <folder>` writes seventeen
+  small PDFs, built object by object: a number broken across a line, a
+  letter-spaced heading, stamps, a tagged picture and a tagged link, a
+  signature of curves, a rule through a word, turned pages (one turned by
+  the page tree, one with a moved crop box and a stamp), a field shown on
+  two pages, a scan with a text layer, text outside the page, an XFA-only
+  form, a term in the file's settings, and ninety pages with every kind of
+  note. Each page says what it is for. Not a test; pytest does not collect
+  it.
 - **Redaction: a result says what the run did not look at (#119).** A
   redaction that verifies has removed what it was asked to remove from
   everything it can read. It has not read a picture. `RedactResult.notes`
@@ -19,11 +29,13 @@
   pictures and the areas filled on each; `boxes_only` — a run by boxes
   alone, which searched for nothing. A search that finds nothing at all has
   no result to carry a note, so "No matching content found to redact." now
-  goes on to name the pages that had no text to search. The bridge sends a
-  result as it is, so the notes reach the app with no change there; wording
-  them is the app's (next cluster). New: `pdf_analyze.embedded_files`. Not
-  noticed: text hidden by a picture drawn over it, rather than by the
-  invisible mode. Tests: `tests/test_redact_notes.py`.
+  goes on to name the pages that had no text to search. Two kinds came
+  later in this work: `text_may_move` (PyMuPDF 2.x, under Changed) and
+  `field_still_shown` (under Fixed). The app shows every note in plain
+  words (see "The Redact page says what happened in plain words" below).
+  New: `pdf_analyze.embedded_files`. Not noticed: text hidden by a picture
+  drawn over it, rather than by the invisible mode. Tests:
+  `tests/test_redact_notes.py`.
 - **Redaction: a whole-file search for every target term (#119).** A term
   redaction could finish verified with the term still in the file, in a
   place the verifier's surface checks have no name for: structure-tree
@@ -306,6 +318,39 @@
   save-failure) and `tests/test_pdf_verify.py` (D1 flatten targeting).
 
 ### Changed
+- **The Redact page says what happened in plain words (#119).** A
+  redaction that verifies shows a headline ("Redacted 3 places on 2
+  pages."), the line "Checked before saving: what you asked to remove is
+  gone from the new file.", what else went ("Also removed": notes and stamps
+  taken off the pages, form fields, links, page thumbnails, descriptions of
+  removed content, hidden copies the structure tree pointed at and the rest
+  of `surface_counts`) and every note
+  ("Good to know": pages with no text to search, a scan's text layer,
+  attachments that were not opened, pages turned into pictures, boxes only,
+  a field under a box still shown elsewhere, text that may move on PyMuPDF
+  2.x). A count reads the same at 1 and at 32,768 (grouped by thousands,
+  one or many), and pages are listed as a person reads them: "pages 2-4 and
+  9", and past eight runs "pages 3, 6, 9, 12, 15, 18 and 94 more". A refused
+  run says which kind of refusal it is (something is still in the new file;
+  part of it could not be read; it would still carry the original's ID),
+  one line for each place something was found, with its pages, and what can
+  be done: turn the pages offered into pictures — "to cover it" for a
+  drawing under a box, "to remove it" otherwise — or why that would not
+  help. It makes no promise; "Please report this file — the scrubber should
+  have removed it." is gone. The whole-file search's places are said
+  without the PDF's own names ("hidden in a note or mark on page 2", not "a
+  stream on page 2, annotation 1, under /Stash"), and a place another check
+  already names is said once. The raw evidence stays, folded, under
+  "Technical details". The other words on the page are plainer too. The
+  wording is made in Python and tested, as for Sanitize: new
+  `pdf_ops.redaction_summary`, `pdf_ops.redact_result_payload` (what the
+  redact slot now returns: the result with a `summary`),
+  `pdf_verify.redaction_refusal_detail` (`RedactionVerificationError.detail`,
+  sent to the window as `refusal`) and `pdf_verify.pages_in_words`. The
+  XFA-only refusal now reads "This file's form is stored in a format (XFA)
+  that redaction cannot change, and what you searched for is in that form.
+  Nothing was saved." `web-react/dist` is rebuilt. Tests:
+  `tests/test_redact_words.py`.
 - **PyMuPDF is pinned to 1.27.2.3, and redaction refuses 1.28 (#119).** The
   same code on the same files: on 1.27.2.3 every redaction that verifies is
   clean. On 1.28.0 and 1.28.2, redacting a word removed thousands of other
@@ -367,9 +412,10 @@
   the address deleted.** `page_labels`: a page-label prefix becomes the
   marker. `xfa`: when an XFA packet holds a term the form's `/XFA` entry is
   dropped, so the form falls back to its AcroForm fields; a form that has
-  none is refused with a plain message that an XFA-only form cannot be
-  term-redacted (`RedactionNotPossibleError`, a `ValueError`; nothing written). `embedded_files`: an
-  attachment whose name, description or bytes hold a term is removed whole —
+  none is refused in plain words (`RedactionNotPossibleError`, a
+  `ValueError`; nothing written; the wording is under "The Redact page says
+  what happened in plain words"). `embedded_files`: an attachment whose
+  name, description or bytes hold a term is removed whole —
   from the attachment list (written back as one sorted leaf, so no `/Limits`
   keeps the name), from every `/AF` array, and with its `/FileAttachment`
   annotation. **Attachments are searched as their stored bytes only: a zip,
@@ -386,7 +432,9 @@
   store, and anything else the sweep finds. (Three more were on this list:
   a GoToE action that names a removed attachment, a form stream only the
   structure tree still references, and the appearance of a note that is off
-  its page. The next entry and the first under Fixed deal with them.) On
+  its page. The next entry deals with the first and the last, and "the
+  unredacted original of a form, an image or a page could stay in a tagged
+  file" under Fixed with the second.) On
   1,139 real PDFs,
   one word of its own text redacted from each: 524 finished verified before
   any of this, 53 of them with the word still in the file; 483 with the
@@ -678,6 +726,13 @@
   code with no remaining callers.
 
 ### Fixed
+- **A redaction that cannot start no longer looks like a crash (#119).** An
+  XFA-only form and PyMuPDF 1.28 raise `RedactionNotPossibleError`, which
+  the bridge treated like any other failure: a stack trace in the log and
+  an error in the window. It now has its own branch: one line in the log,
+  and the window shows the message as a plain refusal (`notPossible` in the
+  done payload), with a warning, not an error. Tests:
+  `TestWhatCannotBeRedacted`, `TestTheBridgeAndTheWindow`.
 - **Redaction: a turned page whose page box does not start at 0 0 (#119).**
   On a page turned by `/Rotate`, PyMuPDF's `page.transformation_matrix` is a
   matrix it builds by hand that leaves out where the crop box or media box
@@ -689,9 +744,12 @@
   and by box: the text was removed in the right place and the black bar
   landed beside it (on `main` too, and on PyMuPDF 1.28 and 2.1). The matrix
   is now read with the page set upright for the moment and its `/Rotate`
-  put back exactly as it was (`pdf_verify.upright`,
+  put back afterwards (`pdf_verify.upright`,
   `pdf_verify.pdf_to_page_matrix`), where annotations are placed by the
-  engine and the verifier and around `apply_redactions`. It is not built
+  engine and the verifier and around `apply_redactions`. A page with its own
+  `/Rotate` gets that value back; a page that takes its turn from the page
+  tree is left with `/Rotate null` in memory, which reads as no entry, and
+  the saved output carries the turn on the page itself. It is not built
   from the page's boxes: that disagrees with PyMuPDF's own on some upright
   pages of real files (user units, broken boxes). A second fault of the
   same kind came to light on the way: PyMuPDF's `rotation_matrix` is made

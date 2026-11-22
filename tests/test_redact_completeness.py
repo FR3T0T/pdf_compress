@@ -980,7 +980,8 @@ class TestXfa:
         out = str(tmp_path / "out.pdf")
         with pytest.raises(ValueError, match="XFA") as ei:
             redact_pdf(src, out, search_terms=[TERM])
-        assert "cannot be term-redacted" in str(ei.value)
+        assert "redaction cannot change" in str(ei.value)
+        assert str(ei.value).endswith("Nothing was saved.")
         assert str(tmp_path) not in str(ei.value)
         assert not os.path.exists(out) and os.listdir(tmp_path) == ["src.pdf"]
 

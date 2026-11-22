@@ -29,6 +29,16 @@ interface VerificationReport {
   flattenTargetPages: number[] | null;
 }
 
+/** A finished run in plain words, made by the Python side
+ *  (pdf_ops.redaction_summary, #119) so the wording is in one place and
+ *  tested. This page shows the lines it is given. */
+interface RedactSummary {
+  headline: string;
+  checked: string;
+  removed: string[];
+  notes: string[];
+}
+
 interface RedactResult {
   input_path: string;
   output_path: string;
@@ -39,16 +49,38 @@ interface RedactResult {
   surface_counts?: Record<string, number>;
   verification?: VerificationReport;
   flattened_pages?: number[];
+  // #119: the plain facts of the run and their plain-words summary.
+  flattened_areas?: Record<string, number>;
+  notes?: unknown[];
+  summary?: RedactSummary;
 }
 
-/** Extra top-level fields the bridge attaches to a FAILED redaction payload
- *  when verify_redaction refused the output (#99, RedactionVerificationError):
- *  the report, the flatten-eligible pages (null when flatten can't help), and
- *  whether the residual was document-level. */
+/** A refused run in plain words (pdf_verify.redaction_refusal_detail). */
+interface RedactRefusal {
+  headline: string;
+  found: string[];
+  nextStep: string;
+}
+
+/** Extra top-level fields the bridge attaches to a FAILED redaction payload.
+ *  When verify_redaction refused the output (#99, RedactionVerificationError):
+ *  the report, the flatten-eligible pages (null when flatten can't help),
+ *  whether the residual was document-level, and the refusal in plain words.
+ *  When the file cannot be redacted at all (RedactionNotPossibleError, #119):
+ *  notPossible, with the reason in the payload's message. */
 interface RedactFailure {
   verification?: VerificationReport;
   flattenablePages?: number[] | null;
   documentLevel?: boolean;
+  refusal?: RedactRefusal | null;
+  notPossible?: boolean;
+}
+
+/** "page 2", "pages 1, 3 and 5", or "these 12 pages" for a long list. */
+function pagesLabel(pages: number[]): string {
+  if (pages.length === 1) return `page ${pages[0]}`;
+  if (pages.length <= 5) return `pages ${pages.slice(0, -1).join(', ')} and ${pages[pages.length - 1]}`;
+  return `these ${pages.length.toLocaleString('en-US')} pages`;
 }
 
 interface PageImage {
@@ -197,7 +229,7 @@ export function RedactPage() {
     bridgeApi.getPageImages(effectivePath).then((res) => {
       setPagesLoading(false);
       if (!res.success || !res.pages) {
-        toast.error(res.error || 'Could not render pages for box drawing.');
+        toast.error(res.error || 'The pages could not be shown for drawing boxes.');
         return;
       }
       setPageImages(res.pages);
@@ -209,11 +241,13 @@ export function RedactPage() {
 
   useEffect(() => {
     if (op.status === 'done' && op.result?.results) {
-      const { redaction_count, pages_affected, verification } = op.result.results;
+      const { redaction_count, pages_affected, summary } = op.result.results;
       // #99: the operation only reaches 'done' when verify_redaction proved
-      // the output clean, so success always means verified.
-      const proof = verification?.verified ? ' Verified clean.' : '';
-      const msg = `Redaction complete: ${redaction_count} matches redacted across ${pages_affected} page(s).${proof}`;
+      // the output clean, so success always means checked. The words come
+      // from the Python side (#119); the fallback is for an older bridge.
+      const msg =
+        summary?.headline ??
+        `Redacted ${redaction_count.toLocaleString('en-US')} places on ${pages_affected.toLocaleString('en-US')} pages.`;
       if (workspaceRunRef.current) {
         workspaceRunRef.current = false;
         // Advance the workspace with the path THIS page computed, not the one
@@ -225,7 +259,7 @@ export function RedactPage() {
           workspace.applyResult(trustedOut, `Redact (${mode})`);
           toast.success(msg);
         } else {
-          toast.error('Redaction succeeded but the working document could not be updated.');
+          toast.error('The redaction worked, but the working document could not be updated.');
         }
         return;
       }
@@ -233,7 +267,11 @@ export function RedactPage() {
     } else if (op.status === 'error') {
       workspaceRunRef.current = false;
       workspaceOutPathRef.current = null;
-      toast.error(op.error || 'An error occurred during redaction.');
+      // A refusal is not a crash: the panel below says what happened.
+      const f = (op.result as unknown as RedactFailure) ?? null;
+      if (f?.verification || f?.refusal) toast.warning('Redaction refused. Nothing was saved.');
+      else if (f?.notPossible) toast.warning("Redaction can't be done. Nothing was saved.");
+      else toast.error(op.error || 'Something went wrong while redacting. Nothing was saved.');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [op.status, op.result, op.error, toast]);
@@ -262,7 +300,7 @@ export function RedactPage() {
       return;
     }
     if (mode === 'terms' && searchTerms.length === 0) {
-      toast.warning('Please enter at least one search term.');
+      toast.warning('Please type at least one word to search for.');
       return;
     }
     if (mode === 'boxes' && boxes.length === 0) {
@@ -270,7 +308,7 @@ export function RedactPage() {
       return;
     }
     if (!workspace.path && !outputPath) {
-      toast.warning('Please choose an output location.');
+      toast.warning('Please choose where to save the new file.');
       return;
     }
     setConfirming(true);
@@ -327,7 +365,8 @@ export function RedactPage() {
   const removeBox = (id: string) => setBoxes((prev) => prev.filter((b) => b.id !== id));
   const clearPageBoxes = (page: number) => setBoxes((prev) => prev.filter((b) => b.page !== page));
 
-  const r = op.status === 'done' && !workspace.path ? op.result?.results : null;
+  const done = op.status === 'done' ? (op.result?.results ?? null) : null;
+  const r = done && !workspace.path ? done : null;
   const results = r
     ? {
         files: [{ name: bridgeApi.basename(r.output_path), status: 'done' as const }],
@@ -337,7 +376,7 @@ export function RedactPage() {
 
   return (
     <div className="console">
-      <PageHeader title="Redact" subtitle="Permanently remove sensitive text from PDF" backButton={false} />
+      <PageHeader title="Redact" subtitle="Remove words and areas from a PDF for good" backButton={false} />
 
       <div
         className="panel"
@@ -353,15 +392,15 @@ export function RedactPage() {
       >
         <span style={{ fontSize: 20 }}>⚠️</span>
         <span style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)' }}>
-          Redaction is irreversible. Redacted content cannot be recovered.
+          Redaction can't be undone. What you redact is gone for good.
         </span>
       </div>
 
       {workspace.path ? (
         <Card>
           <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
-            Operating on the workspace document ({workspace.originalName}) — see the bar above to
-            Preview, Export, or Clear it.
+            Working on the document in your workspace ({workspace.originalName}). Use the bar
+            above to preview, export or clear it.
           </div>
         </Card>
       ) : (
@@ -388,13 +427,13 @@ export function RedactPage() {
         <div style={{ marginTop: 'var(--space-3)' }}>
           <Card>
             <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)', marginBottom: 6 }}>
-              Search terms (one per line)
+              Words to search for (one per line)
             </div>
             <textarea
               value={terms}
               onChange={(e) => setTerms(e.target.value)}
               rows={6}
-              placeholder={'Enter text to redact, one term per line\ne.g.\nJohn Doe\n555-0123\nSSN: 123-45-6789'}
+              placeholder={'Type what to remove, one per line\nfor example:\nJohn Doe\n555-0123\nSSN: 123-45-6789'}
               className="mono"
               style={{
                 width: '100%',
@@ -408,7 +447,7 @@ export function RedactPage() {
               }}
             />
             <div style={{ marginTop: 'var(--space-3)' }}>
-              <Checkbox checked={caseSensitive} onChange={setCaseSensitive} label="Case sensitive" />
+              <Checkbox checked={caseSensitive} onChange={setCaseSensitive} label="Match upper and lower case exactly" />
             </div>
           </Card>
         </div>
@@ -421,7 +460,7 @@ export function RedactPage() {
                 {pagesWithBoxes > 0 ? ` across ${pagesWithBoxes} page${pagesWithBoxes === 1 ? '' : 's'}` : ''}
               </span>
               <span style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)' }}>
-                Click and drag over a page below to mark an area for redaction.
+                Drag over a page below to mark an area to remove.
               </span>
             </div>
           </Card>
@@ -430,14 +469,14 @@ export function RedactPage() {
             {!effectivePath && (
               <Card>
                 <span style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-sm)' }}>
-                  Add a PDF file above to render its pages here.
+                  Add a PDF file above to see its pages here.
                 </span>
               </Card>
             )}
             {effectivePath && pagesLoading && (
               <Card>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-2)' }}>
-                  <span className="spinner" /> Rendering pages…
+                  <span className="spinner" /> Loading pages…
                 </div>
               </Card>
             )}
@@ -462,7 +501,7 @@ export function RedactPage() {
           <Card>
             <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
               <span className="mono" style={{ flex: 1, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
-                {outputPath ? bridgeApi.basename(outputPath) : 'No output file selected'}
+                {outputPath ? bridgeApi.basename(outputPath) : 'No place to save chosen yet'}
               </span>
               <button onClick={pickOutput} disabled={op.status === 'running'} className="btn-ghost">
                 Browse…
@@ -476,19 +515,19 @@ export function RedactPage() {
         <div style={{ marginTop: 'var(--space-4)' }}>
           <Card>
             <div style={{ borderLeft: '2px solid var(--sev-high)', paddingLeft: 'var(--space-3)' }}>
-              <strong style={{ fontSize: 'var(--font-size-sm)' }}>This action is irreversible.</strong>
+              <strong style={{ fontSize: 'var(--font-size-sm)' }}>This can't be undone.</strong>
               <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)', marginTop: 4 }}>
                 {mode === 'terms'
-                  ? `${searchTerms.length} search term(s) will be permanently redacted from the document.`
-                  : `${boxes.length} area(s) across ${pagesWithBoxes} page(s) will be permanently removed.`}{' '}
-                Are you sure you want to continue?
+                  ? `Every place ${searchTerms.length === 1 ? 'this word appears' : `these ${searchTerms.length} words appear`} will be removed for good.`
+                  : `Everything in ${boxes.length === 1 ? 'this area' : `these ${boxes.length} areas`} will be removed for good.`}{' '}
+                Do you want to go on?
               </div>
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 'var(--space-3)' }}>
                 <button onClick={() => setConfirming(false)} className="btn-ghost">
                   Cancel
                 </button>
                 <button onClick={confirmRedact} className="btn-primary">
-                  Redact permanently
+                  Yes, redact
                 </button>
               </div>
             </div>
@@ -510,7 +549,7 @@ export function RedactPage() {
             onCancel={() => {
               bridgeApi.cancel('redact');
               op.reset();
-              toast.info('Redaction cancelled.');
+              toast.info('Redaction stopped. Nothing was saved.');
             }}
           />
         </div>
@@ -519,35 +558,10 @@ export function RedactPage() {
       {results && (
         <div style={{ marginTop: 'var(--space-4)' }}>
           <ResultsPanel results={results} />
-          {r && (
-            <div style={{ marginTop: 6, color: 'var(--text-3)', fontSize: 'var(--font-size-xs)' }}>
-              {r.redaction_count} matches redacted across {r.pages_affected} page(s)
-            </div>
-          )}
-          {r?.verification?.verified && (
-            <div
-              style={{
-                marginTop: 8,
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                color: 'var(--sev-info)',
-                fontSize: 'var(--font-size-sm)',
-                fontWeight: 700,
-              }}
-            >
-              <span aria-hidden>✓</span>
-              <span>
-                Verified — every target term is confirmed unextractable from the output.
-                0 occurrences remain.
-                {r.flattened_pages && r.flattened_pages.length > 0
-                  ? ` Page(s) ${r.flattened_pages.join(', ')} were flattened to image to force removal.`
-                  : ''}
-              </span>
-            </div>
-          )}
         </div>
       )}
+
+      {done?.summary && <RedactSummaryPanel summary={done.summary} />}
 
       {failure?.verification && (
         <VerificationFailurePanel
@@ -557,21 +571,92 @@ export function RedactPage() {
           busy={op.status === 'running'}
         />
       )}
+
+      {failure?.notPossible && <NotPossiblePanel message={op.error} />}
+    </div>
+  );
+}
+
+/** Lines of text that may be long (file names, page lists): they wrap
+ *  anywhere rather than push the panel wider. */
+const wrapAnywhere = { overflowWrap: 'anywhere' as const, wordBreak: 'break-word' as const };
+
+/** A finished run in plain words (#119): the headline, that the new file
+ *  was checked, what else was removed and what to know. Every line comes
+ *  from the Python side (pdf_ops.redaction_summary); a count can be 1 or
+ *  32,768, and the lines simply wrap. Shown for a workspace run too. */
+function RedactSummaryPanel({ summary }: { summary: RedactSummary }) {
+  const listStyle = {
+    margin: '6px 0 0',
+    paddingLeft: 18,
+    color: 'var(--text-2)',
+    fontSize: 'var(--font-size-sm)',
+    ...wrapAnywhere,
+  };
+  return (
+    <div style={{ marginTop: 'var(--space-3)' }}>
+      <Card>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, color: 'var(--sev-info)', fontWeight: 700 }}>
+          <span aria-hidden>✓</span>
+          <span style={{ fontSize: 'var(--font-size-sm)', ...wrapAnywhere }}>{summary.headline}</span>
+        </div>
+        <div style={{ marginTop: 4, color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>{summary.checked}</div>
+        {summary.removed.length > 0 && (
+          <div style={{ marginTop: 'var(--space-3)' }}>
+            <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)' }}>Also removed</div>
+            <ul style={listStyle}>
+              {summary.removed.map((line, i) => (
+                <li key={i} style={{ marginBottom: 2 }}>
+                  {line}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {summary.notes.length > 0 && (
+          <div style={{ marginTop: 'var(--space-3)' }}>
+            <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)' }}>Good to know</div>
+            <ul style={listStyle}>
+              {summary.notes.map((line, i) => (
+                <li key={i} style={{ marginBottom: 4 }}>
+                  {line}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/** Redaction cannot be done at all (#119): a form stored only as XFA, or a
+ *  PDF library that removes other text when it redacts. A plain refusal with
+ *  the reason the Python side gives, not an error. The heading fits both:
+ *  in the second case the file is not the problem. */
+function NotPossiblePanel({ message }: { message: string | null }) {
+  return (
+    <div style={{ marginTop: 'var(--space-4)' }}>
+      <Card>
+        <div style={{ borderLeft: '3px solid var(--sev-medium)', paddingLeft: 'var(--space-3)' }}>
+          <strong style={{ fontSize: 'var(--font-size-sm)' }}>Redaction can't be done.</strong>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)', marginTop: 4, ...wrapAnywhere }}>
+            {message || 'Nothing was saved.'}
+          </div>
+        </div>
+      </Card>
     </div>
   );
 }
 
 /** Fail-closed redaction result (#99): verify_redaction refused the
  *  candidate before it reached the destination, so nothing was written
- *  there and whatever was at that path is untouched. Shows what survived
- *  and where, and — only when every residual is page-content — offers the
- *  D1 flatten-to-image retry. A document-level residual can't be flattened,
- *  so no offer is shown.
- *
- *  A refusal is not always about content: when the only failed check is
- *  `redaction.file_id`, the redaction itself held and the copy was refused
- *  because it would still carry the source's identifier. The wording says
- *  which of the two it was. */
+ *  there and whatever was at that path is untouched. Says, in the plain
+ *  words the Python side made from the failed checks (#119,
+ *  pdf_verify.redaction_refusal_detail), what was found and where, and what
+ *  can be done — with no promise. Only when every residual is on a page is
+ *  the D1 offer to turn those pages into pictures made. The checks' own
+ *  lines are kept under "Technical details", for a support question. */
 function VerificationFailurePanel({
   failure,
   flattenablePages,
@@ -584,58 +669,76 @@ function VerificationFailurePanel({
   busy: boolean;
 }) {
   const failed = (failure.verification?.checks ?? []).filter((c) => !c.passed);
-  const identifierOnly = failed.length > 0 && failed.every((c) => c.id === 'redaction.file_id');
+  const refusal: RedactRefusal = failure.refusal ?? {
+    headline: 'Redaction refused: what you asked to remove could not be shown to be gone. Nothing was saved.',
+    found: [],
+    nextStep: '',
+  };
   return (
     <div style={{ marginTop: 'var(--space-4)' }}>
       <Card>
         <div style={{ borderLeft: '3px solid var(--sev-high)', paddingLeft: 'var(--space-3)' }}>
-          <strong style={{ fontSize: 'var(--font-size-sm)', color: 'var(--sev-high)' }}>
-            {identifierOnly
-              ? 'Redaction refused — the output would still be linked to the original.'
-              : 'Redaction refused — the output could not be proven clean.'}
+          <strong style={{ fontSize: 'var(--font-size-sm)', color: 'var(--sev-high)', ...wrapAnywhere }}>
+            {refusal.headline}
           </strong>
-          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)', marginTop: 4 }}>
-            {identifierOnly
-              ? "Nothing was written. The redacted copy would still carry the original file's identifier, which links the two files, so it was not saved."
-              : 'Nothing was written. Sensitive content was still detectable after redaction, so the copy was not saved with a leak.'}
-          </div>
 
-          {failed.length > 0 && (
+          {refusal.found.length > 0 && (
             <ul
               style={{
-                margin: '10px 0 0',
+                margin: '8px 0 0',
                 paddingLeft: 18,
                 color: 'var(--text-2)',
-                fontSize: 'var(--font-size-xs)',
+                fontSize: 'var(--font-size-sm)',
+                ...wrapAnywhere,
               }}
             >
-              {failed.flatMap((c) =>
-                (c.evidence.length ? c.evidence : [c.description]).map((e, i) => (
-                  <li key={`${c.id}-${i}`} style={{ marginBottom: 2 }}>
-                    {e}
-                  </li>
-                ))
-              )}
+              {refusal.found.map((line, i) => (
+                <li key={i} style={{ marginBottom: 2 }}>
+                  {line}
+                </li>
+              ))}
             </ul>
           )}
 
-          {flattenablePages ? (
+          {refusal.nextStep && (
+            <div style={{ marginTop: 'var(--space-3)', color: 'var(--text-2)', fontSize: 'var(--font-size-sm)' }}>
+              {refusal.nextStep}
+            </div>
+          )}
+
+          {flattenablePages && (
             <div style={{ marginTop: 'var(--space-3)' }}>
-              <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-xs)', marginBottom: 6 }}>
-                The remaining content is on the page itself. You can force its removal by flattening
-                page(s) {flattenablePages.join(', ')} to a plain image — this permanently rasterizes
-                those pages (their text becomes unselectable) and re-verifies.
-              </div>
               <button onClick={onFlatten} disabled={busy} className="btn-primary">
-                {busy ? 'Working…' : `Force removal: flatten page(s) ${flattenablePages.join(', ')}`}
+                {busy
+                  ? 'Working…'
+                  : `Turn ${pagesLabel(flattenablePages)} into ${flattenablePages.length === 1 ? 'a picture' : 'pictures'}`}
               </button>
             </div>
-          ) : (
-            <div style={{ marginTop: 'var(--space-3)', color: 'var(--text-3)', fontSize: 'var(--font-size-xs)' }}>
-              {identifierOnly
-                ? 'The identifier is not on any page, so flattening cannot change it. Please report this file — the identifier should have been replaced.'
-                : 'This residual is in document-level data (metadata, bookmarks, or attachments) that flattening cannot fix. Please report this file — the scrubber should have removed it.'}
-            </div>
+          )}
+
+          {failed.length > 0 && (
+            <details style={{ marginTop: 'var(--space-3)' }}>
+              <summary style={{ cursor: 'pointer', color: 'var(--text-3)', fontSize: 'var(--font-size-xs)' }}>
+                Technical details
+              </summary>
+              <ul
+                style={{
+                  margin: '6px 0 0',
+                  paddingLeft: 18,
+                  color: 'var(--text-3)',
+                  fontSize: 'var(--font-size-xs)',
+                  ...wrapAnywhere,
+                }}
+              >
+                {failed.flatMap((c) =>
+                  (c.evidence.length ? c.evidence : [c.description]).map((e, i) => (
+                    <li key={`${c.id}-${i}`} style={{ marginBottom: 2 }}>
+                      {e}
+                    </li>
+                  ))
+                )}
+              </ul>
+            </details>
           )}
         </div>
       </Card>

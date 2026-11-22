@@ -1645,8 +1645,11 @@ def _whole_file_checks(output_path: str, password: Optional[str] = None) -> list
 @contextlib.contextmanager
 def upright(page):
     """*page* with its /Rotate set to 0 for the time being, and put back
-    exactly as it was afterwards — the page's own value, or none at all
-    when it takes its turn from the page tree.
+    afterwards. A page with a /Rotate of its own gets that value back. A page
+    that takes its turn from the page tree is left with "/Rotate null" in its
+    dictionary in memory (xref_set_key sets a key to null; it does not delete
+    it), which reads as no entry: the page is shown as before, and the saved
+    output carries the turn on the page itself.
 
     PyMuPDF does two things on a turned page with a matrix it builds by
     hand, Matrix(1, 0, 0, -1, 0, cropbox height), which leaves out where
@@ -2825,6 +2828,225 @@ def sanitize_refusal_detail(report: VerificationReport) -> dict:
         "identifier": any(c.id == "sanitize.file_id" for c in failed),
         "unreadable": any(c.id == "sanitization.readable" for c in failed),
     }
+
+
+# ── What a refused redaction says (#119, R4) ─────────────────────────
+
+
+def pages_in_words(pages, cap: int = 8) -> str:
+    """Page numbers as a person reads them: "page 3", "pages 1 and 3",
+    "pages 2-4 and 9". Runs of three pages or more are joined. More than *cap* runs are
+    cut to the first six and a count of the rest: "pages 3, 6, 9, 12, 15,
+    18 and 94 more"."""
+    numbers = sorted({int(p) for p in pages})
+    if not numbers:
+        return "the pages"
+    runs: list[list[int]] = []
+    for n in numbers:
+        if runs and n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    # A run of three pages or more is joined with a dash; two read better apart.
+    runs = [r for a, b in runs for r in ([[a, a], [b, b]] if b == a + 1 else [[a, b]])]
+    texts = [str(a) if a == b else f"{a}-{b}" for a, b in runs]
+    if len(runs) > cap:
+        shown = runs[:6]
+        rest = len(numbers) - sum(b - a + 1 for a, b in shown)
+        texts = texts[:6] + [f"{rest:,} more"]
+    head = "page" if len(numbers) == 1 else "pages"
+    body = texts[0] if len(texts) == 1 else ", ".join(texts[:-1]) + " and " + texts[-1]
+    return f"{head} {body}"
+
+
+_SEARCHED = "What you searched for"
+_TERM_FOUND = re.compile(r"^term '.*?' found in ")
+
+
+def _evidence_pages(lines) -> list[int]:
+    """The pages *lines* name ("on page N"), document-level lines aside."""
+    return VerificationCheck._derive_pages(list(lines))
+
+
+# plain_location's words for the PDF's insides, as the Redact window says them.
+_PLAIN_WHERE = {
+    "in the document information": "in the document's details",
+    "in the document's named scripts": "in the file's scripts",
+    "in the document's attachment list": "in the file's list of attached files",
+    "in the document's named destinations": "in the file's list of places to jump to",
+    "in the document's structure tree": "in the file's structure",
+    "in the document's layer list": "in the file's list of layers",
+    "in the document's open action": "in what the file does when it opens",
+    "in the document catalog": "in the file's own settings",
+    "in the file trailer": "in the file's own settings",
+}
+
+
+def _sweep_place(line: str) -> str:
+    """Where a whole-file search hit is, without the PDF's own names: "term
+    'x' found in a stream on page 2, annotation 1, under /Stash" is "in a
+    note or mark on page 2". The raw line stays in the technical details."""
+    place = _TERM_FOUND.sub("", line).replace(" (document-level)", "").rstrip(".")
+    parts = re.sub(r"^a (text string|stream) ", "", place).split(", ")
+    where = _PLAIN_WHERE.get(parts[0], parts[0])
+    if where.startswith("on ") and any(re.fullmatch(r"annotation \d+", p) for p in parts):
+        where = f"in a note or mark {where}"
+    return ", ".join([where] + [p for p in parts[1:] if p.startswith("and on ")])
+
+
+def _named_elsewhere(failed) -> set:
+    """The places, as _sweep_place says them, that a failed check other than
+    the whole-file search already names, so that the window says each once."""
+    named: set = set()
+    for c in failed:
+        pages = _evidence_pages(c.evidence)
+        if c.id == "redaction.docinfo":
+            named.add("in the document's details")
+        elif c.id == "redaction.bookmarks":
+            named.add("in a bookmark")
+        elif c.id in ("redaction.annotations", "redaction.links", "redaction.form_fields"):
+            named.update(f"in a note or mark on page {p}" for p in pages)
+            if c.id == "redaction.form_fields":
+                named.add("in a form field")
+        elif c.id in ("redaction.page_text", "redaction.raw_content"):
+            named.update(f"on page {p}" for p in pages)
+    return named
+
+
+def _refusal_lines(check: VerificationCheck, named: frozenset = frozenset()) -> list[str]:
+    """What one failed redaction check found, in plain words. *named* is the
+    places other checks already name (_named_elsewhere); the whole-file
+    search leaves them out."""
+    unread = [e for e in check.evidence if "could not be" in e or "did not cover" in e]
+    seen = [e for e in check.evidence if e not in unread and not e.startswith("... and")]
+    lines: list[str] = []
+    if unread or check.unevaluated:
+        if check.id == "redaction.rect_regions":
+            lines.append("A box could not be checked, because it has no size or is for a page "
+                         "the file does not have.")
+        elif check.id == "redaction.readable":
+            lines.append("The new file could not be opened to check it.")
+        else:
+            pages = _evidence_pages(unread)
+            where = pages_in_words(pages) if pages else "the file"
+            lines.append(f"Part of {where} could not be read, so it could not be checked.")
+    if not seen or check.unevaluated:
+        return lines
+    pages = _evidence_pages(seen)
+    where = pages_in_words(pages)
+    cid = check.id
+    if cid == "redaction.page_text":
+        lines.append(f"{_SEARCHED} can still be read in the text of {where}.")
+    elif cid == "redaction.raw_content":
+        lines.append(f"{_SEARCHED} is still in the hidden page code of {where} (for example, "
+                     f"text placed outside the visible page).")
+    elif cid == "redaction.annotations":
+        lines.append(f"{_SEARCHED} is still in a note or comment"
+                     + (f" on {where}." if pages else "."))
+    elif cid == "redaction.form_fields":
+        lines.append(f"{_SEARCHED} is still in a form field"
+                     + (f" on {where}." if pages else " that is not shown on any page."))
+    elif cid == "redaction.links":
+        lines.append(f"{_SEARCHED} is still in a link" + (f" on {where}." if pages else "."))
+    elif cid == "redaction.docinfo":
+        lines.append(f"{_SEARCHED} is still in the document's details, such as the title or "
+                     f"author.")
+    elif cid == "redaction.xmp":
+        lines.append(f"{_SEARCHED} is still in the document's hidden details (XMP).")
+    elif cid == "redaction.bookmarks":
+        lines.append(f"{_SEARCHED} is still in a bookmark title.")
+    elif cid == "redaction.embedded_files":
+        lines.append(f"{_SEARCHED} is still in the name of an attached file.")
+    elif cid == "redaction.term_sweep":
+        places = [p for p in _dedupe([_sweep_place(e) for e in seen if _TERM_FOUND.match(e)])
+                  if p.split(", and on ")[0] not in named]
+        more = max(len(places) - 3, 0) + sum(
+            int(m.group(1).replace(",", "")) for e in check.evidence
+            for m in [re.match(r"^\.\.\. and ([\d,]+) more", e)] if m)
+        lines.extend(f"{_SEARCHED} is still hidden {place}." for place in places[:3])
+        if more > 0:
+            lines.append(f"And in {more:,} more place{'' if more == 1 else 's'} in the file.")
+    elif cid == "redaction.rect_regions":
+        lines.append(f"Text is still under a box you drew on {where}.")
+    elif cid == "redaction.rect_annotations":
+        lines.append(f"A note, stamp or other mark still lies over a box you drew on {where}.")
+    elif cid == "redaction.rect_line_art":
+        lines.append(f"A drawing under a box on {where} could not be removed without also "
+                     f"removing the part of it that goes on outside the box.")
+    elif cid == "redaction.structure_streams":
+        if any("stream" in e for e in seen):
+            lines.append("The file's structure still keeps a hidden copy of content that was "
+                         "removed.")
+        if any("annotation" in e for e in seen):
+            lines.append("The file's structure still keeps a note or form field that was taken "
+                         "off its page.")
+    elif cid == "redaction.thumbnails":
+        lines.append("The file still has small preview pictures of pages, made before "
+                     "redaction." if len(seen) > 1 else
+                     "The file still has a small preview picture of a page, made before "
+                     "redaction.")
+    elif cid == "redaction.file_id":
+        lines.append("The new file would still carry the original file's ID, which links the "
+                     "two files.")
+    else:
+        lines.append("Something you asked to remove is still in the new file.")
+    return lines
+
+
+def redaction_refusal_detail(report: VerificationReport, offer: Optional[list] = None) -> dict:
+    """A refused redaction in plain words, for the window, from its failed
+    checks (#119, R4). *offer* is the pages redact_pdf offers to turn into
+    pictures (RedactionVerificationError.flatten_pages), None for none.
+
+    ``headline``
+        One sentence: something asked to be removed is still in the new
+        file; or part of it could not be read, so it could not be checked;
+        or the new file would still be linked to the original by its ID.
+        Each ends "Nothing was saved."
+    ``found``
+        What was found, and where: one line per place, the pages named.
+    ``nextStep``
+        What can be done: turn the pages offered into pictures (which
+        covers a drawing under a box, and removes anything else on them),
+        or why that would not help. No promise of a later fix.
+
+    Like sanitize_refusal_detail, the wording is made here so that it is
+    in one place and tested; the window shows the lines it is given.
+    """
+    failed = report.failed_checks()
+    named = frozenset(_named_elsewhere(failed))
+    found = _dedupe([line for c in failed for line in _refusal_lines(c, named)])
+    identifier = bool(failed) and all(c.id == "redaction.file_id" for c in failed)
+    unread = bool(failed) and all(
+        c.unevaluated or all("could not be" in e or "did not cover" in e for e in c.evidence)
+        for c in failed)
+    if identifier:
+        headline = ("Redaction refused: the new file would still be linked to the original. "
+                    "Nothing was saved.")
+        step = "The ID is not on any page, so turning pages into pictures cannot change it."
+    else:
+        headline = ("Redaction refused: part of the new file could not be read, so it could "
+                    "not be checked. Nothing was saved." if unread else
+                    "Redaction refused: some of what you asked to remove is still in the new "
+                    "file. Nothing was saved.")
+        if offer:
+            many = len(set(offer)) > 1
+            verb = ("cover" if all(c.id == "redaction.rect_line_art" for c in failed)
+                    else "remove")
+            step = (f"You can turn {pages_in_words(offer)} into "
+                    f"{'pictures' if many else 'a picture'} to {verb} it. "
+                    f"{'The pages keep their look' if many else 'The page keeps its look'}, "
+                    f"with what was found blacked out, but {'their' if many else 'its'} text "
+                    f"can no longer be selected or searched.")
+        elif report.flatten_target_pages():
+            many = len(report.flatten_target_pages()) > 1
+            step = (f"Turning the {'pages' if many else 'page'} into "
+                    f"{'pictures' if many else 'a picture'} did not remove it.")
+        elif unread:
+            step = "Nothing was found there, but a file that could not be checked is not saved."
+        else:
+            step = "It is not drawn on a page, so turning pages into pictures would not remove it."
+    return {"headline": headline, "found": found, "nextStep": step}
 
 
 def verify_sanitization(output_path: str, options: Optional[dict] = None, *,

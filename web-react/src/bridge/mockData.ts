@@ -271,3 +271,140 @@ export const MOCK_PRESETS: PresetsResponse = {
     { key: 'aggressive', name: 'Aggressive', description: 'Maximum compression', targetDpi: { color: 100, grayscale: 100, monochrome: 200 }, jpegQuality: 60 },
   ],
 };
+
+/** What the Redact page shows in browser-dev mode, made by the real Python
+ *  functions (pdf_ops.redaction_summary, pdf_verify.redaction_refusal_detail)
+ *  so that the mock reads like the app. Search for "everything", "lineart",
+ *  "refuse" or "xfa" to see each state (#119). */
+export const MOCK_REDACT_SUMMARY = {
+  "headline": "Redacted 6 places on 2 pages.",
+  "checked": "Checked before saving: what you asked to remove is gone from the new file.",
+  "removed": [],
+  "notes": []
+};
+export const MOCK_REDACT_SUMMARY_FLATTENED = {
+  "headline": "Redacted 6 places on 1 page.",
+  "checked": "Checked before saving: what you asked to remove is gone from the new file.",
+  "removed": [],
+  "notes": [
+    "Page 1 was turned into a picture, with 6 areas blacked out on it. Its text can no longer be selected or searched."
+  ]
+};
+export const MOCK_REDACT_SUMMARY_EVERYTHING = {
+  "headline": "Redacted 32,768 places on 1,200 pages.",
+  "checked": "Checked before saving: what you asked to remove is gone from the new file.",
+  "removed": [
+    "32,768 notes, stamps or other marks taken off the pages",
+    "1 form field taken off a page",
+    "32,768 links taken off the pages",
+    "1,200 small preview pictures of pages",
+    "4 descriptions of removed content, the kind screen readers read aloud",
+    "1 hidden copy of removed content that the file still pointed to",
+    "2 entries in the document's details, such as the title or author",
+    "3 bookmark titles"
+  ],
+  "notes": [
+    "Pages 3, 6, 9, 12, 15, 18 and 94 more have no text to search. They may be scans or pictures, so any words in them were not searched.",
+    "Pages 1 and 2 are scans with a hidden text layer. The search read that layer and found 2 matches there. If the layer misread a word, that word is still in the picture.",
+    "This file has 12 attached files: quarterly-report-final-version-00.zip, quarterly-report-final-version-01.zip, quarterly-report-final-version-02.zip, quarterly-report-final-version-03.zip, quarterly-report-final-version-04.zip and 7 more. Attached files were searched as they are stored, and were not opened. 12 of them are packed (like a zip or Word file), so nothing inside them could be searched.",
+    "Page 4 was turned into a picture, with 2 areas blacked out on it. Its text can no longer be selected or searched.",
+    "A form field under one of your boxes is also shown elsewhere, on pages 1-3 and 9. It is still shown there, and anything filled into it is still in the file.",
+    "Only the boxes you drew were redacted. The words under them were not searched for anywhere else in the file.",
+    "This run used version 2.1 of the PDF library. With this version, text after a removed word can shift along its line."
+  ]
+};
+export const MOCK_REDACT_REFUSAL_LINE_ART = {
+  "refusal": {
+    "headline": "Redaction refused: some of what you asked to remove is still in the new file. Nothing was saved.",
+    "found": [
+      "A drawing under a box on page 1 could not be removed without also removing the part of it that goes on outside the box."
+    ],
+    "nextStep": "You can turn page 1 into a picture to cover it. The page keeps its look, with what was found blacked out, but its text can no longer be selected or searched."
+  },
+  "flattenablePages": [
+    1
+  ],
+  "verification": {
+    "inputPath": "",
+    "outputPath": "",
+    "tool": "redaction",
+    "timestamp": "",
+    "checks": [
+      {
+        "id": "redaction.rect_line_art",
+        "description": "redaction.rect_line_art",
+        "passed": false,
+        "evidence": [
+          "a drawing still has an edge inside a redaction rectangle on page 1"
+        ],
+        "pages": [
+          1
+        ],
+        "isDocumentLevel": false,
+        "unevaluated": false,
+        "objectPaths": []
+      }
+    ],
+    "residualFindings": [],
+    "verified": false,
+    "flattenTargetPages": [
+      1
+    ],
+    "sourceSha256": null,
+    "outputSha256": null,
+    "unevaluated": [],
+    "diagnostics": []
+  }
+};
+export const MOCK_REDACT_REFUSAL_DOCUMENT_LEVEL = {
+  "refusal": {
+    "headline": "Redaction refused: some of what you asked to remove is still in the new file. Nothing was saved.",
+    "found": [
+      "What you searched for is still in the document's details, such as the title or author.",
+      "What you searched for is still hidden in what the file does when it opens."
+    ],
+    "nextStep": "It is not drawn on a page, so turning pages into pictures would not remove it."
+  },
+  "flattenablePages": null,
+  "verification": {
+    "inputPath": "",
+    "outputPath": "",
+    "tool": "redaction",
+    "timestamp": "",
+    "checks": [
+      {
+        "id": "redaction.docinfo",
+        "description": "redaction.docinfo",
+        "passed": false,
+        "evidence": [
+          "term 'refuse' found in document info field 'title' (document-level)"
+        ],
+        "pages": [],
+        "isDocumentLevel": true,
+        "unevaluated": false,
+        "objectPaths": []
+      },
+      {
+        "id": "redaction.term_sweep",
+        "description": "redaction.term_sweep",
+        "passed": false,
+        "evidence": [
+          "term 'refuse' found in a text string in the document information, under /Title (document-level)",
+          "term 'refuse' found in a text string in the document's open action, under /JS (document-level)"
+        ],
+        "pages": [],
+        "isDocumentLevel": true,
+        "unevaluated": false,
+        "objectPaths": []
+      }
+    ],
+    "residualFindings": [],
+    "verified": false,
+    "flattenTargetPages": null,
+    "sourceSha256": null,
+    "outputSha256": null,
+    "unevaluated": [],
+    "diagnostics": []
+  }
+};
+export const MOCK_REDACT_NOT_POSSIBLE = "This file's form is stored in a format (XFA) that redaction cannot change, and what you searched for is in that form. Nothing was saved.";
