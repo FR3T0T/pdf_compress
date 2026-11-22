@@ -1723,6 +1723,61 @@ class TestAFieldWithNothingLeftToShowIt:
             assert len(pdf.Root["/AcroForm"]["/Fields"]) == 1
 
 
+def _field_on_two_pages(pdf, value: str = "Whitfield and Sons"):
+    """A text field shown by two widgets: where _stamp puts its stamp on
+    page 1, and in the same place on page 2."""
+    parent = pdf.make_indirect(Dictionary(FT=Name.Tx, T=String("who"), V=String(value)))
+    kids = [pdf.make_indirect(Dictionary(
+        Type=Name.Annot, Subtype=Name.Widget, Parent=parent, Rect=STAMP_RECT,
+        DA=String("/Helv 12 Tf 0 g"), P=pdf.pages[n].obj, AP=Dictionary(N=_drawn(pdf, value))))
+        for n in (0, 1)]
+    parent["/Kids"] = Array(kids)
+    pdf.Root["/AcroForm"] = Dictionary(Fields=Array([parent]), DA=String("/Helv 12 Tf 0 g"),
+                                       DR=Dictionary(Font=Dictionary(Helv=_font(pdf))))
+    _on_page(pdf, kids[0], page=0)
+    _on_page(pdf, kids[1], page=1)
+
+
+@pytest.mark.integration
+@pytest.mark.filterwarnings("ignore:This document has 1 form widget")         # the fixture's own
+class TestAFieldStillShownElsewhere:
+    """A box drawn by hand over one place a field is shown takes that
+    widget, and that is all a box means: the field keeps its value and
+    goes on showing it wherever else it is shown. The run says where, so
+    the app can tell the user (note "field_still_shown"). Nothing new is
+    counted."""
+
+    def test_on_another_page(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _field_on_two_pages, pages=2)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_THE_STAMP])
+        assert res.verification["verified"] is True
+        assert res.surface_counts == {"page_content": 1, "fields_removed": 1}
+        assert {"kind": "field_still_shown", "pages": [2]} in res.notes
+        assert _subtypes(out, 0) == [] and _subtypes(out, 1) == ["/Widget"]
+        with pikepdf.open(out) as pdf:
+            (field,) = pdf.Root["/AcroForm"]["/Fields"]
+            assert str(field["/V"]) == "Whitfield and Sons"
+
+    def test_on_the_same_page(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _field_in_two_places)
+        res = redact_pdf(src, str(tmp_path / "out.pdf"), rects=[OVER_THE_STAMP])
+        assert {"kind": "field_still_shown", "pages": [1]} in res.notes
+
+    def test_a_field_shown_only_under_the_box_says_nothing(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", lambda pdf: _on_page(
+            pdf, _annotation(pdf, "field shown by a kid widget")))
+        res = redact_pdf(src, str(tmp_path / "out.pdf"), rects=[OVER_THE_STAMP])
+        assert [n for n in res.notes if n["kind"] == "field_still_shown"] == []
+
+    def test_boxes_over_both_places_say_nothing(self, tmp_path):
+        src = _pdf(tmp_path / "src.pdf", _field_on_two_pages, pages=2)
+        out = str(tmp_path / "out.pdf")
+        res = redact_pdf(src, out, rects=[OVER_THE_STAMP, dict(OVER_THE_STAMP, page=1)])
+        assert [n for n in res.notes if n["kind"] == "field_still_shown"] == []
+        assert res.surface_counts.get("fields_removed") == 2 and not _holds(out, "Whitfield")
+
+
 def _field_in_two_places(pdf):
     """A field shown in two places: one under OVER_THE_STAMP, one below."""
     parent = pdf.make_indirect(Dictionary(FT=Name.Tx, T=String("who"), V=String("Whitfield")))

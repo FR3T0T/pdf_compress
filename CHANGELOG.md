@@ -678,6 +678,42 @@
   code with no remaining callers.
 
 ### Fixed
+- **Redaction: a turned page whose page box does not start at 0 0 (#119).**
+  On a page turned by `/Rotate`, PyMuPDF's `page.transformation_matrix` is a
+  matrix it builds by hand that leaves out where the crop box or media box
+  starts. Three things used it. An annotation's own rectangle was placed
+  with it: a stamp over a box drawn by hand stayed on the page, painted over
+  the black, while a stamp or a link elsewhere was taken off and counted
+  (from Part A of this work). The verifier placed annotations the same way
+  and passed. And PyMuPDF draws a redaction's black fill with it, by term
+  and by box: the text was removed in the right place and the black bar
+  landed beside it (on `main` too, and on PyMuPDF 1.28 and 2.1). The matrix
+  is now read with the page set upright for the moment and its `/Rotate`
+  put back exactly as it was (`pdf_verify.upright`,
+  `pdf_verify.pdf_to_page_matrix`), where annotations are placed by the
+  engine and the verifier and around `apply_redactions`. It is not built
+  from the page's boxes: that disagrees with PyMuPDF's own on some upright
+  pages of real files (user units, broken boxes). A second fault of the
+  same kind came to light on the way: PyMuPDF's `rotation_matrix` is made
+  from the crop box as it is written, and MuPDF draws a page with a user
+  unit larger, and a page whose crop box is not inside its media box cut
+  to the media box. On such a page, turned, a box drawn in the app went
+  somewhere else and the run verified with the word under it; the
+  blackout of a flattened page used the same matrix. Both now use
+  `pdf_verify.page_to_picture_matrix`, the same turn made from the page as
+  MuPDF bounds it. Upright pages, and turned pages whose box starts at 0 0
+  and is drawn at its own size, come out as before. Tests:
+  `TestAPageBoxThatDoesNotStartAtTheCorner` and
+  `TestATurnedPageWhoseSizeIsNotItsCropBox` in
+  `tests/test_redact_page_pictures.py`, which check the black on the
+  rendered page and find the box from the ink.
+- **Redaction says when a field under a box is still shown elsewhere
+  (#119).** A box drawn by hand over one place a form field is shown takes
+  that widget and nothing more: the field keeps its value and goes on
+  showing it wherever else it is shown. That is what a box means, and it
+  stays. The result now says so, with a note of a new kind,
+  `field_still_shown`, naming the pages it is still shown on. Nothing new
+  is counted. Tests: `TestAFieldStillShownElsewhere`.
 - **Redaction: a box drawn on a turned page (#119).** The app shows each
   page as a picture of the page as it is shown and sends a box as it lies on
   that picture. `redact_pdf` works on the page before its `/Rotate`, so on a

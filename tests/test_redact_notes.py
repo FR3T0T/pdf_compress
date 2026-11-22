@@ -9,6 +9,10 @@ word; none of them is a failure:
   text_layer    pages whose text is an invisible layer over a picture (OCR)
   attachments   attachments, which are searched as stored and never opened
   flattened     pages that were turned into pictures
+  field_still_shown
+                a box drawn by hand took a widget of a field shown in
+                another place too, which still shows its value (R4; tested
+                in tests/test_redact_engine.py)
   boxes_only    a run by boxes alone searched for nothing
   text_may_move the run was made with PyMuPDF 2.x, which can move the text
                 after a removed word (R4; and 1.28 is refused outright)

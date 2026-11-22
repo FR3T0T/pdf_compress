@@ -113,6 +113,7 @@ stack cannot load (see CLAUDE.md).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -1641,6 +1642,65 @@ def _whole_file_checks(output_path: str, password: Optional[str] = None) -> list
     ]
 
 
+@contextlib.contextmanager
+def upright(page):
+    """*page* with its /Rotate set to 0 for the time being, and put back
+    exactly as it was afterwards — the page's own value, or none at all
+    when it takes its turn from the page tree.
+
+    PyMuPDF does two things on a turned page with a matrix it builds by
+    hand, Matrix(1, 0, 0, -1, 0, cropbox height), which leaves out where
+    the page box starts (page.transformation_matrix): it puts a rectangle
+    from the PDF into page space, and it draws a redaction's black fill
+    (apply_redactions, through a Shape). On a page whose crop box or media
+    box does not start at 0 0 both land in the wrong place. Upright, it
+    asks MuPDF for the matrix, and MuPDF has it right. The change is made
+    in memory, on the document's own page dictionary; nothing is saved
+    here, and it is undone on the way out whatever happens.
+    """
+    if not page.rotation:
+        yield page
+        return
+    doc, xref = page.parent, page.xref
+    kind, value = doc.xref_get_key(xref, "Rotate")
+    doc.xref_set_key(xref, "Rotate", "0")
+    try:
+        yield page
+    finally:
+        doc.xref_set_key(xref, "Rotate", "null" if kind == "null" else value)
+
+
+def page_to_picture_matrix(page):
+    """The matrix that takes a point in PyMuPDF's page space to the page as
+    it is shown — turned by its /Rotate, as get_pixmap draws it and as the
+    app's page pictures show it. Its inverse takes a box drawn on such a
+    picture back to page space.
+
+    page.rotation_matrix is the same turn, made from the size of the crop
+    box as it is written. MuPDF draws the page at another size when the
+    page has a user unit (it is drawn that many times larger) or when its
+    crop box is not inside its media box (it is cut to the media box), and
+    there a box drawn on the picture went somewhere else and the run
+    verified with the word under it. The turn here is made from the page
+    as MuPDF bounds it (page.rect, the size of the page as shown); on every
+    other page the two are the same.
+    """
+    size = page.rect
+    return {90: fitz.Matrix(0, 1, -1, 0, size.width, 0),
+            180: fitz.Matrix(-1, 0, 0, -1, size.width, size.height),
+            270: fitz.Matrix(0, -1, 1, 0, 0, size.height)}.get(page.rotation % 360, fitz.Matrix(1, 0, 0, 1, 0, 0))
+
+
+def pdf_to_page_matrix(page):
+    """The matrix that takes a point in the PDF's own coordinates (an
+    annotation's /Rect, say) to PyMuPDF's page space — the page before any
+    /Rotate, from the top left of its crop box, where get_text and
+    search_for put things. page.transformation_matrix, read upright: see
+    upright()."""
+    with upright(page):
+        return fitz.Matrix(page.transformation_matrix)
+
+
 def _valid_rects(doc, rects: list[dict]) -> list[tuple]:
     """(page index, fitz.Rect) for each entry of *rects* that names a page
     of *doc* and a real area. The others are _rect_region_check's to fail;
@@ -1673,7 +1733,9 @@ def _rect_annotation_check(doc, output_path: str, rects: list[dict],
     reads an annotation written into the array itself like any other;
     PyMuPDF's lists pass over one that has no object number. Its /Rect is
     put into the coordinates redaction rectangles are given in (PyMuPDF's,
-    on the page before any rotation) with the page's own matrix.
+    on the page before any rotation) with the page's own matrix, read the
+    way that is right on a turned page whose page box does not start at
+    0 0 (pdf_to_page_matrix).
     """
     ev: list[str] = []
     by_page: dict[int, list] = {}
@@ -1688,7 +1750,7 @@ def _rect_annotation_check(doc, output_path: str, rects: list[dict],
         with pikepdf.open(output_path, **kwargs) as pdf:
             for pno, boxes in sorted(by_page.items()):
                 try:
-                    to_fitz = doc[pno].transformation_matrix
+                    to_fitz = pdf_to_page_matrix(doc[pno])
                     annots = pdf.pages[pno].obj.get("/Annots")
                     entries = list(annots) if isinstance(annots, pikepdf.Array) else []
                 except Exception as exc:
