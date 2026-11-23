@@ -492,7 +492,11 @@ export function TranslatePage() {
                 current={setupOp.progress?.current}
                 total={setupOp.progress?.total}
                 filename={setupOp.progress?.filename}
-                onCancel={setupOp.cancel}
+                onCancel={() => {
+                  bridgeApi.cancel('translateSetup');
+                  setupOp.reset();
+                  toast.info('Setup cancelled.');
+                }}
               />
             </div>
           )}

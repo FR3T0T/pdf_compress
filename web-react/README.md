@@ -47,7 +47,9 @@ file that cannot be redacted); any other word is redacted plainly. With
 "Also read scanned pages with OCR" ticked, a run shows the OCR progress line
 and an OCR summary, and `damage` shows the refusal for a page that would
 have changed outside the places found; add `?ocr=off` to the address to see
-the option as it is when OCR is not set up. The
+the option as it is when OCR is not set up. `nothing` shows the note for a
+search that finds nothing. On every page, Cancel ends the mock run the way
+the bridge ends a cancelled one, so only the page's own line shows. The
 mock's words are made by the real Python functions. Route `#/gallery` is a
 dev-only component gallery, not shown in the sidebar.
 

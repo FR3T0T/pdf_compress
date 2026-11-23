@@ -7,6 +7,7 @@ import {
   MOCK_PRESETS,
   MOCK_OCR_NOT_READY,
   MOCK_REDACT_NOT_POSSIBLE,
+  MOCK_REDACT_NOTHING_FOUND,
   MOCK_REDACT_REFUSAL_DOCUMENT_LEVEL,
   MOCK_REDACT_REFUSAL_LINE_ART,
   MOCK_REDACT_REFUSAL_OCR_OUTSIDE,
@@ -16,7 +17,7 @@ import {
   MOCK_REDACT_SUMMARY_OCR,
   mockSanitizeResult,
 } from './mockData';
-import { simulateFailure, simulateOperation, type MockFileLike } from './mockEventBus';
+import { cancelSimulated, simulateFailure, simulateOperation, type MockFileLike } from './mockEventBus';
 import { safeJsonParse } from './safeJsonParse';
 
 export const isRealBridge = (): boolean => typeof window !== 'undefined' && !!window.BridgeAPI;
@@ -658,6 +659,10 @@ export const bridgeApi = {
         simulateFailure(TOOL_KEYS.redact, MOCK_REDACT_NOT_POSSIBLE, { notPossible: true });
         return;
       }
+      if (asked.includes('nothing')) {
+        simulateFailure(TOOL_KEYS.redact, MOCK_REDACT_NOTHING_FOUND, { nothingFound: true });
+        return;
+      }
       if (params.ocr && asked.includes('damage')) {
         simulateFailure(TOOL_KEYS.redact, MOCK_REDACT_REFUSAL_OCR_OUTSIDE.refusal.headline,
           { ...MOCK_REDACT_REFUSAL_OCR_OUTSIDE, documentLevel: false });
@@ -734,7 +739,8 @@ export const bridgeApi = {
   },
 
   cancel(toolKey: string): void {
-    window.BridgeAPI?.cancel(toolKey);
+    if (window.BridgeAPI) window.BridgeAPI.cancel(toolKey);
+    else cancelSimulated(toolKey);          // the mock run ends as a cancelled one (#135)
   },
 
   // -- Workspace (persistent working document) -----------------------------

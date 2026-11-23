@@ -1957,15 +1957,6 @@ def _inside(rect, shape, margin: float = 1.0):
     return slice(y0, max(y0, y1)), slice(x0, max(x0, x1))
 
 
-def _user_unit(doc, page) -> float:
-    """The page's /UserUnit, 1 when it has none."""
-    try:
-        kind, value = doc.xref_get_key(page.xref, "UserUnit")
-        return float(value) if kind in ("int", "real") else 1.0
-    except Exception:
-        return 1.0
-
-
 def _pixels_blank_under(pix, transform, box) -> bool:
     """Whether the decoded picture *pix*, drawn by *transform*, holds one
     value under *box* (page space), counting the pixels wholly inside it."""
@@ -2014,26 +2005,14 @@ def _inline_blank_under(blocks: list, transform, box) -> Optional[bool]:
         return None
 
 
-def _changed_outside(doc, page, now, then, to_pixels, pno: int, rects: list, on: str) -> list[str]:
+def _changed_outside(page, now, then, to_pixels, pno: int, rects: list, on: str) -> list[str]:
     """Evidence that *page* (*now*, its fingerprint pixels) changed from
     *then* outside every box of *rects* on it, each grown by two pixels:
-    pixels more than 24 grey levels apart."""
+    pixels more than 24 grey levels apart. On a page with a user unit too:
+    the black fill is the box there (pdf_ops._fill_black, #134), and black
+    past it is counted like any other change."""
     import numpy as np
     changed = np.abs(now.astype(np.int16) - then.astype(np.int16)) > 24
-    if _user_unit(doc, page) != 1:
-        # PyMuPDF draws a redaction's black fill larger than its box on a
-        # page with a user unit (a known limit, README): a pixel that turned
-        # black there, or lies within two pixels of one (the fill's edge,
-        # half covered), is put down to it.
-        fill = now <= 24
-        for _ in range(2):
-            grown = fill.copy()
-            grown[1:] |= fill[:-1]
-            grown[:-1] |= fill[1:]
-            grown[:, 1:] |= fill[:, :-1]
-            grown[:, :-1] |= fill[:, 1:]
-            fill = grown
-        changed &= ~fill
     for r in rects:
         try:
             if int(r["page"]) != pno:
@@ -2070,8 +2049,8 @@ def _ocr_checks(doc, ocr_pages: list, terms: list[str], case_sensitive: bool,
         of the fingerprint). Both are drawn the same way, at a resolution
         at which a picture stored again without loss draws as it did
         (pdf_ocr.fingerprint_pixels). Damage, not a leak: no flatten
-        either. On a page with a user unit, where PyMuPDF draws the black
-        fill larger than the box, a pixel that turned black is not counted.
+        either. A page with a user unit is held to it like any other: its
+        black fill is the box (pdf_ops._fill_black, #134).
 
     *ocr_pages* is redact_pdf's account of the pages: {"page" (0-based),
     "boxes" ([x0, y0, x1, y1] in page space), "dpi", "turns", "before"
@@ -2137,7 +2116,7 @@ def _ocr_checks(doc, ocr_pages: list, terms: list[str], case_sensitive: bool,
             if now.shape != (before["height"], before["width"]):
                 outside_ev.append(f"the page {on} is not the size it was")
             else:
-                outside_ev += _changed_outside(doc, page, now, then.reshape(now.shape), to_print,
+                outside_ev += _changed_outside(page, now, then.reshape(now.shape), to_print,
                                                pno, list(rects) + searched, on)
         # (d) What OCR reads on the page now.
         if not tessdata:

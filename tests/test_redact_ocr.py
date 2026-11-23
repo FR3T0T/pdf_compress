@@ -32,6 +32,7 @@ from pikepdf import Dictionary, Name
 from PIL import Image
 
 import pdf_ocr
+import pdf_ops
 import pdf_verify
 from pdf_ops import RedactionVerificationError, redact_pdf
 
@@ -640,7 +641,7 @@ def test_a_cancel_stops_inside_a_page_between_turns(tmp_path, tessdata, monkeypa
         return real(*a, **k)
     monkeypatch.setattr(pdf_ocr, "_ocr", first_then_cancel)
     out = tmp_path / "out.pdf"
-    with pytest.raises(ValueError, match="Cancelled"):
+    with pytest.raises(InterruptedError, match="Cancelled"):
         redact_pdf(str(path), str(out), search_terms=[TERM], ocr=True, cancel=cancel)
     assert len(calls) == 1 and not out.exists()
 
@@ -670,16 +671,19 @@ def test_a_mapping_gone_wrong_is_refused(tmp_path, tessdata, monkeypatch):
 
 def _redacted_by_hand(tmp_path, src, boxes, *, fill=True, blank=True, after=b""):
     """*src* with *boxes* redacted by MuPDF directly, as redact_pdf applies
-    a box (the page set upright for it, pdf_verify.upright): with or
-    without the fill, with or without the picture's pixels blanked, and
-    with *after* drawn on top of the page last."""
+    a box (the page set upright for it, pdf_verify.upright; the black
+    written by pdf_ops._fill_black): with or without the fill, with or
+    without the picture's pixels blanked, and with *after* drawn on top of
+    the page last."""
     with fitz.open(src) as doc:
         page = doc[0]
         for box in boxes:
-            page.add_redact_annot(fitz.Rect(box), fill=(0, 0, 0) if fill else False)
+            page.add_redact_annot(fitz.Rect(box), fill=False)
         with pdf_verify.upright(page):
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS if blank
                                   else fitz.PDF_REDACT_IMAGE_NONE)
+        if fill:                     # the black, the size of the box (#134)
+            pdf_ops._fill_black(page, [fitz.Rect(b) for b in boxes])
         if after:
             xref = page.get_contents()[-1]
             doc.update_stream(xref, doc.xref_stream(xref) + b"\n" + after)
@@ -888,10 +892,11 @@ def test_damage_outside_the_boxes_of_a_clipped_jpeg_is_still_caught(tmp_path, te
     assert not outside.passed
 
 
-def test_on_a_page_with_a_user_unit_only_black_is_put_down_to_the_fill(tmp_path, tessdata):
-    """PyMuPDF draws the black fill larger than its box on a page with a
-    user unit (README, known limits): pixels turned black there are not
-    damage. Anything else that changed still is."""
+def test_on_a_page_with_a_user_unit_the_outside_check_is_as_anywhere(tmp_path, tessdata):
+    """The black fill is the box on a page with a user unit too (#134): a
+    proper redaction passes with nothing put down to the fill, and anything
+    else that changed is caught (test_redact_user_unit.py has the fill drawn
+    too large)."""
     src, _term, _near = _scan_pair(tmp_path, "uu", user_unit=2)
     boxes = _term_boxes(src, tessdata)
     with fitz.open(src) as doc:

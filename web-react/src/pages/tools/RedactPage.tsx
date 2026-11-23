@@ -74,6 +74,10 @@ interface RedactFailure {
   documentLevel?: boolean;
   refusal?: RedactRefusal | null;
   notPossible?: boolean;
+  /** A search that found nothing (#135): not an error. The payload's message
+   *  says so in full, with what the search could not read and that nothing
+   *  was saved (pdf_ops.RedactionNothingFoundError). */
+  nothingFound?: boolean;
 }
 
 /** "page 2", "pages 1, 3 and 5", or "these 12 pages" for a long list. */
@@ -286,6 +290,7 @@ export function RedactPage() {
       const f = (op.result as unknown as RedactFailure) ?? null;
       if (f?.verification || f?.refusal) toast.warning('Redaction refused. Nothing was saved.');
       else if (f?.notPossible) toast.warning("Redaction can't be done. Nothing was saved.");
+      else if (f?.nothingFound) toast.info('Nothing matched what you searched for. Nothing was saved.');
       else toast.error(op.error || 'Something went wrong while redacting. Nothing was saved.');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -426,6 +431,7 @@ export function RedactPage() {
           files={files}
           onFilesChanged={setFiles}
           multiple={false}
+          compact={files.length > 0}
           title="Drop PDF file here"
           subtitle="or click to browse"
           disabled={op.status === 'running'}
@@ -602,6 +608,8 @@ export function RedactPage() {
       )}
 
       {failure?.notPossible && <NotPossiblePanel message={op.error} />}
+
+      {failure?.nothingFound && <NothingFoundPanel message={op.error} />}
     </div>
   );
 }
@@ -671,6 +679,25 @@ function NotPossiblePanel({ message }: { message: string | null }) {
           <strong style={{ fontSize: 'var(--font-size-sm)' }}>Redaction can't be done.</strong>
           <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)', marginTop: 4, ...wrapAnywhere }}>
             {message || 'Nothing was saved.'}
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/** A search that found nothing to redact (#135). Not an error: a plain note
+ *  with the whole message the Python side gives — what the search could not
+ *  read (scans, pages read with OCR, pages that are mostly a picture) and
+ *  that nothing was saved. */
+function NothingFoundPanel({ message }: { message: string | null }) {
+  return (
+    <div style={{ marginTop: 'var(--space-4)' }}>
+      <Card>
+        <div style={{ borderLeft: '3px solid var(--sev-info)', paddingLeft: 'var(--space-3)' }}>
+          <strong style={{ fontSize: 'var(--font-size-sm)' }}>Nothing to redact.</strong>
+          <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)', marginTop: 4, ...wrapAnywhere }}>
+            {message || 'Nothing matched what you searched for. Nothing was saved.'}
           </div>
         </div>
       </Card>

@@ -36,6 +36,10 @@ export function useOperation<TResult = unknown>(toolKey: string): UseOperationRe
 
   useEventBus('done', (data) => {
     if (data.toolKey !== toolKey) return;
+    // A run the user cancelled (#135): the page's Cancel button has already
+    // stopped waiting for it (reset) and said so in its own words, and a run
+    // started since must not be ended by it. Not an error: let it go.
+    if (data.cancelled) return;
     setResult(data as DonePayload<TResult>);
     setStatus(data.success ? 'done' : 'error');
     if (!data.success) setError(data.message || 'Operation failed.');
@@ -62,8 +66,15 @@ export function useOperation<TResult = unknown>(toolKey: string): UseOperationRe
     });
   }, []);
 
+  // Stops waiting for the run as well as asking the bridge to stop it: the
+  // cancelled run's "done" is let go (#135), so a Cancel that did not leave
+  // the running state here would never leave it.
   const cancel = useCallback(() => {
     bridgeApi.cancel(toolKey);
+    setStatus('idle');
+    setProgress(null);
+    setResult(null);
+    setError(null);
   }, [toolKey]);
 
   const reset = useCallback(() => {

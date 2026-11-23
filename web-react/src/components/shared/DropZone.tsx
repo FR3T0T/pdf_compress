@@ -120,7 +120,7 @@ export const DropZone = forwardRef<DropZoneHandle, DropZoneProps>(function DropZ
     >
       {compact && files.length > 0 ? (
         <div className="mono" style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-2)' }}>
-          {summary} — click or drop to add more
+          {summary} — click or drop to {multiple ? 'add more' : 'pick another'}
         </div>
       ) : (
         <>

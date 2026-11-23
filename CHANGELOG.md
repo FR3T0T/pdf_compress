@@ -763,6 +763,50 @@
   code with no remaining callers.
 
 ### Fixed
+- **Redaction: the black is the box on a page with a user unit (#134).** On
+  a page whose `/UserUnit` is above 1 (drawn that many times larger than its
+  numbers say), PyMuPDF drew a redaction's black fill at the box's size in
+  the page's own numbers, from its lower left corner: twice the box each
+  way at user unit 2, three times at 3 — up to 397 points past it — in box
+  mode, search mode and with OCR, upright and turned, on 1.27.2.3 and 2.1
+  alike. What was removed was right. Redaction now asks PyMuPDF for no fill
+  and writes the black itself (`pdf_ops._fill_black`): each box put into the
+  PDF's own space by `pdf_verify.pdf_to_page_matrix` and filled, with the
+  one-point black edge PyMuPDF's fill had, in RGB black as PyMuPDF wrote it
+  (`0 0 0 rg`: grey black, `0 g`, shows dark grey on a page drawn in a CMYK
+  transparency group, as print exports are), in a content stream of the
+  page's own, in the same save. On every page the black is now within a
+  pixel of the box; a page with no user unit looks as it did. The OCR check
+  that nothing changed outside the boxes no longer puts black on a
+  user-unit page down to the fill, and the README's known limit is gone.
+  Tests: `tests/test_redact_user_unit.py`; sample 24 in
+  `tests/manual/make_redact_samples.py`.
+- **Redaction: a search that finds nothing, and Cancel, are not errors
+  (#135).** "No matching content found to redact." (with its notes about
+  scans, OCR and pages that are mostly a picture) was a plain ValueError:
+  the bridge logged a stack trace and the Redact page showed a red error. It
+  is now `RedactionNothingFoundError`, a ValueError, whose message ends
+  "Nothing was saved."; the bridge gives it a branch of its own (one info
+  line, no stack trace, `nothingFound: true` in the done payload) and the
+  page a plain note with the whole message and an info pop-up. A cancel in
+  `redact_pdf` raised `ValueError("Cancelled")`, so it too logged a stack
+  trace; it now raises `InterruptedError`, as the other tools do. And every
+  tool's Cancel showed a red "Cancelled" pop-up beside the page's own
+  line, because the cancelled run's done payload set the shared operation
+  hook to an error after the page had reset it: the worker's cancel branch
+  now logs one line and sends `cancelled: true`, and `useOperation` lets
+  such a payload go, so each page shows only its own line (all 21 tool
+  pages with a Cancel button). Every Cancel leaves the running state at
+  once: the hook's own `cancel()` resets too, and Translate's setup panel,
+  which used it directly, now has a handler like the others ("Setup
+  cancelled."); without that it would have stayed "running", Close
+  disabled, until the app was restarted. The browser-dev mock answers a
+  cancel the same way. Tests: `tests/test_redact_outcomes.py`.
+- **The Redact page shows which file is loaded (#135).** Its drop box kept
+  saying "Drop PDF file here" after a file was picked. It now shows the
+  file's name, "— click or drop to pick another", as the Compare page's do;
+  a drop box for one file says "pick another" rather than "add more"
+  (Compare's too).
 - **A redaction that cannot start no longer looks like a crash (#119).** An
   XFA-only form and PyMuPDF 1.28 raise `RedactionNotPossibleError`, which
   the bridge treated like any other failure: a stack trace in the log and

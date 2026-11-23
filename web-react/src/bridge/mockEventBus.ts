@@ -33,6 +33,21 @@ export interface MockFileLike {
   name: string;
 }
 
+/** Tools whose simulated run the user cancelled: it ends the way ui/bridge.py's
+ *  worker ends a cancelled run (#135), with a "done" that says "cancelled". */
+const cancelledTools = new Set<string>();
+
+export function cancelSimulated(toolKey: string): void {
+  cancelledTools.add(toolKey);
+}
+
+function endedByCancel(toolKey: string): boolean {
+  if (!cancelledTools.has(toolKey)) return false;
+  cancelledTools.delete(toolKey);
+  mockEventBus.emit('done', { toolKey, success: false, message: 'Cancelled', cancelled: true });
+  return true;
+}
+
 /**
  * Simulate a fire-and-forget operation for mock mode: emits a "progress"
  * event per file, then a "done" event, on mockEventBus. Timing is short
@@ -45,9 +60,11 @@ export function simulateOperation(
 ): void {
   const total = Math.max(files.length, 1);
   const items = files.length > 0 ? files : [{ name: 'document.pdf' }];
+  cancelledTools.delete(toolKey);
 
   items.forEach((f, i) => {
     setTimeout(() => {
+      if (cancelledTools.has(toolKey)) return;
       const payload: ProgressPayload = {
         toolKey,
         current: i + 1,
@@ -61,6 +78,7 @@ export function simulateOperation(
 
   setTimeout(
     () => {
+      if (endedByCancel(toolKey)) return;
       const payload: DonePayload = {
         toolKey,
         success: true,
@@ -79,10 +97,13 @@ export function simulateOperation(
  * level — the shape ui/bridge.py's _done_payload gives a refusal.
  */
 export function simulateFailure(toolKey: string, message: string, extra: Record<string, unknown>): void {
+  cancelledTools.delete(toolKey);
   setTimeout(() => {
+    if (cancelledTools.has(toolKey)) return;
     mockEventBus.emit('progress', { toolKey, current: 1, total: 1, pct: 100, filename: 'document.pdf' });
   }, 300);
   setTimeout(() => {
+    if (endedByCancel(toolKey)) return;
     mockEventBus.emit('done', { toolKey, success: false, message, ...extra });
   }, 550);
 }

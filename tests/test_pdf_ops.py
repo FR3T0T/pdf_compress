@@ -923,7 +923,7 @@ class TestRedactErrorTail:
         out = str(tmp_path / "c_out.pdf")
         evt = threading.Event()
         evt.set()
-        with pytest.raises(ValueError, match="Cancelled"):
+        with pytest.raises(InterruptedError, match="Cancelled"):     # a cancel, not an error (#135)
             redact_pdf(src, out, search_terms=["SECRET_TERM"], cancel=evt)
         assert not os.path.exists(out)
 

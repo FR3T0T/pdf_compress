@@ -284,3 +284,35 @@ answers:
   option ticked shows the OCR progress line and an OCR summary, and the
   search word `damage` shows the refusal for a page that would have changed
   outside the places found. `web-react/dist/` rebuilt.
+
+### #135 — Nothing found and Cancel are not errors; Redact shows its file (2026-11-23)
+
+- **Done payload, a search that finds nothing.** `redact_pdf` raises
+  `RedactionNothingFoundError` (a ValueError). The worker gives it its own
+  branch, like `RedactionNotPossibleError`: one info line in the log, no
+  stack trace, `success: false` with the whole plain message (it ends
+  "Nothing was saved.") and the **new top-level `nothingFound: true`**.
+  `RedactPage.tsx` shows a plain note ("Nothing to redact.") with the
+  message and an info pop-up, not a red error.
+- **Done payload, a cancel (every tool).** The worker's
+  `CancelledError`/`InterruptedError` branch now logs one info line and adds
+  the **new top-level `cancelled: true`** (message still "Cancelled").
+  `redact_pdf` raises `InterruptedError` on a cancel, as the other tools
+  did, instead of `ValueError("Cancelled")`. The shared `useOperation` hook
+  ignores a done payload with `cancelled` (`DonePayload.cancelled` in
+  `types/bridge.ts`): every tool page's Cancel button had already reset the
+  operation and said so in its own line, and the payload then set it to an
+  error, so a red "Cancelled" pop-up came as well — on all 21 tool pages
+  with a Cancel button. Now only the page's own line shows, and a cancelled
+  run cannot end a run started after it. Since that payload no longer ends
+  the run, every Cancel resets the operation itself: the hook's own
+  `cancel()` now resets as the pages' handlers do, and Translate's setup
+  panel (which passed `setupOp.cancel` straight to its ProgressPanel) has a
+  handler like the others that resets and says "Setup cancelled.".
+- **Frontend.** The Redact page's drop box is compact once a file is
+  loaded and shows its name, as the Compare page's drop boxes do; the shared
+  `DropZone` says "click or drop to pick another" in a box that takes one
+  file (it said "add more", Compare's too). The browser-dev mock answers
+  `bridgeApi.cancel` as the bridge does (a done payload with `cancelled`),
+  and the Redact search word `nothing` shows the nothing-found note.
+  `web-react/dist/` rebuilt.

@@ -1901,8 +1901,16 @@ class RedactionNotPossibleError(ValueError):
     """The document cannot be term-redacted at all, for a reason the message
     gives in plain words — not a candidate that failed verification, so
     there is no report. A ValueError, like the other reasons a redaction
-    does not start ("No matching content found"): callers that show those
+    does not start (RedactionNothingFoundError): callers that show those
     show this. Nothing was written."""
+
+
+class RedactionNothingFoundError(ValueError):
+    """A search found nothing to redact anywhere in the file (#135). Not a
+    failure: the message says so in plain words, with what the search could
+    not read (scans, pages read by OCR, pages that are mostly a picture), and
+    that nothing was saved. A ValueError, so that callers that caught the
+    plain ValueError it used to be still do. Nothing was written."""
 
 
 def _all_objects(pdf) -> list:
@@ -3478,7 +3486,7 @@ def _redact_boxes(page, boxes: list, graphics: int | None = None, text: int | No
     if not boxes:
         return 0
     for box in boxes:
-        page.add_redact_annot(box, fill=(0, 0, 0))
+        page.add_redact_annot(box, fill=False)
     under = [wdg for wdg in page.widgets() if any(r.intersects(wdg.rect) for r in boxes)]
     fields = _fields_on(page) if under else 0
     if covered is not None:
@@ -3504,7 +3512,48 @@ def _redact_boxes(page, boxes: list, graphics: int | None = None, text: int | No
     if text is not None:
         options["text"] = text
     _apply(page, tally, **options)
+    _fill_black(page, boxes)
     return len(boxes)
+
+
+def _fill_black(page, boxes: list) -> None:
+    """Fill *boxes* (page space) black on *page*, on top of everything it
+    draws: what a redaction's fill is, written here rather than by PyMuPDF
+    (#134).
+
+    PyMuPDF draws the fill at the box's size in the page's own numbers, from
+    its lower left corner, and on a page with a /UserUnit above 1 those
+    numbers are drawn that many times larger: the black came out twice the
+    box each way at user unit 2, three times at 3, in every mode, upright and
+    turned, on 1.27.2.3 and 2.1 alike. Here each box is put into the PDF's
+    own space by pdf_verify.pdf_to_page_matrix — which has the user unit, a
+    page box that does not start at 0 0 and the turn right — and written as
+    a rectangle filled with black, after what the page draws, in a stream of
+    its own: the content is wrapped in q ... Q first, so that nothing it
+    leaves set moves or colours the fill, and no stream another page shares
+    is changed. Like PyMuPDF's, the rectangle has a black edge a point wide
+    on the page as shown (half a point past the box), and is black in RGB
+    (0 0 0 rg): a page drawn in a transparency group with its own colour
+    space (/Group << /S /Transparency /CS /DeviceCMYK >>, as print exports
+    are) shows grey black (0 g) as dark grey, about 35, 31, 32 against 8,
+    7, 6. So a page with no user unit looks as it did."""
+    if not boxes:
+        return
+    doc = page.parent
+    to_page = pdf_to_page_matrix(page)
+    to_pdf = ~to_page
+    scale = math.hypot(to_page.a, to_page.b) or 1.0      # the user unit
+    rects = [(fitz.Rect(box) * to_pdf).normalize() for box in boxes]
+    fill = "".join(f"{r.x0:.4f} {r.y0:.4f} {r.width:.4f} {r.height:.4f} re B\n" for r in rects)
+    streams = []
+    for data in (b"q\n", f"Q\nq 0 0 0 rg 0 0 0 RG {1 / scale:.4f} w\n{fill}Q\n".encode()):
+        xref = doc.get_new_xref()
+        doc.update_object(xref, "<<>>")
+        doc.update_stream(xref, data)
+        streams.append(xref)
+    contents = page.get_contents()
+    doc.xref_set_key(page.xref, "Contents",
+                     "[" + " ".join(f"{x} 0 R" for x in [streams[0], *contents, streams[1]]) + "]")
 
 
 def _redact_term_boxes(page, hits: list, tally: dict | None = None) -> int:
@@ -4516,7 +4565,10 @@ def redact_pdf(
     word (pages with no text, pages whose text is a layer over a picture,
     attachments, pages turned into pictures, a run by boxes alone; see
     RedactResult). A search that finds nothing at all has no result to
-    carry a note, so its ValueError names the pages it could not read.
+    carry a note, so its RedactionNothingFoundError (a ValueError) names the
+    pages it could not read, and says that nothing was saved (#135). A
+    cancel raises InterruptedError, as the other tools do, with nothing
+    saved.
     """
     scrub_terms = [t for t in (search_terms or []) if t and t.strip()]
     if not scrub_terms and not rects:
@@ -4578,7 +4630,7 @@ def redact_pdf(
         except InterruptedError:
             doc.close()
             _let_go()
-            raise ValueError("Cancelled") from None
+            raise
 
     def redact_pages(doc) -> tuple[int, set, dict]:
         """Redact the page content of *doc*; returns (rectangles drawn,
@@ -4597,7 +4649,7 @@ def redact_pdf(
             if cancel and cancel.is_set():
                 doc.close()
                 _let_go()
-                raise ValueError("Cancelled")
+                raise InterruptedError("Cancelled")
             if on_progress:
                 on_progress(i + 1, len(target))
             if pno < 0 or pno >= total:
@@ -4643,7 +4695,7 @@ def redact_pdf(
                 if cancel and cancel.is_set():
                     doc.close()
                     _let_go()
-                    raise ValueError("Cancelled")
+                    raise InterruptedError("Cancelled")
                 again = _apart_from([box for turn in reading.hit_turns
                                      for box in pdf_ocr.read_at(page, scrub_terms, case_sensitive,
                                                                 tessdata, turn, reading.dpi).boxes],
@@ -4772,8 +4824,10 @@ def redact_pdf(
             # No result to carry a note, so the facts that explain an empty
             # search go in the message: pages it could not read, and pages
             # OCR read, which can miss words.
-            raise ValueError("No matching content found to redact."
-                             + _unread_in_words(seen, tessdata is None and ocr_state is not None))
+            raise RedactionNothingFoundError(
+                "No matching content found to redact."
+                + _unread_in_words(seen, tessdata is None and ocr_state is not None)
+                + " Nothing was saved.")
 
         final_src = work
         if flatten_pages:

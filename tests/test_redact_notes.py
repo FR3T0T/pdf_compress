@@ -131,13 +131,14 @@ class TestPagesWithNoText:
         with pytest.raises(ValueError, match="No matching content found to redact") as ei:
             redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM])
         assert str(ei.value) == ("No matching content found to redact. Pages 2-3, 5 have no "
-                                 "text: a search cannot read words in a scan or a picture.")
+                                 "text: a search cannot read words in a scan or a picture. "
+                                 "Nothing was saved.")
 
     def test_and_says_nothing_more_when_every_page_had_text(self, tmp_path):
         src = _pdf(tmp_path / "src.pdf", OTHER_WORDS)
         with pytest.raises(ValueError) as ei:
             redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM])
-        assert str(ei.value) == "No matching content found to redact."
+        assert str(ei.value) == "No matching content found to redact. Nothing was saved."
 
 
 @pytest.mark.integration

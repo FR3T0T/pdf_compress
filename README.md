@@ -206,7 +206,14 @@ but its text can no longer be selected or searched. When it is not on a page
 (the document's details, the file's identifier), the page says that turning
 pages into pictures would not help. A form stored only as XFA that holds a
 search term, and PyMuPDF 1.28 (see Install), are refused before anything is
-written.
+written. A search that finds nothing is not an error: the page says so in a
+note, with the pages it could not read, and that nothing was saved. Neither
+is Cancel: the page says the run stopped and nothing was saved.
+
+**The black is the box.** Each place is filled black, with an edge half a
+point past it, the same on a page with a user unit (a page drawn larger than
+its numbers say), where PyMuPDF's own fill used to reach two or three times
+the box.
 
 **Supported PDF library.** PyMuPDF 1.27.2.3. Redact refuses to run on 1.28,
 and runs on 2.x with a note (see Install).
@@ -296,9 +303,6 @@ described here.
   may still be in the picture.
 - A straight line written as a curve is treated as a curve: a box over it
   is refused and the page offered as a picture.
-- On a page with a user unit (a page drawn larger than its numbers say), the
-  black fill reaches past the box you drew. It hides more than you asked;
-  it removes nothing extra.
 - On PyMuPDF 2.x the text after a removed word can move along its line. The
   run says so.
 - Words inside a picture are not read, unless OCR is ticked (see *Reading

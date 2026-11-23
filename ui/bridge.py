@@ -54,6 +54,7 @@ from epdf_crypto import (
 )
 from pdf_analyze import DEFAULT_SANITIZE, analyze_file, sanitize_payload
 from pdf_ops import (
+    RedactionNothingFoundError,
     RedactionNotPossibleError,
     RedactionVerificationError,
     add_page_numbers,
@@ -145,9 +146,25 @@ class _Worker(QThread):
                               extra={"notPossible": True}),
                 ensure_ascii=False,
             ))
-        except (CancelledError, InterruptedError):
+        except RedactionNothingFoundError as exc:
+            # A search that found nothing (#135): not a failure. Its message
+            # says so in plain words, with what the search could not read
+            # and that nothing was saved; the log gets one line and no
+            # stack trace, and the window shows a note, not an error.
+            log.info("Operation %s found nothing to redact; nothing was saved", self.tool_key)
             self.finished.emit(json.dumps(
-                _done_payload(self.tool_key, False, message="Cancelled"),
+                _done_payload(self.tool_key, False, message=str(exc),
+                              extra={"nothingFound": True}),
+                ensure_ascii=False,
+            ))
+        except (CancelledError, InterruptedError):
+            # A cancel the user asked for (#135): one line in the log, and a
+            # payload that says so, which the window's operation hook lets go
+            # (useOperation): the page has said it stopped, in its own words.
+            log.info("Operation %s cancelled", self.tool_key)
+            self.finished.emit(json.dumps(
+                _done_payload(self.tool_key, False, message="Cancelled",
+                              extra={"cancelled": True}),
                 ensure_ascii=False,
             ))
         except EncryptedPDFError as exc:

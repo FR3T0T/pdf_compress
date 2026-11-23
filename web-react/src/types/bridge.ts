@@ -59,6 +59,8 @@ export interface DonePayload<TResult = unknown> {
   success: boolean;
   message: string;
   results?: TResult;
+  /** The run was cancelled by the user (#135): useOperation lets it go. */
+  cancelled?: boolean;
 }
 
 /** A file picked via BridgeAPI.openFiles() or the "files-dropped" signal. */

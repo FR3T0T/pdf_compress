@@ -1,4 +1,4 @@
-"""Write the sample files for the Redact app checklist (#119, #128).
+"""Write the sample files for the Redact app checklist (#119, #128, #134).
 
 Usage: python tests/manual/make_redact_samples.py <folder>
 
@@ -444,6 +444,26 @@ def large_jpeg_drawn_larger_than_the_page(folder):
     save(pdf, folder, "23_large_jpeg_drawn_larger_than_the_page.pdf")
 
 
+def page_with_a_user_unit(folder):
+    """#134: a page with a user unit of 2, drawn twice as large as its
+    numbers say. The black of a box, or of a search hit, used to come out
+    twice the box each way there, reaching up and to the right."""
+    pdf = pikepdf.Pdf.new()
+    page = add_page(pdf, text("Sample 24: this page has a user unit of 2: it is drawn",
+                              "twice as large as its numbers say.", "",
+                              "Draw a box over the grey block below, and search for",
+                              f"the reference: {TERM} is on this line.",
+                              "The black should cover the box you drew and the",
+                              "reference, and nothing more: the words around the",
+                              "reference stay, and so does the frame round the block.",
+                              size=8, x=24, y=366, step=13)
+                    + b"\nq 0.75 0.75 0.75 rg 60 150 120 50 re f Q"
+                    + b"\nq 0 0 1 RG 0.5 w 50 140 140 70 re S Q",
+                    UserUnit=2)
+    page["/MediaBox"] = [0, 0, 306, 396]
+    save(pdf, folder, "24_page_with_a_user_unit.pdf")
+
+
 def main(folder: str) -> None:
     os.makedirs(folder, exist_ok=True)
     number_across_a_line(folder)
@@ -469,6 +489,7 @@ def main(folder: str) -> None:
     photo_with_no_words(folder)
     page_too_large(folder)
     large_jpeg_drawn_larger_than_the_page(folder)
+    page_with_a_user_unit(folder)
 
 
 if __name__ == "__main__":

@@ -462,3 +462,7 @@ export const MOCK_REDACT_REFUSAL_OCR_OUTSIDE = {
   }
 };
 export const MOCK_OCR_NOT_READY = "OCR isn't set up: run python setup_ocr.py --install, then restart the app.";
+
+/** #135: a search that found nothing (search for "nothing"), as redact_pdf
+ *  words it for a six-page scan with OCR off. */
+export const MOCK_REDACT_NOTHING_FOUND = "No matching content found to redact. Pages 1-6 have no text: a search cannot read words in a scan or a picture. Nothing was saved.";
