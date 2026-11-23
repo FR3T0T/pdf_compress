@@ -408,3 +408,57 @@ export const MOCK_REDACT_REFUSAL_DOCUMENT_LEVEL = {
   }
 };
 export const MOCK_REDACT_NOT_POSSIBLE = "This file's form is stored in a format (XFA) that redaction cannot change, and what you searched for is in that form. Nothing was saved.";
+
+/** #128: a run with "Also read scanned pages with OCR" ticked (any search
+ *  word; "damage" shows the refusal for a page that would have changed
+ *  outside the places found), and the line shown when OCR is not set up
+ *  (add ?ocr=off to the address). Made by the same Python functions. */
+export const MOCK_REDACT_SUMMARY_OCR = {
+  "headline": "Redacted 3 places on 2 pages.",
+  "checked": "Checked before saving: a search of the new file no longer finds what you asked to remove, and OCR no longer reads it on page 1.",
+  "removed": [],
+  "notes": [
+    "OCR read pages 1 and 2 and found 2 places to black out on them. OCR can miss words: check them by eye.",
+    "OCR found no words it could read on page 3. It may be a photo or a drawing, or its words may not be in English: check it by eye."
+  ]
+};
+export const MOCK_REDACT_REFUSAL_OCR_OUTSIDE = {
+  "refusal": {
+    "headline": "Redaction refused: it would have changed more of the page than the places found. Nothing was saved.",
+    "found": [
+      "The picture of page 1 would have changed outside the places that were blacked out."
+    ],
+    "nextStep": "The file was left as it was."
+  },
+  "flattenablePages": null,
+  "verification": {
+    "inputPath": "",
+    "outputPath": "",
+    "tool": "redaction",
+    "timestamp": "",
+    "checks": [
+      {
+        "id": "redaction.ocr_outside",
+        "description": "redaction.ocr_outside",
+        "passed": false,
+        "evidence": [
+          "1,204 pixels changed outside the boxes on page 1"
+        ],
+        "pages": [
+          1
+        ],
+        "isDocumentLevel": false,
+        "unevaluated": false,
+        "objectPaths": []
+      }
+    ],
+    "residualFindings": [],
+    "verified": false,
+    "flattenTargetPages": null,
+    "sourceSha256": null,
+    "outputSha256": null,
+    "unevaluated": [],
+    "diagnostics": []
+  }
+};
+export const MOCK_OCR_NOT_READY = "OCR isn't set up: run python setup_ocr.py --install, then restart the app.";

@@ -253,3 +253,34 @@ answers:
   it." is gone, and the page's other words are plainer. The browser-dev mock
   answers from the search word: `everything`, `lineart` (and its flatten
   retry), `refuse`, `xfa`. `web-react/dist/` rebuilt.
+
+### #128 — Redact can read scanned pages with OCR (2026-11-23)
+
+- **New slot `getOcrStatus()`** → `{ready: boolean, reason: string | null}`
+  (Qt-free `pdf_ocr.ocr_readiness`). `reason` is one plain line: in the
+  packaged app "The OCR language file is missing from this copy of PDF
+  Toolkit: reinstall it."; from source "OCR isn't set up: run python
+  setup_ocr.py --install, then restart the app." (or that numpy is needed).
+  The language file's path is never sent, nor logged: it sits in the user's
+  own folder. No download from the app: setup is the `setup_ocr.py` command.
+- **New request param.** `startRedact` accepts `ocr` (boolean, off when
+  absent), handed to `redact_pdf(ocr=...)`.
+- **Progress.** While a page is read with OCR the slot sends a
+  `progressUpdate` with the count as before and `filename` set to "Reading
+  page 3 of 12 with OCR" (`redact_pdf(on_status=...)`); the panel shows it
+  beside the count, as a file name. No other tool's progress changes.
+- **Success.** `surface_counts` may hold `ocr_page_content`, and `notes`
+  new kinds: `ocr`, `ocr_unread`, `ocr_not_ready`, `mostly_picture`. All
+  are worded in `summary` by `pdf_ops.redaction_summary`, whose `checked`
+  line after an OCR run says what was checked there and no more.
+- **Refusal.** New check ids `redaction.ocr_fill`, `redaction.ocr_image`,
+  `redaction.ocr_reread`, `redaction.ocr_outside`, worded in `refusal` as
+  before.
+- **Frontend.** `RedactPage.tsx` has the option "Also read scanned pages
+  with OCR (slower)" under the search words: off by default, disabled with
+  no words typed, and disabled with the `reason` line under it when OCR is
+  not ready. The shared `Checkbox` gains an optional `disabled`. The
+  browser-dev mock is ready unless the address has `?ocr=off`; a run with the
+  option ticked shows the OCR progress line and an OCR summary, and the
+  search word `damage` shows the refusal for a page that would have changed
+  outside the places found. `web-react/dist/` rebuilt.

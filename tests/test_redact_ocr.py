@@ -19,6 +19,8 @@ These tests read pictures, so they need the OCR language file (the
 """
 
 import io
+import pathlib
+import re
 import threading
 import time
 import zlib
@@ -221,6 +223,34 @@ def test_a_term_in_a_scan_is_found_and_blacked_out(tmp_path, tessdata, shape):
     assert _note(res, "no_text") is None
 
 
+#: Lines 16 points apart, with a word right under the term.
+TIGHT = ["Notes from the visit made in May",
+         "after the vote on 4455-8870 today",
+         "under the oak by 5566-7788 here",
+         "and then we all went back home"]
+
+
+@pytest.mark.parametrize("skew", [0.0, 1.5])
+def test_the_margin_stops_at_the_next_word(tmp_path, tessdata, skew):
+    """A box grows by 2 points and a quarter of its height, but the quarter
+    goes no further than the edge of another word OCR read: on lines set
+    close, it took a third or more of the paper round the word below (#128,
+    measured 0.35, and 0.48 tilted). The term is still covered whole."""
+    scan = _scanned(_words(lines=TIGHT, gap=16), skew=skew)
+    src = _pdf(tmp_path / "tight.pdf", scan)
+    term = _pdf(tmp_path / "term.pdf", _scanned(_words(only={"4455-8870"}, lines=TIGHT, gap=16),
+                                                skew=skew, rgb=False), jpeg=False)
+    below = _pdf(tmp_path / "below.pdf", _scanned(_words(only={"5566-7788"}, lines=TIGHT, gap=16),
+                                                  skew=skew, rgb=False), jpeg=False)
+    out = str(tmp_path / "out.pdf")
+    res = redact_pdf(src, out, search_terms=[TERM], ocr=True)
+    assert res.verification["verified"] is True
+    black, ink = _covered(out, term)
+    assert ink > 100 and black == ink
+    harmed, near = _covered(out, below)
+    assert harmed / near < 0.25, f"{harmed} of {near} pixels round the word below blacked"
+
+
 def test_a_scan_read_at_150_dpi(tmp_path, tessdata, monkeypatch):
     monkeypatch.setattr(pdf_ocr, "DPI", 150)
     src, term, _near = _scan_pair(tmp_path, "scan")
@@ -309,13 +339,22 @@ def _photo():
     return Image.fromarray(np.clip(img, 0, 255).astype(np.uint8), "RGB")
 
 
-def _noise():
-    rng = np.random.default_rng(11)
+def _noise(seed=11):
+    rng = np.random.default_rng(seed)
     return Image.fromarray(rng.integers(0, 256, (612, 792), dtype=np.uint8), "L").convert("RGB")
 
 
 def _blank():
     return Image.new("RGB", (792, 612), (255, 255, 255))
+
+
+#: Noise pictures OCR reads a few common words in, at one turn or another,
+#: enough for the share rule as it was: seeds 2, 13, 14, 17 and 23 on
+#: PyMuPDF 1.27.2.3 and 0, 14, 15 and 17 on 2.1 (Windows), and 11 on 2.1 on
+#: Linux (CI) (#128).
+NOISE_SEEDS = (0, 2, 11, 13, 14, 15, 17, 23)
+PICTURES = {"photo": _photo, "blank": _blank,
+            **{f"noise {seed}": (lambda seed=seed: _noise(seed)) for seed in NOISE_SEEDS}}
 
 
 def _with_text_page(tmp_path, img):
@@ -331,9 +370,9 @@ def _with_text_page(tmp_path, img):
     return out
 
 
-@pytest.mark.parametrize("make", [_photo, _noise, _blank], ids=["photo", "noise", "blank"])
-def test_a_picture_with_no_words_is_noted_as_not_read(tmp_path, tessdata, make):
-    src = _with_text_page(tmp_path, make())
+@pytest.mark.parametrize("picture", list(PICTURES))
+def test_a_picture_with_no_words_is_noted_as_not_read(tmp_path, tessdata, picture):
+    src = _with_text_page(tmp_path, PICTURES[picture]())
     before = _shown(src, 1)
     out = str(tmp_path / "out.pdf")
     res = redact_pdf(src, out, search_terms=[TERM], ocr=True)
@@ -359,8 +398,11 @@ def test_a_page_too_large_to_read_is_not_drawn(tmp_path, tessdata, monkeypatch):
     drawn = []
     real = pdf_ocr._render
     monkeypatch.setattr(pdf_ocr, "_render", lambda page, *a, **k: (drawn.append(page.rect.width), real(page, *a, **k))[1])
-    res = redact_pdf(both, str(tmp_path / "out.pdf"), search_terms=[TERM], ocr=True)
+    said = []
+    res = redact_pdf(both, str(tmp_path / "out.pdf"), search_terms=[TERM], ocr=True,
+                     on_status=said.append)
     assert 14400 not in drawn
+    assert said == ["Reading page 2 of 3 with OCR"]           # page 3 is not read
     assert pdf_ocr.reading_dpi(fitz.open(both)[2]) is None
     assert _note(res, "ocr_unread") == {"kind": "ocr_unread", "pages": [2, 3], "too_large": [3]}
 
@@ -374,6 +416,10 @@ def test_the_rule_for_what_looks_like_words():
     assert not pdf_ocr.looks_like_words("Sees ste Lees RMAC leas Suge Ceres Ene " * 40 + "the and for")
     assert not pdf_ocr.looks_like_words("")
     assert not pdf_ocr.looks_like_words("an in to is it of on at by or")     # two letters say nothing
+    # Noise read sideways on PyMuPDF 2.1: three common words, seven times,
+    # among 115 tokens (6.1%).
+    gibberish = " ".join(["see", "each", "the", "see", "each", "see", "the"] + ["Vr4"] * 108)
+    assert not pdf_ocr.looks_like_words(gibberish)
 
 
 # ── When OCR runs, and when it does not ────────────────────────────────
@@ -429,6 +475,84 @@ def test_nothing_found_says_ocr_can_miss_words(tmp_path, tessdata):
     assert "check" in words
 
 
+# ── Pages that are mostly a picture, with a little text on them ────────
+
+def _with_a_few_words(tmp_path, how):
+    """The scan with a little text the search can read on it: "Page 1 of 1"
+    typed under the picture's words, or a FreeText note saying "Received"."""
+    src, term, near = _scan_pair(tmp_path, "scan")
+    with fitz.open(src) as doc:
+        page = doc[0]
+        if how == "typed":
+            page.insert_text((page.rect.width - 90, page.rect.height - 14), "Page 1 of 1",
+                             fontname="helv", fontsize=9)
+        else:
+            page.add_freetext_annot(fitz.Rect(page.rect.width - 110, 8, page.rect.width - 10, 30),
+                                    "Received", fontsize=11)
+        out = str(tmp_path / f"{how}.pdf")
+        doc.save(out)
+    return out, term, near
+
+
+@pytest.mark.parametrize("how", ["typed", "note"])
+def test_a_scan_with_a_few_words_on_it_is_noted_without_ocr(tmp_path, tessdata, how, monkeypatch):
+    src, _term, _near = _with_a_few_words(tmp_path, how)
+    monkeypatch.setattr(pdf_ocr, "read_page", lambda *a, **k: pytest.fail("OCR ran"))
+    # Something the search can find, so that the run finishes with a result.
+    with fitz.open(src) as doc:
+        doc.new_page(-1, width=300, height=200).insert_text((20, 40), f"Ref {TERM}", fontsize=11)
+        both = str(tmp_path / "both.pdf")
+        doc.save(both)
+    res = redact_pdf(both, str(tmp_path / "out.pdf"), search_terms=[TERM])
+    assert _note(res, "mostly_picture") == {"kind": "mostly_picture", "pages": [1]}
+    assert _note(res, "no_text") is None
+    # And with nothing found at all, the message says so.
+    with pytest.raises(ValueError) as info:
+        redact_pdf(src, str(tmp_path / "out2.pdf"), search_terms=["ZEBRA-0001"])
+    assert "Page 1 is mostly a picture" in str(info.value)
+
+
+@pytest.mark.parametrize("how", ["typed", "note"])
+def test_a_scan_with_a_few_words_on_it_is_read_with_ocr(tmp_path, tessdata, how):
+    src, term, near = _with_a_few_words(tmp_path, how)
+    with fitz.open(src) as doc:
+        before_words = doc[0].get_text().split()
+    out = str(tmp_path / "out.pdf")
+    res = redact_pdf(src, out, search_terms=[TERM], ocr=True)
+    assert res.verification["verified"] is True
+    black, ink = _covered(out, term)
+    assert ink > 100 and black == ink
+    assert _blackened(out, src, near) < 0.25
+    assert res.surface_counts.get("ocr_page_content") == 2
+    assert _note(res, "ocr") == {"kind": "ocr", "pages": [1], "hits": {1: 2}}
+    assert _note(res, "mostly_picture") is None
+    with fitz.open(out) as doc:                          # the few words are still there
+        assert doc[0].get_text().split() == before_words
+
+
+def test_on_such_a_page_a_term_in_its_text_is_left_to_the_search(tmp_path, tessdata):
+    """The term typed on the scan as well as in it: the search takes the
+    typed one by its characters, OCR the one in the picture; the typed one,
+    which OCR reads too, is not taken twice. The search's box does not
+    count as damage."""
+    src, term, _near = _scan_pair(tmp_path, "scan")
+    with fitz.open(src) as doc:
+        page = doc[0]
+        page.insert_text((page.rect.width - 150, page.rect.height - 14), f"Ref {TERM}",
+                         fontname="helv", fontsize=12)
+        typed = str(tmp_path / "typed.pdf")
+        doc.save(typed)
+    out = str(tmp_path / "out.pdf")
+    res = redact_pdf(typed, out, search_terms=[TERM], ocr=True)
+    assert res.verification["verified"] is True
+    assert res.surface_counts.get("page_content") == 1
+    assert res.surface_counts.get("ocr_page_content") == 2
+    with fitz.open(out) as doc:
+        assert "Ref" in doc[0].get_text() and TERM not in doc[0].get_text()
+    black, ink = _covered(out, term)
+    assert black == ink
+
+
 def test_a_redaction_with_ocr_uses_no_network(tmp_path, tessdata, monkeypatch):
     import socket
     import urllib.request
@@ -440,6 +564,55 @@ def test_a_redaction_with_ocr_uses_no_network(tmp_path, tessdata, monkeypatch):
     src, _term, _near = _scan_pair(tmp_path, "scan")
     res = redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM], ocr=True)
     assert res.verification["verified"] is True
+
+
+# ── What the window is told ─────────────────────────────────────────────
+
+_NOT_READY = {"ready": False, "tessdata": None, "file": None, "source": None, "pinned": False,
+              "problem": "The OCR language file /opt/tools/ocr-data/eng.traineddata does not "
+                         "match the pinned file."}
+
+
+def test_the_window_is_told_whether_ocr_is_ready_and_nothing_more(monkeypatch):
+    """{ready, reason} only, in plain words: never the language file's path,
+    which sits in the user's own folder (#128)."""
+    monkeypatch.setattr(pdf_ocr, "ocr_status", lambda: dict(_NOT_READY))
+    assert pdf_ocr.ocr_readiness(frozen=True) == {
+        "ready": False,
+        "reason": "The OCR language file is missing from this copy of PDF Toolkit: reinstall it."}
+    assert pdf_ocr.ocr_readiness(frozen=False) == {
+        "ready": False,
+        "reason": "OCR isn't set up: run python setup_ocr.py --install, then restart the app."}
+    monkeypatch.setattr(pdf_ocr, "ocr_status", lambda: {
+        **_NOT_READY, "problem": "OCR needs numpy to check what it redacted, and numpy is not "
+                                 "installed."})
+    assert pdf_ocr.ocr_readiness(frozen=False) == {
+        "ready": False,
+        "reason": "OCR isn't set up: it needs numpy (pip install numpy), then restart the app."}
+    monkeypatch.setattr(pdf_ocr, "ocr_status", lambda: {
+        **_NOT_READY, "ready": True, "tessdata": "/opt/tools/ocr-data", "source": "installed",
+        "file": "/opt/tools/ocr-data/eng.traineddata", "pinned": True, "problem": None})
+    assert pdf_ocr.ocr_readiness(frozen=False) == {"ready": True, "reason": None}
+
+
+def test_the_bridge_passes_ocr_on_and_tells_the_window_only_readiness():
+    bridge = (pathlib.Path(__file__).resolve().parents[1] / "ui" / "bridge.py").read_text(encoding="utf-8")
+    slot = bridge[bridge.index("def startRedact"):]
+    slot = slot[:slot.index("self._run_in_thread")]
+    assert 'ocr=bool(p.get("ocr"' in slot and "on_status=" in slot
+    status = bridge[bridge.index("def getOcrStatus"):]
+    end = re.search(r"\n(    @Slot|    def |    # ──|\S)", status[1:])
+    status = status[:end.start() + 1] if end else status
+    assert "ocr_readiness()" in status
+    assert "tessdata" not in status and '["file"]' not in status and "log." not in status
+
+
+def test_progress_says_when_a_page_is_read_with_ocr(tmp_path, tessdata):
+    src, _term, _near = _scan_pair(tmp_path, "scan", pages=2)
+    said = []
+    redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM], ocr=True,
+               on_status=said.append)
+    assert said == ["Reading page 1 of 2 with OCR", "Reading page 2 of 2 with OCR"]
 
 
 # ── Progress and cancel ────────────────────────────────────────────────
@@ -632,6 +805,87 @@ def test_damage_outside_the_boxes_is_caught(tmp_path, tessdata):
     report, checks = _ocr_checks(out, boxes, tessdata, before=before)
     assert not checks["redaction.ocr_outside"].passed
     assert report.flatten_target_pages() is None
+
+
+#: Twenty lines of type, one with the term of the clipped-picture tests.
+MINUTES = ["The meeting was held on the third floor of the old building.",
+           "Everyone who had been asked to come was there by nine.",
+           "The minutes of the last meeting were read and agreed.",
+           "A question was asked about the Hollyhock fund for the roof.",
+           "The treasurer said the work would start in the spring.",
+           "There was some talk about the car park and the new gates.",
+           "It was agreed that the gates would be painted green.",
+           "The chair thanked the volunteers for their hard work.",
+           "A letter from the council was read out to the room.",
+           "It said that the path by the river would be closed.",
+           "Several people asked how long the closure would last.",
+           "No one knew, and the chair said she would find out.",
+           "The next item was the summer fair and its stalls.",
+           "More helpers are needed for the cake stall this year.",
+           "The raffle prizes have been given by local shops.",
+           "Tickets will be on sale from the first of the month.",
+           "Any other business was taken at the end of the meeting.",
+           "The date of the next meeting will be sent by post.",
+           "The meeting closed at a quarter past ten that evening.",
+           "These notes were written up on the following day."]
+
+
+def _clipped_scan(path, *, size=(2640, 1896), draw=b"q 1320 0 0 948 33 -156 cm /X4 Do Q", turn=90):
+    """A JPEG of *size* pixels holding MINUTES in 26-pixel type, turned
+    *turn* degrees, near its top left corner; drawn on a 612 x 792 page by
+    *draw*, by default at 144 dpi and larger than the page, so that the page
+    shows only part of it (the shape of pdf.js's issue12841)."""
+    doc = fitz.open()
+    width = max(fitz.get_text_length(t, fontname="helv", fontsize=26) for t in MINUTES) + 40
+    page = doc.new_page(width=width, height=36 * len(MINUTES) + 40)
+    for i, line in enumerate(MINUTES):
+        page.insert_text((20, 56 + i * 36), line, fontname="helv", fontsize=26)
+    pix = page.get_pixmap(dpi=72, colorspace=fitz.csGRAY)
+    block = Image.frombytes("L", (pix.width, pix.height), pix.samples).rotate(turn, expand=True, fillcolor=255)
+    img = Image.new("RGB", size, "white")
+    img.paste(block.convert("RGB"), (60, 60))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=85)
+    pdf = pikepdf.Pdf.new()
+    image = pdf.make_stream(buf.getvalue(), Type=Name.XObject, Subtype=Name.Image, Width=size[0],
+                            Height=size[1], BitsPerComponent=8, ColorSpace=Name.DeviceRGB,
+                            Filter=Name.DCTDecode)
+    pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page, MediaBox=[0, 0, 612, 792],
+                                             Resources=Dictionary(XObject=Dictionary(X4=image)),
+                                             Contents=pdf.make_stream(draw))))
+    pdf.save(str(path))
+    return str(path)
+
+
+def test_a_clipped_jpeg_saved_without_loss_is_not_damage(tmp_path, tessdata):
+    """A JPEG drawn at less than half its own resolution is decoded small by
+    MuPDF, and differs at the edge of every letter from the same pixels
+    stored without loss, as a redacted picture is; and what MuPDF has kept
+    from drawing the page before changes how it draws it next. Neither is a
+    change to the page: the run verifies, and the outside check ran."""
+    src = _clipped_scan(tmp_path / "clipped.pdf")
+    out = str(tmp_path / "out.pdf")
+    res = redact_pdf(src, out, search_terms=["Hollyhock"], ocr=True)
+    assert res.verification["verified"] is True
+    checks = {c["id"]: c for c in res.verification["checks"]}
+    assert checks["redaction.ocr_outside"]["passed"]
+    assert res.surface_counts.get("ocr_page_content") == 1
+
+
+def test_damage_outside_the_boxes_of_a_clipped_jpeg_is_still_caught(tmp_path, tessdata):
+    src = _clipped_scan(tmp_path / "clipped.pdf")
+    with fitz.open(src) as doc:
+        reading = pdf_ocr.read_page(doc[0], ["Hollyhock"], False, tessdata)
+        before = pdf_ocr.fingerprint(doc[0])
+    boxes = reading.boxes
+    assert len(boxes) == 1
+    out = _redacted_by_hand(tmp_path, src, boxes, after=b"q 0.6 0.6 0.6 rg 400 40 30 2 re f Q")
+    report = pdf_verify.verify_redaction(
+        out, ["Hollyhock"], rects=[{"page": 0, "x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3]} for b in boxes],
+        ocr_pages=[{"page": 0, "boxes": [list(b) for b in boxes], "dpi": reading.dpi,
+                    "turns": reading.hit_turns, "before": before}], tessdata=tessdata)
+    outside = next(c for c in report.checks if c.id == "redaction.ocr_outside")
+    assert not outside.passed
 
 
 def test_on_a_page_with_a_user_unit_only_black_is_put_down_to_the_fill(tmp_path, tessdata):

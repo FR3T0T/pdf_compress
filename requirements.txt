@@ -3,7 +3,7 @@ Pillow>=10.0.0
 PySide6>=6.5.0
 # Pinned: 1.28 removes other text when it redacts; 2.x can move text after a removed word (#119)
 PyMuPDF==1.27.2.3    # PDF rendering, text extraction, page-to-image conversion
-numpy>=1.24.0        # optional — improves photo/diagram detection accuracy
+numpy>=1.24.0        # optional — improves photo/diagram detection accuracy; needed for Redact's OCR (#128)
 python-docx>=0.8.11  # optional — PDF to Word conversion
 argon2-cffi>=23.1.0  # Argon2id/Argon2d key derivation for enhanced encryption
 pycryptodome>=3.19.0 # AES-256-GCM cipher

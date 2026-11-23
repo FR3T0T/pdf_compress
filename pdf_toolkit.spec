@@ -55,6 +55,16 @@ if not (_ocr["ready"] and _ocr["pinned"] and _ocr["source"] in ("installed", "bu
                      "python setup_ocr.py --install, then build again.\n"
                      + (_ocr["problem"] or ""))
 datas.append((_ocr["file"], "ocr-data"))
+# ...with its licence (Apache-2.0) beside it, as committed and pinned in the
+# lock (licenses/tessdata_fast-LICENSE, from tessdata_fast at the commit).
+_lock = pdf_ocr.load_lock()
+_licence = os.path.join(PROJECT_ROOT, _lock["licence_file"])
+import hashlib  # noqa: E402
+
+with open(_licence, "rb") as _fh:
+    if hashlib.sha256(_fh.read()).hexdigest() != _lock["licence_sha256"]:
+        raise SystemExit(f"{_lock['licence_file']} is not the licence the OCR lock pins.")
+datas.append((_licence, "ocr-data"))
 
 # ── Hidden imports ───────────────────────────────────────────────────
 # Modules that PyInstaller can't detect from static analysis.

@@ -27,8 +27,12 @@ a half and three quarters and read again, and the reading that looks most
 like words is kept: a scan can be sideways or upside down. Every box found
 goes back to the page's own space through the matrix the picture was drawn
 with (pdf_verify.page_to_picture_matrix, the one the redact slot puts boxes
-drawn on page pictures back with), grown by GROW_PT and GROW_SHARE of its
-height.
+drawn on page pictures back with), grown by GROW_PT and by GROW_SHARE of
+its height, the share stopping at the edge of any other word OCR read
+(_short_of).
+
+Whether OCR can be used, the Redact page is told by ocr_readiness: ready or
+not, and one plain line why not, never a path.
 
 Qt-free on purpose: tests import this module (see CLAUDE.md).
 """
@@ -39,6 +43,7 @@ import functools
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -264,6 +269,35 @@ def ocr_status() -> dict:
     return status
 
 
+#: Why OCR cannot be used, as the Redact page says it: one plain line, and
+#: never a path (the language file sits in the user's own folder).
+_MISSING_FROM_APP = "The OCR language file is missing from this copy of PDF Toolkit: reinstall it."
+_NOT_SET_UP = "OCR isn't set up: run python setup_ocr.py --install, then restart the app."
+_NO_NUMPY = "OCR isn't set up: it needs numpy (pip install numpy), then restart the app."
+_UNOPENABLE_FOLDER = ("OCR can't open its language file in a folder named with letters other "
+                      "than A to Z: set " + DATA_DIR_ENV + " to another folder, run python "
+                      "setup_ocr.py --install, then restart the app.")
+
+
+def ocr_readiness(frozen: Optional[bool] = None) -> dict:
+    """What the Redact page is told about OCR (#128): {"ready", "reason"},
+    the reason a plain line, or None when ready. From ocr_status, without
+    its file or folder. *frozen* is whether this is the packaged app (by
+    default, sys.frozen), which carries the file: if it is not ready there,
+    the copy is broken, and the line says to reinstall."""
+    status = ocr_status()
+    if status["ready"]:
+        return {"ready": True, "reason": None}
+    if getattr(sys, "frozen", False) if frozen is None else frozen:
+        return {"ready": False, "reason": _MISSING_FROM_APP}
+    problem = status.get("problem") or ""
+    if "numpy" in problem:
+        return {"ready": False, "reason": _NO_NUMPY}
+    if "plain letters" in problem:
+        return {"ready": False, "reason": _UNOPENABLE_FOLDER}
+    return {"ready": False, "reason": _NOT_SET_UP}
+
+
 def install_language_data(progress: Optional[ProgressFn] = None,
                           should_cancel: Optional[CancelFn] = None) -> dict:
     """Fetch the pinned language file into data_dir(), check its size and
@@ -338,11 +372,14 @@ MAX_SIDE = 32_000
 TURNS = (0, 90, 180, 270)
 #: A box OCR found is grown on every side by GROW_PT points and GROW_SHARE
 #: of its height: OCR boxes a word's letters as it reads them, and a scan's
-#: ink runs past them (an accent, a blurred edge, a slanted line).
+#: ink runs past them (an accent, a blurred edge, a slanted line). The
+#: share goes no further than the edge of another word OCR read (_short_of).
 GROW_PT = 2.0
 GROW_SHARE = 0.25
-#: The resolution of a page's fingerprint (fingerprint()).
+#: The resolution a page's fingerprint is kept at (fingerprint()), and the
+#: most pixels the page may be drawn with to make it.
 FINGERPRINT_DPI = 50
+FINGERPRINT_BUDGET = 16_000_000
 
 #: Common English words of three letters or more. A reading that has
 #: several of them is words; letters OCR makes of a photo, or of a page
@@ -361,21 +398,31 @@ long area based three given general public value results
 _LETTERS = re.compile(r"[A-Za-z]+")
 
 
+#: The share of what OCR read that common words must make up, when there are
+#: only three to six different ones (looks_like_words).
+WORD_SHARE = 0.15
+
+
 def looks_like_words(text: str) -> bool:
     """Whether what OCR read looks like English words: seven different
-    common words (_COMMON), or three that make up a fiftieth or more of
+    common words (_COMMON), or three that make up WORD_SHARE or more of
     what it read.
 
-    Measured on real pages (#128): of 177 readings of English and other
-    text pages made at a wrong turn, and 639 readings of pages that are one
-    picture (photos, diagrams, halftones, at every turn), none passes; of
-    32 English pages read the right way up, 31 do, and a book cover with
-    eight words does. A page in another language seldom passes: it is read
-    at every turn, and is noted as not read unless the term is found."""
+    Measured on real pages on PyMuPDF 1.27.2.3 and 2.1 (#128): of 177
+    readings of text pages made at a wrong turn, 635 readings of pages that
+    are one picture (photos, diagrams, halftones, at every turn) and 640 of
+    noise and photo-like pictures, none passes. Where the share decides
+    (three to six different common words), what such readings reach is at
+    most 6.1% (noise read sideways, on 2.1); English read the right way up
+    reaches 21% to 30%, and a short line of title words more. Of 32 English
+    pages read the right way up, 31 pass on 1.27.2.3 and all 32 on 2.1, as
+    does a book cover with a few words. A page in another language seldom
+    passes: it is read at every turn, and is noted as not read unless the
+    term is found."""
     words = [w.lower() for w in _LETTERS.findall(text)]
     common = [w for w in words if w in _COMMON]
     distinct = len(set(common))
-    return distinct >= 7 or (distinct >= 3 and len(common) >= 0.02 * len(text.split()))
+    return distinct >= 7 or (distinct >= 3 and len(common) >= WORD_SHARE * len(text.split()))
 
 
 def _score(text: str) -> tuple:
@@ -408,20 +455,60 @@ def _ocr(pix, dpi: int, tessdata: str):
     return fitz.open("pdf", pix.pdfocr_tobytes(language=LANGUAGE, tessdata=tessdata))
 
 
-def _to_page(rects, ocr_page, pix, to_pixels, dpi: int) -> list:
-    """*rects* found on *ocr_page*, each grown (GROW_PT, GROW_SHARE), in
-    page space."""
+def _short_of(grown, rect, words, least: float = 0.0) -> "fitz.Rect":
+    """*grown* (a box *rect* grown) cut back so that it reaches no further
+    than the near edge of any of *words* (the other words OCR read on the
+    page, at the same turn), but always *least* past *rect*. A word whose
+    centre lies in *rect* is one of its own and is left alone. Which side a
+    word is on is told by where its centre lies from *rect*'s.
+
+    OCR's boxes are as tall as the line, and on a tilted scan taller: the
+    box of a word on the next line often overlaps the term's own. Cut back
+    to *rect* there, the box left part of the term's ink uncovered on 25 of
+    64 tilted pages; with *least* (GROW_PT), every term was covered whole,
+    and the words harmed beside it — a third or more of the paper round
+    their ink blacked — fell from 25 to 4 on 66 straight pages at 300 dpi,
+    and from 146 to 56 on 64 tilted ones (measured on real pages, #128)."""
+    g = fitz.Rect(grown)
+    cx, cy = (rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2
+    for word in words:
+        if not g.intersects(word):
+            continue
+        wx, wy = (word.x0 + word.x1) / 2, (word.y0 + word.y1) / 2
+        if rect.x0 <= wx <= rect.x1 and rect.y0 <= wy <= rect.y1:
+            continue                                 # one of its own
+        # How far apart the centres are, in the boxes' half sizes.
+        across = abs(wx - cx) / max((rect.width + word.width) / 2, 1e-6)
+        down = abs(wy - cy) / max((rect.height + word.height) / 2, 1e-6)
+        if down >= across:
+            if wy < cy:                              # above it
+                g.y0 = max(g.y0, min(word.y1, rect.y0 - least))
+            else:                                    # below it
+                g.y1 = min(g.y1, max(word.y0, rect.y1 + least))
+        elif wx < cx:                                # before it on the line
+            g.x0 = max(g.x0, min(word.x1, rect.x0 - least))
+        else:                                        # after it
+            g.x1 = min(g.x1, max(word.x0, rect.x1 + least))
+    return g
+
+
+def _to_page(rects, ocr_page, pix, to_pixels, dpi: int, words=()) -> list:
+    """*rects* found on *ocr_page*, each grown (GROW_PT, GROW_SHARE) but no
+    further than the edge of another of *words* (_short_of), in page
+    space."""
     if not ocr_page.rect.width:
         return []
     scale = pix.width / ocr_page.rect.width          # pixels to a unit of the OCR page
     per_point = scale / (dpi / 72)                   # OCR units to a point of the page
     back = fitz.Matrix(scale, scale) * ~to_pixels
+    words = [fitz.Rect(w) for w in words]
     out = []
     for rect in rects:
         rect = fitz.Rect(rect)
         grow = GROW_PT * per_point + rect.height * GROW_SHARE
-        grown = fitz.Rect(rect.x0 - grow, rect.y0 - grow, rect.x1 + grow, rect.y1 + grow) * back
-        out.append(grown.normalize())
+        grown = _short_of(fitz.Rect(rect.x0 - grow, rect.y0 - grow, rect.x1 + grow, rect.y1 + grow),
+                          rect, words, GROW_PT * per_point)
+        out.append((grown * back).normalize())
     return out
 
 
@@ -448,7 +535,8 @@ def read_at(page, terms, case_sensitive: bool, tessdata: str, turn: int, dpi: in
         read = doc[0]
         text = read.get_text()
         found = term_boxes(read, terms, case_sensitive) if terms else []
-        boxes = _to_page(found, read, pix, to_pixels, dpi)
+        words = [w[:4] for w in read.get_text("words")] if found else []
+        boxes = _to_page(found, read, pix, to_pixels, dpi, words)
     return Reading(turn, dpi, text, boxes, time.perf_counter() - start)
 
 
@@ -513,10 +601,57 @@ def read_page(page, terms, case_sensitive: bool, tessdata: str, *, cancel=None) 
     return PageReading(status, dpi, readings, boxes)
 
 
-def fingerprint(page) -> dict:
+def fingerprint_dpi(page) -> int:
+    """The resolution *page* is drawn at for its fingerprint: FINGERPRINT_DPI,
+    or half the resolution of the sharpest picture it draws, within
+    FINGERPRINT_BUDGET.
+
+    MuPDF decodes a picture drawn at less than half its own resolution at a
+    reduced size, and a JPEG decoded that way differs at the edge of every
+    letter from the same pixels stored without loss — which is what a
+    redacted picture is. Which reduced size it decodes at also depends on
+    what it kept from drawing the page before. From half the picture's
+    resolution up, both are decoded whole, and draw the same, pixel for
+    pixel (measured on PyMuPDF 1.27.2.3 and 2.1, #128)."""
+    need = FINGERPRINT_DPI
+    try:
+        for info in page.get_image_info():
+            m, w, h = fitz.Matrix(info["transform"]), info.get("width") or 0, info.get("height") or 0
+            # The points one of the picture's pixels takes on the page.
+            across, down = math.hypot(m.a, m.b) / w if w else 0, math.hypot(m.c, m.d) / h if h else 0
+            if across > 0 and down > 0:
+                need = max(need, math.ceil(72 / min(across, down) * 0.51))
+    except Exception:
+        pass
+    area = abs(page.rect.width * page.rect.height) / 72 / 72
+    most = int((FINGERPRINT_BUDGET / area) ** 0.5) if area else need
+    return max(FINGERPRINT_DPI, min(need, most))
+
+
+def fingerprint_pixels(page, dpi: int):
+    """*page* as shown, without its annotations, in grey, drawn at *dpi* and
+    then made FINGERPRINT_DPI or so by averaging blocks of pixels; and the
+    matrix that takes page space to those pixels. What MuPDF kept from
+    drawing the page before is let go first."""
+    import numpy as np
+    factor = max(1, dpi // FINGERPRINT_DPI)
+    fitz.TOOLS.store_shrink(100)
+    zoom = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=zoom, colorspace=fitz.csGRAY, alpha=False, annots=False)
+    drawn = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width)
+    h, w = pix.height // factor * factor, pix.width // factor * factor
+    small = drawn[:h, :w].reshape(h // factor, factor, w // factor, factor).mean(axis=(1, 3))
+    to_pixels = (page_to_picture_matrix(page) * zoom * fitz.Matrix(1, 0, 0, 1, -pix.x, -pix.y)
+                 * fitz.Matrix(1 / factor, 1 / factor))
+    return np.rint(small).astype(np.uint8), to_pixels
+
+
+def fingerprint(page, dpi: Optional[int] = None) -> dict:
     """A small grey picture of *page* as shown, without its annotations:
     what the check that a redaction changed nothing outside its boxes
-    compares the output with (pdf_verify, redaction.ocr_outside)."""
-    pix = page.get_pixmap(dpi=FINGERPRINT_DPI, colorspace=fitz.csGRAY, annots=False)
-    return {"dpi": FINGERPRINT_DPI, "width": pix.width, "height": pix.height,
-            "samples": zlib.compress(pix.samples)}
+    compares the output with (pdf_verify, redaction.ocr_outside), made the
+    same way from the output (fingerprint_pixels at the same *dpi*)."""
+    dpi = int(dpi or fingerprint_dpi(page))
+    small, _to_pixels = fingerprint_pixels(page, dpi)
+    return {"dpi": dpi, "width": small.shape[1], "height": small.shape[0],
+            "samples": zlib.compress(small.tobytes())}

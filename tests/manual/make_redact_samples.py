@@ -1,12 +1,13 @@
-"""Write the sample files for the Redact app checklist (#119).
+"""Write the sample files for the Redact app checklist (#119, #128).
 
 Usage: python tests/manual/make_redact_samples.py <folder>
 
 Every file is built here, object by object, with pikepdf, Pillow and
 PyMuPDF, which the app already needs; nothing is downloaded or copied. Each
-page says what the sample is for. The checklist that uses them is in the
-pull request for #119. This is not a test: pytest collects only test_*.py
-files.
+page says what the sample is for; a scan (samples 18 to 23, for reading
+scanned pages with OCR) says it in its own picture. The checklists that use
+them are in the pull requests for #119 and #128. This is not a test: pytest
+collects only test_*.py files.
 """
 import io
 import os
@@ -317,6 +318,132 @@ def many_places_and_notes(folder):
     save(pdf, folder, "17_many_places_and_notes.pdf")
 
 
+# ── Scans, for "Also read scanned pages with OCR" (#128) ─────────────────
+# A scan says what it is for in its own picture: typed words on it would
+# make it a page with text.
+
+def scan_picture(rows, *, width: float = 612, height: float = 792, dpi: int = 200,
+                 top: float = 90, size: int = 14, step: float = 26) -> Image.Image:
+    """A letter page of typed *rows* as a scanner gives it: grey, at *dpi*."""
+    doc = fitz.open()
+    page = doc.new_page(width=width, height=height)
+    for i, row in enumerate(rows):
+        page.insert_text((72, top + i * step), row, fontname="helv", fontsize=size)
+    pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+    doc.close()
+    return Image.frombytes("L", (pix.width, pix.height), pix.samples)
+
+
+def jpeg(pdf, picture: Image.Image, quality: int = 85):
+    """*picture* as an image XObject stored as a JPEG, as scanners write them."""
+    buf = io.BytesIO()
+    picture.save(buf, "JPEG", quality=quality)
+    return pdf.make_stream(buf.getvalue(), Type=Name.XObject, Subtype=Name.Image,
+                           Width=picture.width, Height=picture.height, BitsPerComponent=8,
+                           ColorSpace=Name.DeviceRGB if picture.mode == "RGB" else Name.DeviceGray,
+                           Filter=Name.DCTDecode)
+
+
+def picture_page(pdf, xobject, draw: str, *, size=(612, 792), typed: bytes = b"", **entries):
+    """A page that draws *xobject* by *draw* (and *typed*, words in type)."""
+    page = add_page(pdf, draw.encode() + typed, **entries)
+    page["/MediaBox"] = [0, 0, *size]
+    page["/Resources"]["/XObject"] = Dictionary(Scan=xobject)
+    return page
+
+
+def scan_with_the_term_twice(folder):
+    pdf = pikepdf.Pdf.new()
+    first = ["Sample 18: a scan of six pages, with no text in it.",
+             "Type the reference below as the search word, and tick",
+             "Also read scanned pages with OCR. It is in this picture twice:", "",
+             f"The account {TERM} was opened in March.",
+             "The other lines on this page should stay as they are.",
+             f"Please quote {TERM} when you write to us.", "",
+             "Nothing else on this page should turn black."]
+    for n in range(1, 7):
+        rows = first if n == 1 else [
+            f"Sample 18, page {n} of 6: a scanned page with no reference on it.",
+            "OCR reads this page too, and finds nothing to black out.",
+            "On a run that is cancelled while it reads, nothing is saved."]
+        picture_page(pdf, jpeg(pdf, scan_picture(rows)), "q 612 0 0 792 0 0 cm /Scan Do Q")
+    save(pdf, folder, "18_scan_with_the_term_twice.pdf")
+
+
+def scan_turned(folder):
+    pdf = pikepdf.Pdf.new()
+    rows = ["Sample 19: the scan of sample 18, fed in sideways. Its words run",
+            "down the page; OCR reads it turned. Search for the reference:", "",
+            f"The account {TERM} was opened in March.",
+            f"Please quote {TERM} when you write to us."]
+    picture = scan_picture(rows).rotate(-90, expand=True)
+    picture_page(pdf, jpeg(pdf, picture), "q 792 0 0 612 0 0 cm /Scan Do Q", size=(792, 612))
+    save(pdf, folder, "19_scan_turned.pdf")
+
+
+def scan_with_a_page_number(folder):
+    pdf = pikepdf.Pdf.new()
+    rows = ["Sample 20: a scan with a page number typed under it.",
+            "The search reads only those few words. With OCR off, the",
+            "result says so; with it on, OCR reads the picture too.", "",
+            f"The account {TERM} was opened in March.",
+            f"Please quote {TERM} when you write to us."]
+    picture_page(pdf, jpeg(pdf, scan_picture(rows)), "q 612 0 0 792 0 0 cm /Scan Do Q",
+                 typed=b"\nBT /F1 9 Tf 520 30 Td (Page 1 of 1) Tj ET")
+    save(pdf, folder, "20_scan_with_a_page_number.pdf")
+
+
+def photo_with_no_words(folder):
+    pdf = pikepdf.Pdf.new()
+    add_page(pdf, text("Sample 21: page 2 is a photo with no words in it.", "",
+                       f"The reference {TERM} is on this page, so the run has",
+                       "something to remove. The result should say that OCR found",
+                       "no words it could read on page 2."))
+    width, height = 1200, 900
+    photo = Image.new("RGB", (width, height))
+    draw = ImageDraw.Draw(photo)
+    for i in range(height):                       # a sky and a field
+        shade = int(120 + 100 * i / height)
+        draw.line([(0, i), (width, i)], fill=(shade // 2, shade // 2 + 40, shade) if i < 500
+                  else (40, 90 + i // 20, 40))
+    draw.ellipse([850, 80, 1000, 230], fill=(250, 220, 120))
+    for left in range(0, width, 160):             # hills
+        draw.polygon([(left, 520), (left + 120, 380), (left + 240, 520)], fill=(60, 110, 60))
+    picture_page(pdf, jpeg(pdf, photo), "q 612 0 0 459 0 166 cm /Scan Do Q")
+    save(pdf, folder, "21_photo_with_no_words.pdf")
+
+
+def page_too_large(folder):
+    pdf = pikepdf.Pdf.new()
+    add_page(pdf, text("Sample 22: page 2 is 200 by 200 inches, too large to read with OCR.",
+                       "", f"The reference {TERM} is on this page. The result should say",
+                       "that page 2 is too large to read with OCR, and was not read."))
+    rows = ["Sample 22, page 2: a page 200 inches square.", f"The account {TERM} is here."]
+    picture = scan_picture(rows, width=400, height=400, dpi=150, top=60)
+    picture_page(pdf, jpeg(pdf, picture), "q 14400 0 0 14400 0 0 cm /Scan Do Q",
+                 size=(14400, 14400))
+    save(pdf, folder, "22_page_too_large_to_read.pdf")
+
+
+def large_jpeg_drawn_larger_than_the_page(folder):
+    """The shape of pdf.js's issue12841: a 2640 x 1896 JPEG drawn at 144 dpi,
+    larger than the page, so that only its top left corner shows; the words
+    in it are turned. Redacting with OCR was refused before #128's fix, for
+    changes it had not made."""
+    rows = ["Sample 23: a large photo of a page, drawn larger than this page",
+            "and turned, so that only its corner shows. Search for the reference.",
+            f"The account {TERM} was opened in March and is now closed.",
+            "Nothing outside the black box should change at all."] + [
+            f"Line {n}: the minutes of the meeting go on here, as they did." for n in range(5, 21)]
+    block = scan_picture(rows, width=900, height=600, dpi=72, top=40, size=26, step=28)
+    block = block.rotate(90, expand=True, fillcolor=255)
+    picture = Image.new("RGB", (2640, 1896), "white")
+    picture.paste(block.convert("RGB"), (60, 60))
+    pdf = pikepdf.Pdf.new()
+    picture_page(pdf, jpeg(pdf, picture), "q 1320 0 0 948 33 -156 cm /Scan Do Q")
+    save(pdf, folder, "23_large_jpeg_drawn_larger_than_the_page.pdf")
+
+
 def main(folder: str) -> None:
     os.makedirs(folder, exist_ok=True)
     number_across_a_line(folder)
@@ -336,6 +463,12 @@ def main(folder: str) -> None:
     xfa_only_form(folder)
     term_in_an_output_intent(folder)
     many_places_and_notes(folder)
+    scan_with_the_term_twice(folder)
+    scan_turned(folder)
+    scan_with_a_page_number(folder)
+    photo_with_no_words(folder)
+    page_too_large(folder)
+    large_jpeg_drawn_larger_than_the_page(folder)
 
 
 if __name__ == "__main__":

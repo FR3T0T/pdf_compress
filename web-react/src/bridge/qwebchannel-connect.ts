@@ -28,6 +28,7 @@ interface RawBridge {
   analyzeFile(path: string): Promise<string>;
   getThumbnail(path: string): Promise<string>;
   getPageImages(path: string): Promise<string>;
+  getOcrStatus(): Promise<string>;
   getMetadata(path: string): Promise<string>;
   getToc(path: string): Promise<string>;
   analyzeDocument(path: string): Promise<string>;
@@ -167,6 +168,9 @@ export function connectQWebChannel(): Promise<void> {
         },
         async getPageImages(path) {
           return safeJsonParse(await raw.getPageImages(path), { success: false });
+        },
+        async getOcrStatus() {
+          return safeJsonParse(await raw.getOcrStatus(), { ready: false, reason: 'OCR could not be checked.' });
         },
         async getMetadata(path) {
           return safeJsonParse(await raw.getMetadata(path), {});

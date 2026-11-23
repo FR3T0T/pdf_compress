@@ -28,8 +28,9 @@ warning.
 
 **Optional dependencies:**
 - [Ghostscript](https://www.ghostscript.com/releases/gsdnld.html) — font subsetting (auto-detected if on PATH)
-- **Offline translation** (Translate tool) — provisioned on demand: open the Translate tool, pick your languages, and it downloads what it needs once (in the packaged app that includes the ML runtime itself, ~204 MB — pinned wheels verified against `translate_runtime_lock.json`); afterwards translation is fully offline. From a source checkout you can also do it manually: `pip install argostranslate pytesseract`, the [Tesseract](https://github.com/tesseract-ocr/tesseract) binary (needed for OCR of images/scans either way), then `python setup_translation.py --install all`. These explicit setup downloads are the only network use in the entire toolkit.
-- [NumPy](https://numpy.org/) — improves photo vs diagram detection accuracy (`pip install numpy`)
+- **Offline translation** (Translate tool) — provisioned on demand: open the Translate tool, pick your languages, and it downloads what it needs once (in the packaged app that includes the ML runtime itself, ~204 MB — pinned wheels verified against `translate_runtime_lock.json`); afterwards translation is fully offline. From a source checkout you can also do it manually: `pip install argostranslate pytesseract`, the [Tesseract](https://github.com/tesseract-ocr/tesseract) binary (needed for OCR of images/scans either way), then `python setup_translation.py --install all`. These explicit setup downloads, and the OCR one below, are the only network use in the entire toolkit.
+- [NumPy](https://numpy.org/) — improves photo vs diagram detection accuracy, and is needed for Redact's OCR (`pip install numpy`)
+- **OCR for Redact** (reading scanned pages for search words) — the packaged app carries it. From a source checkout, fetch its pinned English language file once with `python setup_ocr.py --install` (about 4 MB; `--status` checks it). It uses PyMuPDF's own built-in Tesseract, so the Tesseract program is not needed. This is another explicit setup download; a redaction never downloads anything.
 - [python-docx](https://python-docx.readthedocs.io/) — PDF to Word conversion (`pip install python-docx`)
 
 ---
@@ -129,7 +130,7 @@ python compress_pdf.py document.pdf --log             # enable diagnostic loggin
 ### Security
 - **Protect PDF** — add password and set permissions (AES-256)
 - **Unlock PDF** — remove password protection
-- **Redact PDF** — permanently remove sensitive text via search terms or a visual box-drawing mode; true content destruction (including form-field values, metadata, bookmarks, annotations, link URLs, and attachment names), not a cosmetic overlay. **Fail-closed:** every redaction is verified *before* it is saved and *refused* if any target is still extractable — a page-content leak can be force-removed by flattening the affected page(s) to image; nothing is ever saved with a residual, and a refused run leaves the destination untouched (including the original, when redacting in place). The output gets a new content-derived file identifier, so it cannot be matched to its source through the PDF `/ID`. What it removes, what it reports and its known limits: [Redaction](#redaction)
+- **Redact PDF** — permanently remove sensitive text via search terms (optionally reading scanned pages with OCR) or a visual box-drawing mode; true content destruction (including form-field values, metadata, bookmarks, annotations, link URLs, and attachment names), not a cosmetic overlay. **Fail-closed:** every redaction is verified *before* it is saved and *refused* if any target is still extractable — a page-content leak can be force-removed by flattening the affected page(s) to image; nothing is ever saved with a residual, and a refused run leaves the destination untouched (including the original, when redacting in place). The output gets a new content-derived file identifier, so it cannot be matched to its source through the PDF `/ID`. What it removes, what it reports and its known limits: [Redaction](#redaction)
 - **Enhanced encryption** — custom `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 and Argon2id key derivation
 
 ### Page Operations
@@ -190,7 +191,9 @@ place.
 **What it reports.** When the run is saved, the Redact page says how many
 places on how many pages were redacted, what else was removed, and what is
 good to know: pages with no text to search (a scan or a picture: any words
-in it were not searched), a scan's hidden text layer that was searched (a
+in it were not searched), pages that are mostly a picture with a few words
+of text (only those words were searched), the pages OCR read and what it
+found on each (see *Reading scanned pages*), a scan's hidden text layer that was searched (a
 word the layer misread is still in the picture), attachments, which are
 searched as they are stored and never opened (a zip or a Word file is
 packed, so nothing inside it is searched), pages turned into pictures, a
@@ -207,6 +210,59 @@ written.
 
 **Supported PDF library.** PyMuPDF 1.27.2.3. Redact refuses to run on 1.28,
 and runs on 2.x with a note (see Install).
+
+**Reading scanned pages (OCR).** Tick *Also read scanned pages with OCR
+(slower)* under the search words. It is off by default and needs search
+words. A search then also reads, with OCR, every page it has no text to read
+on (a scan, a picture), and every page that is mostly a picture with a few
+words of text on it: pictures cover half the page or more, and the search
+reads 200 characters or fewer there (a scan with a typed page or Bates
+number, a stamp, a "Scanned with" line or a note on it). Where OCR finds a
+search word, a black box covers it with a small margin, and the picture's own
+pixels under the box are blanked, so the word is not in the file for anyone
+who takes the picture out. Where OCR reads the word in such a page's typed
+text, the search has found it there already and removes it the usual way. A
+page that is sideways or upside down is read at each quarter turn. Before
+saving, these places are checked too: each shows only black, the picture
+holds nothing there any more, OCR no longer reads the word on the page, and
+nothing else on the page changed. The result names every page OCR read, so
+that you can check them by eye.
+
+OCR uses PyMuPDF's own built-in Tesseract (the Tesseract program is not
+needed) and one language file: English, `eng.traineddata` from
+tesseract-ocr/tessdata_fast, pinned by commit and SHA-256 in
+`ocr_data_lock.json`. The packaged app carries the file. From source, fetch
+it once with `python setup_ocr.py --install` (`--status` says whether OCR is
+ready); OCR also needs numpy. Nothing is downloaded during a redaction.
+Without the file the option is greyed out with one line saying why, and a run
+asked to use OCR goes ahead without it and says so.
+
+Known limits of OCR:
+- OCR misses words. In the owner's tests it found 99 of 117; the misses were
+  on 7 pages, and the result told the user to check each of them by eye. It
+  never says a page is clear.
+- English only: a word with accented letters may not be found (OCR can read
+  "impôt" as "impot").
+- The black can take parts of words on the lines above and below, more on a
+  tilted scan. A box grows 2 points round what OCR found, and by a quarter of
+  its height more, but that quarter stops at the edge of any other word OCR
+  read. Measured on real pages made into scans, a word beside the search word
+  lost a third or more of the paper round it on 4 of 66 straight pages at 300
+  dpi, and on 26 of 64 pages tilted 1.5 degrees.
+- It is slow: a page took about 20 seconds in the owner's tests, and up to
+  two and a half minutes on a large one. Cancel waits for the reading in
+  progress.
+- A redacted scan's picture is saved without loss, so the file grows: 1.3 to
+  1.6 times for a typical scan, up to about 15 times on a real page (13 times
+  for a large JPEG, 14.5 times for a JPEG 2000 picture).
+- A page with an OCR text layer (a "searchable" scan) is searched through
+  that layer and not read again; a word the layer misread is still in the
+  picture, and the result says so.
+- A page with more than a few words of text on its picture (type over a
+  background picture, a form with a scanned signature) is searched as text
+  and not read with OCR.
+- A page too large to read at 150 dpi within 25 million pixels (about A0 and
+  up) is not read, and the result says so.
 
 **Known limits.** Each of these is refused, reported in the result, or as
 described here.
@@ -245,8 +301,8 @@ described here.
   it removes nothing extra.
 - On PyMuPDF 2.x the text after a removed word can move along its line. The
   run says so.
-- Words inside a picture are not read. Attachments are searched as stored
-  and never opened. A few places have no rule yet (web-capture names, an
+- Words inside a picture are not read, unless OCR is ticked (see *Reading
+  scanned pages*). Attachments are searched as stored and never opened. A few places have no rule yet (web-capture names, an
   output intent's strings, certificates in the document security store):
   a term there is refused.
 
@@ -389,6 +445,10 @@ Text and vector graphics are never modified.
 | `translate_runtime.py` | On-demand provisioning of the translation ML runtime (frozen builds exclude torch & friends; this downloads pinned wheels into a user dir once) |
 | `translate_runtime_lock.json` | Pinned wheel manifest for that runtime (regenerate: `python translate_runtime.py --make-lockfile`) |
 | `setup_translation.py` | CLI provisioning of offline translation/OCR models (source checkouts) |
+| `pdf_ocr.py` | Redact's OCR: reading scanned pages with PyMuPDF's built-in Tesseract, its language file and whether it is ready (Qt-free) |
+| `ocr_data_lock.json` | The pinned OCR language file (commit, size, SHA-256) and its licence |
+| `setup_ocr.py` | Fetches the pinned OCR language file once, for a source checkout (`--install`, `--status`) |
+| `licenses/tessdata_fast-LICENSE` | Apache-2.0 licence of the OCR language file, carried beside it in the packaged app |
 | `compress_pdf.py` | Command-line interface for compression |
 | `compress_pdf.bat` | Windows launcher (no console window) |
 | `pdf_toolkit.ico` | Application icon (16–256 px) — embedded in the .exe, window icon, installer/shortcuts |
@@ -413,3 +473,7 @@ Text and vector graphics are never modified.
 ## License
 
 MIT — FR3T0T © 2026
+
+The OCR language file Redact reads scans with (`eng.traineddata`, from
+tesseract-ocr/tessdata_fast) is Apache-2.0. Its licence is in
+`licenses/tessdata_fast-LICENSE`, and the packaged app carries it beside the file.

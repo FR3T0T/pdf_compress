@@ -5,12 +5,15 @@ import {
   MOCK_SANITIZE_DEFAULTS,
   MOCK_TOOL_REGISTRY,
   MOCK_PRESETS,
+  MOCK_OCR_NOT_READY,
   MOCK_REDACT_NOT_POSSIBLE,
   MOCK_REDACT_REFUSAL_DOCUMENT_LEVEL,
   MOCK_REDACT_REFUSAL_LINE_ART,
+  MOCK_REDACT_REFUSAL_OCR_OUTSIDE,
   MOCK_REDACT_SUMMARY,
   MOCK_REDACT_SUMMARY_EVERYTHING,
   MOCK_REDACT_SUMMARY_FLATTENED,
+  MOCK_REDACT_SUMMARY_OCR,
   mockSanitizeResult,
 } from './mockData';
 import { simulateFailure, simulateOperation, type MockFileLike } from './mockEventBus';
@@ -203,6 +206,17 @@ export const bridgeApi = {
       `<text x="70" y="168" font-size="9" text-anchor="middle" fill="#9a978f">${name.slice(0, 20)}</text>` +
       `</svg>`;
     return { success: true, dataUrl: `data:image/svg+xml;base64,${btoa(svg)}`, width: 140, height: 180 };
+  },
+
+  /** Whether Redact can read scanned pages with OCR (#128). The browser-dev
+   *  mock says it can; add ?ocr=off to the address to see the page without
+   *  it (the line is the one a source checkout gets). */
+  async getOcrStatus(): Promise<{ ready: boolean; reason: string | null }> {
+    if (window.BridgeAPI) return window.BridgeAPI.getOcrStatus();
+    await delay(50);
+    return new URLSearchParams(window.location.search).get('ocr') === 'off'
+      ? { ready: false, reason: MOCK_OCR_NOT_READY }
+      : { ready: true, reason: null };
   },
 
   async getPageImages(path: string) {
@@ -642,6 +656,29 @@ export const bridgeApi = {
       }
       if (asked.includes('xfa')) {
         simulateFailure(TOOL_KEYS.redact, MOCK_REDACT_NOT_POSSIBLE, { notPossible: true });
+        return;
+      }
+      if (params.ocr && asked.includes('damage')) {
+        simulateFailure(TOOL_KEYS.redact, MOCK_REDACT_REFUSAL_OCR_OUTSIDE.refusal.headline,
+          { ...MOCK_REDACT_REFUSAL_OCR_OUTSIDE, documentLevel: false });
+        return;
+      }
+      if (params.ocr) {
+        // #128: the progress line as the bridge sends it while a page is read.
+        simulateOperation(
+          TOOL_KEYS.redact,
+          [{ name: 'Reading page 1 of 2 with OCR' }, { name: 'Reading page 2 of 2 with OCR' }],
+          () => ({
+            input_path: String(params.file ?? ''),
+            output_path: outputPath,
+            redaction_count: 3,
+            pages_affected: 2,
+            surface_counts: { page_content: 1, ocr_page_content: 2 },
+            verification: { verified: true, checks: [], flattenTargetPages: null },
+            flattened_pages: [],
+            summary: MOCK_REDACT_SUMMARY_OCR,
+          }),
+        );
         return;
       }
       const everything = asked.includes('everything');

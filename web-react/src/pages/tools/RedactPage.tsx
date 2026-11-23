@@ -187,6 +187,10 @@ export function RedactPage() {
   // -- Search-terms mode ---------------------------------------------------
   const [terms, setTerms] = useState('');
   const [caseSensitive, setCaseSensitive] = useState(false);
+  // #128: also read scanned pages with OCR. Off by default; offered only
+  // when the bridge says OCR is ready (getOcrStatus), else its one line why.
+  const [useOcr, setUseOcr] = useState(false);
+  const [ocrStatus, setOcrStatus] = useState<{ ready: boolean; reason: string | null } | null>(null);
 
   // -- Draw-boxes mode -------------------------------------------------------
   const [pageImages, setPageImages] = useState<PageImage[]>([]);
@@ -215,6 +219,17 @@ export function RedactPage() {
 
   const file = files[0] ?? null;
   const effectivePath = workspace.path ?? file?.path ?? null;
+
+  useEffect(() => {
+    let live = true;
+    bridgeApi
+      .getOcrStatus()
+      .then((status) => live && setOcrStatus(status))
+      .catch(() => live && setOcrStatus({ ready: false, reason: 'OCR could not be checked.' }));
+    return () => {
+      live = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!effectivePath) {
@@ -281,6 +296,9 @@ export function RedactPage() {
     .map((s) => s.trim())
     .filter(Boolean);
   const pagesWithBoxes = new Set(boxes.map((b) => b.page)).size;
+  const ocrReady = !!ocrStatus?.ready;
+  // OCR finds search terms: with none typed, or OCR not set up, it is off.
+  const ocrOn = useOcr && ocrReady && searchTerms.length > 0;
 
   const canRun =
     !!effectivePath &&
@@ -318,7 +336,7 @@ export function RedactPage() {
   // the D1 flatten retry pages (#99).
   const buildParams = (path: string, out: string, flattenPages?: number[]) => ({
     ...(mode === 'terms'
-      ? { file: path, output_path: out, search_terms: searchTerms, case_sensitive: caseSensitive }
+      ? { file: path, output_path: out, search_terms: searchTerms, case_sensitive: caseSensitive, ocr: ocrOn }
       : { file: path, output_path: out, rects: boxesToRects(boxes) }),
     ...(flattenPages && flattenPages.length ? { flatten_pages: flattenPages } : {}),
   });
@@ -448,6 +466,17 @@ export function RedactPage() {
             />
             <div style={{ marginTop: 'var(--space-3)' }}>
               <Checkbox checked={caseSensitive} onChange={setCaseSensitive} label="Match upper and lower case exactly" />
+              <Checkbox
+                checked={ocrOn}
+                onChange={setUseOcr}
+                disabled={!ocrReady || searchTerms.length === 0 || op.status === 'running'}
+                label="Also read scanned pages with OCR (slower)"
+              />
+              {ocrStatus && !ocrStatus.ready && ocrStatus.reason && (
+                <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', marginLeft: 26, ...wrapAnywhere }}>
+                  {ocrStatus.reason}
+                </div>
+              )}
             </div>
           </Card>
         </div>

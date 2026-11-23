@@ -32,6 +32,8 @@ from pdf_analyze import (
     write_name_tree,
 )
 from pdf_verify import (
+    _MATCH_FLAGS,
+    DAMAGE_HEADLINE,
     STRUCTURE_WAYS_OUT,
     PageText,
     TermFinder,
@@ -1592,14 +1594,21 @@ class RedactResult:
     #:     at all (a scan with no text layer, text drawn as outlines): a
     #:     search finds no words on them. With OCR, only those OCR did not
     #:     read because it is not set up;
+    #:   {"kind": "mostly_picture", "pages": [...]} — searched pages that
+    #:     are mostly a picture with a few words of text (_search_fact): a
+    #:     scan with a typed page number, a stamp or a note on it. The search
+    #:     read only those words. With OCR, only those OCR did not read
+    #:     because it is not set up (#128);
     #:   {"kind": "ocr_not_ready"} — OCR was asked for and is not set up
-    #:     (pdf_ocr.ocr_status): the pages in no_text were not read (#128);
+    #:     (pdf_ocr.ocr_status): the pages in no_text and mostly_picture
+    #:     were not read (#128);
     #:   {"kind": "ocr", "pages": [...], "hits": {page: n}} — pages with no
-    #:     text that were read with OCR, and how many places it found on
-    #:     each (0 for none). OCR can miss a word: these pages want checking
-    #:     by eye, and none of them was searched for certain (#128);
+    #:     text, or mostly a picture, that were read with OCR, and how many
+    #:     places it found on each (0 for none). OCR can miss a word: these
+    #:     pages want checking by eye, and none of them was searched for
+    #:     certain (#128);
     #:   {"kind": "ocr_unread", "pages": [...], "too_large": [...]} — pages
-    #:     with no text on which OCR found nothing that looks like words at
+    #:     read with OCR on which it found nothing that looks like words at
     #:     any turn (pdf_ocr.looks_like_words: a photo, a drawing, a page in
     #:     another language), and among them those too large to read
     #:     (pdf_ocr.reading_dpi), which were not drawn at all (#128);
@@ -3312,6 +3321,18 @@ _REDACT_PASSES = 3
 #: The same for a page read with OCR (#128): read once, and again after its
 #: boxes are applied, at each turn the term was found at.
 _OCR_PASSES = 2
+#: The kinds of page (_search_fact) a search reads with OCR when asked to:
+#: those it has no text to read on, and those it has only a few words of.
+_OCR_READS = ("no_text", "mostly_picture")
+
+
+def _apart_from(boxes: list, hits: list) -> list:
+    """The places OCR found (*boxes*) that lie apart from every place the
+    search found in the page's own text (*hits*, term_hits'): where OCR
+    reads the term in a page's typed words, the search has it already, and
+    its box takes those characters and nothing else (#128)."""
+    found = [fitz.Rect(box) for box, _trimmed in hits]
+    return [box for box in boxes if not any(fitz.Rect(box).intersects(h) for h in found)]
 
 
 def _box_key(rect) -> tuple:
@@ -3848,35 +3869,85 @@ def _drop_unshown_fields(pdf) -> int:
     return len(gone)
 
 
+#: A page is mostly a picture when pictures are drawn on MOSTLY_PICTURE of
+#: it or more and the search reads FEW_CHARACTERS characters of text on it
+#: or fewer, spaces not counted (_search_fact, #128). Measured on 2,111
+#: pages of 1,133 real files: of the 30 pages pictures cover 30% or more of
+#: that have text, 12 are such pages — scans and photos with a title, a
+#: caption, labels or nothing the search can read at all — and the rest
+#: are pages of text with a picture.
+MOSTLY_PICTURE = 0.5
+FEW_CHARACTERS = 200
+_PICTURE_GRID = 40
+
+
+def _picture_share(page, boxes: list) -> float:
+    """How much of *page* the rectangles *boxes* (the pictures it draws, in
+    page space) cover together: the share of a 40 x 40 grid of points on
+    the page that lie in one of them."""
+    width, height = abs(page.rect.width), abs(page.rect.height)
+    if page.rotation % 180:
+        width, height = height, width
+    if not width or not height:
+        return 0.0
+    cells = bytearray(_PICTURE_GRID * _PICTURE_GRID)
+    step_x, step_y = width / _PICTURE_GRID, height / _PICTURE_GRID
+    for box in boxes:
+        x0 = max(0, math.ceil(box.x0 / step_x - 0.5))
+        x1 = min(_PICTURE_GRID - 1, math.floor(box.x1 / step_x - 0.5))
+        y0 = max(0, math.ceil(box.y0 / step_y - 0.5))
+        y1 = min(_PICTURE_GRID - 1, math.floor(box.y1 / step_y - 0.5))
+        for row in range(y0, y1 + 1):
+            start = row * _PICTURE_GRID
+            cells[start + x0:start + x1 + 1] = b"\x01" * max(0, x1 - x0 + 1)
+    return sum(cells) / len(cells)
+
+
 def _search_fact(page) -> str | None:
-    """What a search cannot read of *page*, if anything: "no_text" — it
-    draws something and none of it is text (a scan with no text layer,
-    type drawn as outlines) — or "text_layer": it shows a picture and most
-    of its text is drawn in the invisible mode, the way OCR lays what it
-    read over a scan. The search reads that layer; a word the layer got
-    wrong is still in the picture.
+    """What a search cannot read of *page*, if anything:
+
+    ``no_text``
+        It draws something and none of it is text (a scan with no text
+        layer, type drawn as outlines).
+    ``text_layer``
+        It shows a picture and most of its text is drawn in the invisible
+        mode, the way OCR lays what it read over a scan. The search reads
+        that layer; a word the layer got wrong is still in the picture.
+    ``mostly_picture``
+        Pictures cover most of it (MOSTLY_PICTURE) and the text the search
+        reads on it is short (FEW_CHARACTERS): a scan with a typed page or
+        Bates number, a stamp, a "Scanned with" line or a note on it, a
+        photo with a caption (#128). The search reads only those few words.
 
     From MuPDF's own account of what the page draws, in order (the same
-    reading the matcher has: an annotation's text is the page's text
-    here too). An empty page is neither; nor is ordinary type beside a
-    picture with a hidden word somewhere. A fact for RedactResult.notes,
-    never a check: a page that cannot be read this way is simply not noted.
+    reading the matcher has: an annotation's text, and a form field's, is
+    the page's text here too). An empty page is none of them; nor is
+    ordinary type beside a picture with a hidden word somewhere. A fact for
+    RedactResult.notes, never a check: a page that cannot be read this way
+    is simply not noted.
     """
     try:
         drawn = page.get_bboxlog()
         kinds = {entry[0] for entry in drawn}
         if not any(kind.endswith("text") for kind in kinds):
             return "no_text" if drawn else None
-        if "ignore-text" not in kinds or "fill-image" not in kinds:
+        pictures = [fitz.Rect(box) for kind, box in drawn if kind in ("fill-image", "fill-imgmask")]
+        if not pictures:
             return None
-        hidden = shown = 0
-        for span in page.get_texttrace():
-            letters = sum(1 for ch in span.get("chars", ()) if ch[0] > 32)
-            if span.get("type") == 3:            # the invisible mode
-                hidden += letters
-            else:
-                shown += letters
-        return "text_layer" if hidden > shown else None
+        if "ignore-text" in kinds and "fill-image" in kinds:
+            hidden = shown = 0
+            for span in page.get_texttrace():
+                letters = sum(1 for ch in span.get("chars", ()) if ch[0] > 32)
+                if span.get("type") == 3:            # the invisible mode
+                    hidden += letters
+                else:
+                    shown += letters
+            if hidden > shown:
+                return "text_layer"
+        text = page.get_text("text", flags=_MATCH_FLAGS)
+        if sum(1 for ch in text if not ch.isspace()) > FEW_CHARACTERS:
+            return None
+        return "mostly_picture" if _picture_share(page, pictures) >= MOSTLY_PICTURE else None
     except Exception:
         return None
 
@@ -3934,8 +4005,11 @@ def _notes(seen: dict | None, attached: list, flattened: list, flattened_areas: 
     if seen is not None:
         if seen["no_text"]:
             notes.append({"kind": "no_text", "pages": sorted(p + 1 for p in seen["no_text"])})
-            if ocr_not_ready:
-                notes.append({"kind": "ocr_not_ready"})
+        if seen.get("mostly_picture"):
+            notes.append({"kind": "mostly_picture",
+                          "pages": sorted(p + 1 for p in seen["mostly_picture"])})
+        if ocr_not_ready and (seen["no_text"] or seen.get("mostly_picture")):
+            notes.append({"kind": "ocr_not_ready"})
         ocr = seen.get("ocr") or {}
         read = sorted(p for p, r in ocr.items() if r["status"] == "read")
         if read:
@@ -3974,8 +4048,13 @@ def _unread_in_words(seen: dict, ocr_not_ready: bool) -> str:
         where, many = pages(seen["no_text"])
         words += (f" {'Pages' if many else 'Page'} {where} {'have' if many else 'has'} no text: "
                   f"a search cannot read words in a scan or a picture.")
-        if ocr_not_ready:
-            words += " OCR, which can read them, is not set up."
+    if seen.get("mostly_picture"):
+        where, many = pages(seen["mostly_picture"])
+        words += (f" {'Pages' if many else 'Page'} {where} {'are' if many else 'is'} mostly "
+                  f"{'pictures' if many else 'a picture'} with a few words of text: the search "
+                  f"read only those words.")
+    if ocr_not_ready and (seen["no_text"] or seen.get("mostly_picture")):
+        words += " OCR, which can read the words in a picture, is not set up."
     ocr = seen.get("ocr") or {}
     read = sorted(p for p, r in ocr.items() if r["status"] == "read")
     unread = sorted(p for p, r in ocr.items() if r["status"] == "unread")
@@ -4209,6 +4288,39 @@ def _note_in_words(note: dict) -> str | None:
     if kind == "text_may_move":
         return (f"This run used version {note.get('version', '')} of the PDF library. With "
                 f"this version, text after a removed word can shift along its line.")
+    # What OCR did (#128). It can miss words: every page it read is named,
+    # and nothing it did is said for certain.
+    if kind == "mostly_picture":
+        return (f"{Where} {'are mostly pictures' if many else 'is mostly a picture'} with a few "
+                f"words of text. The search read only those words, so any words in "
+                f"{'the pictures' if many else 'the picture'} were not searched.")
+    if kind == "ocr_not_ready":
+        return ("OCR, which can read the words in a picture, is not set up, so those pages were "
+                "not read.")
+    if kind == "ocr":
+        every = pages_in_words(pages, cap=len(pages) + 1)
+        hits = _total(note.get("hits"))
+        found = (f"found {_how_many(hits, 'place', 'places')} to black out" if hits else
+                 "found nothing to black out")
+        return (f"OCR read {every} and {found} {'on them' if many else 'there'}. OCR can miss "
+                f"words: check {'them' if many else 'it'} by eye.")
+    if kind == "ocr_unread":
+        large = sorted({int(p) for p in note.get("too_large") or []})
+        unread = sorted({int(p) for p in pages} - set(large))
+        lines = []
+        if unread:
+            some = len(unread) > 1
+            lines.append(f"OCR found no words it could read on {pages_in_words(unread, cap=len(unread) + 1)}. "
+                         f"{'They may be photos or drawings' if some else 'It may be a photo or a drawing'}, "
+                         f"or {'their' if some else 'its'} words may not be in English: check "
+                         f"{'them' if some else 'it'} by eye.")
+        if large:
+            some = len(large) > 1
+            where_large = pages_in_words(large, cap=len(large) + 1)
+            lines.append(f"{where_large[:1].upper()}{where_large[1:]} {'are' if some else 'is'} too "
+                         f"large to read with OCR, and {'were' if some else 'was'} not read: check "
+                         f"{'them' if some else 'it'} by eye.")
+        return " ".join(lines) or None
     return None
 
 
@@ -4243,10 +4355,21 @@ def redaction_summary(result: "RedactResult") -> dict:
                 if n and key not in ("page_content", "ocr_page_content")
                 and key not in _REMOVED_WORDS]
     notes = [line for line in map(_note_in_words, result.notes or []) if line]
-    return {"headline": headline,
-            "checked": "Checked before saving: what you asked to remove is gone from the new "
-                       "file.",
-            "removed": removed, "notes": notes}
+    checked = "Checked before saving: what you asked to remove is gone from the new file."
+    kinds = {n.get("kind") for n in result.notes or []}
+    if kinds & {"ocr", "ocr_unread"}:
+        # What OCR read is a picture: the search checks the file, and OCR
+        # reads again the pages it found places on. Nothing more is said.
+        read = next((n for n in result.notes if n.get("kind") == "ocr"), {})
+        try:
+            found = sorted(int(p) for p, n in dict(read.get("hits") or {}).items() if int(n))
+        except (TypeError, ValueError):
+            found = []
+        checked = ("Checked before saving: a search of the new file no longer finds what you "
+                   "asked to remove"
+                   + (f", and OCR no longer reads it on {pages_in_words(found, cap=len(found) + 1)}"
+                      if found else "") + ".")
+    return {"headline": headline, "checked": checked, "removed": removed, "notes": notes}
 
 
 def redact_result_payload(result: "RedactResult") -> dict:
@@ -4266,6 +4389,10 @@ def _refusal_message(failed) -> str:
         # different thing to tell the user (#119).
         return ("Redaction could not be verified: part of the output could "
                 "not be read, so it could not be checked.")
+    if failed and all(c.id == "redaction.ocr_outside" for c in failed):
+        # Damage, not a leak: the page would have changed outside the
+        # places OCR found (#128). As redaction_refusal_detail says it.
+        return DAMAGE_HEADLINE
     return ("Redaction could not be verified: sensitive content is still "
             "present in the output.")
 
@@ -4283,6 +4410,7 @@ def redact_pdf(
     ocr: bool = False,
     on_progress: Callable[[int, int], None] | None = None,
     cancel: threading.Event | None = None,
+    on_status: Callable[[str], None] | None = None,
 ) -> RedactResult:
     """Redact a PDF, then PROVE the targets are gone or refuse (fail-closed).
 
@@ -4335,7 +4463,11 @@ def redact_pdf(
 
     With ocr=True, a search also reads with OCR every page it has no text
     to read on (_search_fact's "no_text": a scan with no text layer, type
-    drawn as outlines), and redacts the term where OCR finds it (#128).
+    drawn as outlines) or only a few words of ("mostly_picture": a scan
+    with a typed page number, a stamp or a note on it), and redacts the
+    term where OCR finds it (#128). Where OCR reads the term in such a
+    page's own words, the search has found it there too, and that place is
+    left to the search.
     pdf_ocr.read_page draws the page as shown and reads it, at other turns
     too when what it reads does not look like words, and finds the term on
     what it read with the matcher above. Each place found is a box, grown a
@@ -4349,7 +4481,10 @@ def redact_pdf(
     shows, what its pictures hold, and what OCR reads on it now. Boxes
     alone never use OCR, nor does a page with a text layer. OCR needs its
     language file (pdf_ocr.ocr_status); without it the run goes ahead as
-    without OCR, and says so. Off by default.
+    without OCR, and says so. Off by default. Before a page is read with
+    OCR, *on_status* is given what is happening in words ("Reading page 3
+    of 12 with OCR"), for the progress line; *on_progress* still counts the
+    pages. A cancel stops the run before the next reading.
 
     On every run, by term or by box, the structure tree's references to the
     original of a form or image the pages now have a redacted copy of are
@@ -4436,6 +4571,8 @@ def redact_pdf(
 
     def read_with_ocr(doc, page):
         """pdf_ocr.read_page for this run; a cancel ends the run."""
+        if on_status and pdf_ocr.reading_dpi(page) is not None:
+            on_status(f"Reading page {page.number + 1} of {len(doc)} with OCR")
         try:
             return pdf_ocr.read_page(page, scrub_terms, case_sensitive, tessdata, cancel=cancel)
         except InterruptedError:
@@ -4453,8 +4590,8 @@ def redact_pdf(
         it found (not among the rectangles drawn)."""
         total, drawn, touched = len(doc), 0, set()
         seen: dict = {"annotations": 0, "fields": 0, "links": 0, "no_text": [],
-                      "text_layer": {}, "covered": set(), "still_shown": [],
-                      "ocr": {}, "ocr_found": 0}
+                      "mostly_picture": [], "text_layer": {}, "covered": set(),
+                      "still_shown": [], "ocr": {}, "ocr_found": 0}
         hand_boxes.clear()
         for i, pno in enumerate(target):
             if cancel and cancel.is_set():
@@ -4469,16 +4606,20 @@ def redact_pdf(
             page = doc[pno]
             # What a search cannot read of this page, before it is changed.
             fact = _search_fact(page) if scrub_terms else None
-            # A page with nothing to search is read with OCR, when asked
-            # for; and its fingerprint is taken while it is as it was.
-            reading = read_with_ocr(doc, page) if fact == "no_text" and tessdata else None
-            ocr_boxes = list(reading.boxes) if reading else []
-            before = pdf_ocr.fingerprint(page) if ocr_boxes else None
+            # A page with nothing to search, or only a few words on a
+            # picture, is read with OCR when asked for.
+            reading = read_with_ocr(doc, page) if fact in _OCR_READS and tessdata else None
             # Term hits come from the one matcher the verifier also uses
             # (pdf_verify.term_hits): its own views of the page's
             # characters, and search_for's hits beside them, each widened to
             # the whole words it touches. It honours case_sensitive itself.
             hits = term_hits(page, scrub_terms, case_sensitive)
+            # Where OCR reads the term in the page's own text, the search
+            # has found it too: that place is left to the search, whose box
+            # takes the term's characters and nothing else. The page's
+            # fingerprint is taken while it is as it was.
+            ocr_boxes = _apart_from(reading.boxes, hits) if reading else []
+            before = pdf_ocr.fingerprint(page) if ocr_boxes else None
             drawn_by_hand = []
             for rr in rects_by_page.get(pno, []):
                 rect = fitz.Rect(rr["x0"], rr["y0"], rr["x1"], rr["y1"])
@@ -4503,9 +4644,10 @@ def redact_pdf(
                     doc.close()
                     _let_go()
                     raise ValueError("Cancelled")
-                again = [box for turn in reading.hit_turns
-                         for box in pdf_ocr.read_at(page, scrub_terms, case_sensitive, tessdata,
-                                                    turn, reading.dpi).boxes]
+                again = _apart_from([box for turn in reading.hit_turns
+                                     for box in pdf_ocr.read_at(page, scrub_terms, case_sensitive,
+                                                                tessdata, turn, reading.dpi).boxes],
+                                    hits)
                 if not again:
                     break
                 apply_boxes(page, again, seen, _under_keys(page, again))
@@ -4519,6 +4661,7 @@ def redact_pdf(
                 seen["ocr"][pno] = {"status": reading.status, "dpi": reading.dpi,
                                     "turns": reading.turns, "hit_turns": reading.hit_turns,
                                     "boxes": [tuple(box) for box in ocr_boxes], "places": places,
+                                    "search_boxes": [tuple(box) for box, _trimmed in hits],
                                     "seconds": reading.seconds, "before": before}
                 seen["ocr_found"] += places
                 if ocr_boxes:
@@ -4546,8 +4689,8 @@ def redact_pdf(
             if added:
                 drawn += added
                 touched.add(pno)
-            if fact == "no_text" and reading is None:
-                seen["no_text"].append(pno)
+            if fact in _OCR_READS and reading is None:
+                seen[fact].append(pno)
             elif fact == "text_layer":
                 seen["text_layer"][pno] = found
         seen["still_shown"] = _still_shown(doc, seen["covered"])
@@ -4691,7 +4834,7 @@ def redact_pdf(
         ocr_rects = [{"page": pno, "x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3]}
                      for pno, read in sorted(seen["ocr"].items()) for b in read["boxes"]]
         ocr_pages = [{"page": pno, "boxes": read["boxes"], "dpi": read["dpi"],
-                      "turns": read["hit_turns"],
+                      "turns": read["hit_turns"], "search_boxes": read["search_boxes"],
                       "before": None if pno + 1 in flattened else read["before"]}
                      for pno, read in sorted(seen["ocr"].items()) if read["boxes"]]
         report = verify_redaction(

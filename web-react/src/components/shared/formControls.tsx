@@ -13,10 +13,12 @@ export function Checkbox({
   checked,
   onChange,
   label,
+  disabled = false,
 }: {
   checked: boolean;
   onChange: (checked: boolean) => void;
   label: ReactNode;
+  disabled?: boolean;
 }) {
   return (
     <label
@@ -25,14 +27,15 @@ export function Checkbox({
         alignItems: 'center',
         gap: 10,
         padding: '6px 0',
-        cursor: 'pointer',
+        cursor: disabled ? 'default' : 'pointer',
         fontSize: 'var(--font-size-sm)',
-        color: 'var(--text-1)',
+        color: disabled ? 'var(--text-3)' : 'var(--text-1)',
       }}
     >
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
         style={{ accentColor: 'var(--accent)' }}
       />

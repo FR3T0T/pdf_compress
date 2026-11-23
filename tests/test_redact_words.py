@@ -215,6 +215,93 @@ class TestWhatToKnow:
             "Page", "Page", "This", "Page", "A", "Only", "This"]
 
 
+class TestWhatOcrDid:
+    """The notes of a run that read pages with OCR, or was asked to (#128).
+    OCR can miss words: every page it read is named, and nothing it did is
+    said with certainty."""
+
+    def test_a_page_read_with_ocr(self):
+        assert _notes({"kind": "ocr", "pages": [2], "hits": {2: 2}}) == [
+            "OCR read page 2 and found 2 places to black out there. OCR can miss words: "
+            "check it by eye."]
+        assert _notes({"kind": "ocr", "pages": [2], "hits": {"2": 1}}) == [
+            "OCR read page 2 and found 1 place to black out there. OCR can miss words: "
+            "check it by eye."]
+        assert _notes({"kind": "ocr", "pages": [2], "hits": {2: 0}}) == [
+            "OCR read page 2 and found nothing to black out there. OCR can miss words: "
+            "check it by eye."]
+
+    def test_pages_read_with_ocr(self):
+        assert _notes({"kind": "ocr", "pages": [1, 2, 3, 7], "hits": {1: 1, 2: 0, 3: 2, 7: 0}}) == [
+            "OCR read pages 1-3 and 7 and found 3 places to black out on them. OCR can miss "
+            "words: check them by eye."]
+
+    def test_every_page_ocr_read_is_named(self):
+        import re
+        pages = list(range(3, 301, 3))
+        (line,) = _notes({"kind": "ocr", "pages": pages, "hits": {p: 0 for p in pages}})
+        named = line.split(" and found ")[0]
+        assert "more" not in named
+        assert [int(n) for n in re.findall(r"\d+", named)] == pages
+
+    def test_pages_ocr_could_not_read(self):
+        assert _notes({"kind": "ocr_unread", "pages": [4], "too_large": []}) == [
+            "OCR found no words it could read on page 4. It may be a photo or a drawing, or "
+            "its words may not be in English: check it by eye."]
+        assert _notes({"kind": "ocr_unread", "pages": [4, 6], "too_large": []}) == [
+            "OCR found no words it could read on pages 4 and 6. They may be photos or "
+            "drawings, or their words may not be in English: check them by eye."]
+
+    def test_a_page_too_large_to_read(self):
+        assert _notes({"kind": "ocr_unread", "pages": [9], "too_large": [9]}) == [
+            "Page 9 is too large to read with OCR, and was not read: check it by eye."]
+        assert _notes({"kind": "ocr_unread", "pages": [4, 9], "too_large": [9]}) == [
+            "OCR found no words it could read on page 4. It may be a photo or a drawing, or "
+            "its words may not be in English: check it by eye. Page 9 is too large to read "
+            "with OCR, and was not read: check it by eye."]
+
+    def test_ocr_asked_for_but_not_set_up(self):
+        assert _notes({"kind": "no_text", "pages": [2]}, {"kind": "ocr_not_ready"}) == [
+            "Page 2 has no text to search. It may be a scan or a picture, so any words in it "
+            "were not searched.",
+            "OCR, which can read the words in a picture, is not set up, so those pages were "
+            "not read."]
+
+    def test_a_page_that_is_mostly_a_picture(self):
+        assert _notes({"kind": "mostly_picture", "pages": [3]}) == [
+            "Page 3 is mostly a picture with a few words of text. The search read only those "
+            "words, so any words in the picture were not searched."]
+        assert _notes({"kind": "mostly_picture", "pages": [3, 5]}) == [
+            "Pages 3 and 5 are mostly pictures with a few words of text. The search read only "
+            "those words, so any words in the pictures were not searched."]
+
+    def test_what_was_checked_on_pages_ocr_read(self):
+        s = _summary(count=3, pages=2, counts={"page_content": 1, "ocr_page_content": 2},
+                     notes=[{"kind": "ocr", "pages": [2, 4], "hits": {2: 2, 4: 0}}])
+        assert s["checked"] == ("Checked before saving: a search of the new file no longer "
+                                "finds what you asked to remove, and OCR no longer reads it on "
+                                "page 2.")
+        assert s["removed"] == []
+
+    def test_what_was_checked_when_ocr_found_nothing(self):
+        s = _summary(count=1, pages=1,
+                     notes=[{"kind": "ocr", "pages": [2], "hits": {2: 0}}])
+        assert s["checked"] == ("Checked before saving: a search of the new file no longer "
+                                "finds what you asked to remove.")
+        s = _summary(count=1, pages=1,
+                     notes=[{"kind": "ocr_unread", "pages": [2], "too_large": []}])
+        assert s["checked"] == ("Checked before saving: a search of the new file no longer "
+                                "finds what you asked to remove.")
+
+    def test_every_ocr_note_reads_as_words(self):
+        for note in ({"kind": "ocr", "pages": [1], "hits": {1: 1}},
+                     {"kind": "ocr_unread", "pages": [1], "too_large": [1]},
+                     {"kind": "ocr_not_ready"},
+                     {"kind": "mostly_picture", "pages": [1]}):
+            (line,) = _notes(note)
+            assert "_" not in line and "ocr_" not in line
+
+
 class TestManyPages:
     def test_a_long_list_of_pages_is_cut_short(self):
         (line,) = _notes({"kind": "no_text", "pages": list(range(3, 301, 3))})
@@ -437,6 +524,20 @@ class TestWhatCanBeDone:
         d = _detail(_failed("redaction.page_text",
                             "term 'x' is still extractable from page text on page 2"), offer=None)
         assert d["nextStep"] == ("Turning the page into a picture did not remove it.")
+
+    def test_damage_alone_is_not_called_a_leak(self):
+        """When the only thing wrong is that more of a page would have
+        changed than the places OCR found, nothing is "still present": the
+        one-line message says what the headline says (#128)."""
+        failed = [_failed("redaction.ocr_outside", "792 pixels changed outside the boxes on page 1")]
+        headline = _detail(*failed)["headline"]
+        assert headline == ("Redaction refused: it would have changed more of the page than the "
+                            "places found. Nothing was saved.")
+        assert pdf_ops._refusal_message(failed) == headline
+        # With something left as well, it is a leak, and said so.
+        both = failed + [_failed("redaction.ocr_reread", "OCR still reads a term on page 1, "
+                                 "turned 0 degrees (1 place)")]
+        assert "still present" in pdf_ops._refusal_message(both)
 
     def test_no_promise_anywhere(self):
         """The old words promised a fix ("the scrubber should have removed

@@ -2,6 +2,43 @@
 ## Unreleased
 
 ### Added
+- **Redact can read scanned pages with OCR (#128).** A new option under the
+  search words, "Also read scanned pages with OCR (slower)", off by default
+  and only with search words, reads with OCR every page a search has no text
+  to read on (a scan, a picture) and every page that is mostly a picture with
+  a few words of text (pictures over half the page, 200 characters or fewer
+  of text: a scan with a typed page number, a stamp or a note; new page kind
+  and note `mostly_picture`, given with OCR off too). Where OCR finds a term,
+  the place is boxed, grown 2 pt and a quarter of its height (the quarter
+  stopping at the edge of any other word OCR read), the picture's pixels
+  under it blanked, and the page read again; a place where OCR reads the term
+  in the page's own typed words is left to the search. A page is read as
+  shown at 300 dpi within 25 million pixels, and at the other quarter turns
+  when what it reads does not look like English words. It uses PyMuPDF's
+  built-in Tesseract and one language file, tessdata_fast's
+  `eng.traineddata`, pinned by commit and SHA-256 in `ocr_data_lock.json`,
+  never committed: the packaged app carries it, with its Apache-2.0 licence
+  (`licenses/tessdata_fast-LICENSE`, pinned in the lock); a source checkout
+  fetches it once with the new `python setup_ocr.py --install`. Nothing is
+  downloaded during a redaction. Four new checks before saving:
+  `redaction.ocr_fill` (each place shows only black), `redaction.ocr_image`
+  (the picture data under it is blanked, soft masks and inline pictures
+  too), `redaction.ocr_reread` (OCR no longer reads the term) and
+  `redaction.ocr_outside` (nothing else on the page changed, judged from
+  pictures of the page drawn where MuPDF decodes every picture whole, so a
+  JPEG saved again without loss is not counted as change). New notes `ocr`
+  (every page read, and the places found on each), `ocr_unread` (pages it
+  could not read, and pages too large to read) and `ocr_not_ready`, all
+  worded by `redaction_summary`, whose checked line after an OCR run says
+  what was checked there and no more; `surface_counts["ocr_page_content"]`.
+  The progress line says "Reading page 3 of 12 with OCR", and Cancel stops
+  at the next reading. When OCR is not set up the option is greyed out with
+  one line why (new bridge slot `getOcrStatus`, `{ready, reason}` only:
+  never the file's path). Known limits are in the README. New:
+  `pdf_ocr.py`, `setup_ocr.py`, `redact_pdf(ocr=..., on_status=...)`,
+  `pdf_ocr.ocr_readiness`. CI fetches the language file and requires it.
+  Tests: `tests/test_redact_ocr.py`, `tests/test_ocr_data.py`, and the OCR
+  words in `tests/test_redact_words.py`.
 - **Sample files for trying Redact in the app (#119).**
   `python tests/manual/make_redact_samples.py <folder>` writes seventeen
   small PDFs, built object by object: a number broken across a line, a

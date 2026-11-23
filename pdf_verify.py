@@ -2014,6 +2014,37 @@ def _inline_blank_under(blocks: list, transform, box) -> Optional[bool]:
         return None
 
 
+def _changed_outside(doc, page, now, then, to_pixels, pno: int, rects: list, on: str) -> list[str]:
+    """Evidence that *page* (*now*, its fingerprint pixels) changed from
+    *then* outside every box of *rects* on it, each grown by two pixels:
+    pixels more than 24 grey levels apart."""
+    import numpy as np
+    changed = np.abs(now.astype(np.int16) - then.astype(np.int16)) > 24
+    if _user_unit(doc, page) != 1:
+        # PyMuPDF draws a redaction's black fill larger than its box on a
+        # page with a user unit (a known limit, README): a pixel that turned
+        # black there, or lies within two pixels of one (the fill's edge,
+        # half covered), is put down to it.
+        fill = now <= 24
+        for _ in range(2):
+            grown = fill.copy()
+            grown[1:] |= fill[:-1]
+            grown[:-1] |= fill[1:]
+            grown[:, 1:] |= fill[:, :-1]
+            grown[:, :-1] |= fill[:, 1:]
+            fill = grown
+        changed &= ~fill
+    for r in rects:
+        try:
+            if int(r["page"]) != pno:
+                continue
+            box = fitz.Rect(float(r["x0"]), float(r["y0"]), float(r["x1"]), float(r["y1"]))
+        except Exception:
+            continue
+        changed[_inside(box * to_pixels, changed.shape, margin=-2.0)] = False
+    return [f"{int(changed.sum()):,} pixels changed outside the boxes {on}"] if changed.any() else []
+
+
 def _ocr_checks(doc, ocr_pages: list, terms: list[str], case_sensitive: bool,
                 tessdata: Optional[str], rects: list) -> list[VerificationCheck]:
     """The checks of the places OCR found (#128): a picture cannot be read
@@ -2036,13 +2067,16 @@ def _ocr_checks(doc, ocr_pages: list, terms: list[str], case_sensitive: bool,
         Given a fingerprint of the page from before (pdf_ocr.fingerprint),
         the page as shown, without annotations, is the same outside the
         boxes on it (every box of *rects* on the page, grown by two pixels
-        of the fingerprint). Damage, not a leak: no flatten either. On a
-        page with a user unit, where PyMuPDF draws the black fill larger
-        than the box, a pixel that turned black is not counted.
+        of the fingerprint). Both are drawn the same way, at a resolution
+        at which a picture stored again without loss draws as it did
+        (pdf_ocr.fingerprint_pixels). Damage, not a leak: no flatten
+        either. On a page with a user unit, where PyMuPDF draws the black
+        fill larger than the box, a pixel that turned black is not counted.
 
     *ocr_pages* is redact_pdf's account of the pages: {"page" (0-based),
     "boxes" ([x0, y0, x1, y1] in page space), "dpi", "turns", "before"
-    (optional)}. A box of a page the file does not have, a picture that
+    (optional), "search_boxes" (optional: the boxes the search itself put
+    on the page, left out of the outside check like *rects*)}. A box of a page the file does not have, a picture that
     cannot be decoded, or no language file: could not be checked."""
     import numpy as np
 
@@ -2088,7 +2122,24 @@ def _ocr_checks(doc, ocr_pages: list, terms: list[str], case_sensitive: bool,
                 unchecked.append(f"a picture under an OCR box {on} could not be read, so it could not be checked")
             elif not all(blank):
                 image_ev.append(f"a picture under an OCR box {on} still holds what was under the box")
-        # (c) What OCR reads on the page now.
+        # (c) Nothing changed outside the boxes: the page drawn the way its
+        # fingerprint was (pdf_ocr.fingerprint_pixels), so that a picture
+        # stored again without loss draws as it did.
+        before = entry.get("before")
+        if before:
+            fingerprints = True
+            now, to_print = pdf_ocr.fingerprint_pixels(page, int(before["dpi"]))
+            then = np.frombuffer(zlib.decompress(before["samples"]), np.uint8)
+            # The search's own boxes on the page are boxes too: a stamp's
+            # text it removed is not damage.
+            searched = [{"page": pno, "x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3]}
+                        for b in entry.get("search_boxes") or []]
+            if now.shape != (before["height"], before["width"]):
+                outside_ev.append(f"the page {on} is not the size it was")
+            else:
+                outside_ev += _changed_outside(doc, page, now, then.reshape(now.shape), to_print,
+                                               pno, list(rects) + searched, on)
+        # (d) What OCR reads on the page now.
         if not tessdata:
             unchecked.append(f"the OCR language file was not given: what OCR reads {on} could not be checked")
         else:
@@ -2097,42 +2148,6 @@ def _ocr_checks(doc, ocr_pages: list, terms: list[str], case_sensitive: bool,
                 if again.boxes:
                     read_ev.append(f"OCR still reads a term {on}, turned {int(turn)} degrees "
                                    f"({len(again.boxes)} place{'' if len(again.boxes) == 1 else 's'})")
-        # (d) Nothing changed outside the boxes.
-        before = entry.get("before")
-        if before:
-            fingerprints = True
-            now, to_print = _shown_pixels(page, int(before["dpi"]), grey=True, annots=False)
-            now = now[:, :, 0]
-            then = np.frombuffer(zlib.decompress(before["samples"]), np.uint8)
-            if now.shape != (before["height"], before["width"]):
-                outside_ev.append(f"the page {on} is not the size it was")
-                continue
-            then = then.reshape(now.shape)
-            changed = np.abs(now.astype(np.int16) - then.astype(np.int16)) > 24
-            if _user_unit(doc, page) != 1:
-                # PyMuPDF draws a redaction's black fill larger than its box
-                # on a page with a user unit (a known limit, README): a
-                # pixel that turned black there, or lies within two pixels
-                # of one (the fill's edge, half covered), is put down to it.
-                fill = now <= 24
-                for _ in range(2):
-                    grown = fill.copy()
-                    grown[1:] |= fill[:-1]
-                    grown[:-1] |= fill[1:]
-                    grown[:, 1:] |= fill[:, :-1]
-                    grown[:, :-1] |= fill[:, 1:]
-                    fill = grown
-                changed &= ~fill
-            for r in rects:
-                try:
-                    if int(r["page"]) != pno:
-                        continue
-                    box = fitz.Rect(float(r["x0"]), float(r["y0"]), float(r["x1"]), float(r["y1"]))
-                except Exception:
-                    continue
-                changed[_inside(box * to_print, changed.shape, margin=-2.0)] = False
-            if changed.any():
-                outside_ev.append(f"{int(changed.sum()):,} pixels changed outside the boxes {on}")
     checks = [
         VerificationCheck(id="redaction.ocr_fill",
                           description="Every place OCR found shows only black",
@@ -3238,6 +3253,12 @@ def _refusal_lines(check: VerificationCheck, named: frozenset = frozenset()) -> 
     return lines
 
 
+#: The headline of a refusal whose only failure is redaction.ocr_outside:
+#: damage, not a leak (#128). pdf_ops' one-line message says the same.
+DAMAGE_HEADLINE = ("Redaction refused: it would have changed more of the page than the places "
+                   "found. Nothing was saved.")
+
+
 def redaction_refusal_detail(report: VerificationReport, offer: Optional[list] = None) -> dict:
     """A refused redaction in plain words, for the window, from its failed
     checks (#119, R4). *offer* is the pages redact_pdf offers to turn into
@@ -3271,8 +3292,7 @@ def redaction_refusal_detail(report: VerificationReport, offer: Optional[list] =
                     "Nothing was saved.")
         step = "The ID is not on any page, so turning pages into pictures cannot change it."
     elif damage:
-        headline = ("Redaction refused: it would have changed more of the page than the places "
-                    "found. Nothing was saved.")
+        headline = DAMAGE_HEADLINE
         step = "The file was left as it was."
     else:
         headline = ("Redaction refused: part of the new file could not be read, so it could "

@@ -23,6 +23,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QSettings, QThread, Signal, Slot
 from PySide6.QtWidgets import QFileDialog
 
+import pdf_ocr
 import translate_runtime
 from compress_paths import compress_output_path
 from engine import (
@@ -1748,6 +1749,17 @@ class Bridge(QObject):
         tool_key = p.get("toolKey", "redact")
         cancel = self._make_cancel_event(tool_key)
         progress_cb = self._make_progress_callback(tool_key)
+        # Where the run is, for the words redact_pdf gives while it reads a
+        # page with OCR ("Reading page 3 of 12 with OCR", #128): they go in
+        # the progress line beside the count, as a file name does.
+        where = [0, 0]
+
+        def on_progress(current: int, total: int):
+            where[:] = [current, total]
+            progress_cb(current, total)
+
+        def on_status(words: str):
+            self.progressUpdate.emit(_progress_payload(tool_key, where[0], where[1], words))
 
         def _work():
             # Boxes drawn in the app's Draw-boxes mode, a JSON array of
@@ -1769,8 +1781,21 @@ class Bridge(QObject):
                 # 1-based page numbers for the D1 flatten-to-image retry
                 # (#99): sent only on the user-confirmed second attempt.
                 flatten_pages=p.get("flattenPages"),
-                on_progress=progress_cb,
+                # Also read scanned pages with OCR (#128): off unless asked.
+                ocr=bool(p.get("ocr", False)),
+                on_progress=on_progress,
                 cancel=cancel,
+                on_status=on_status,
             ))
 
         self._run_in_thread(tool_key, _work)
+
+    @Slot(result=str)
+    def getOcrStatus(self) -> str:
+        """Whether the Redact page can offer OCR (#128): {"ready", "reason"}
+        only, the reason a plain line. Never the language file's path,
+        which sits in the user's own folder."""
+        try:
+            return json.dumps(pdf_ocr.ocr_readiness(), ensure_ascii=False)
+        except Exception:
+            return json.dumps({"ready": False, "reason": "OCR could not be checked."})

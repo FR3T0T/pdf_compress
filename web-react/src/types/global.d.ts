@@ -38,6 +38,10 @@ export interface RealBridgeAPI {
     pages?: Array<{ index: number; dataUrl: string; width: number; height: number }>;
     error?: string;
   }>;
+  // Whether the Redact page can offer OCR on scanned pages (#128):
+  // ui/bridge.py's getOcrStatus, from pdf_ocr.ocr_readiness. `reason` is one
+  // plain line when it can't; the language file's path is never sent.
+  getOcrStatus(): Promise<{ ready: boolean; reason: string | null }>;
 
   // -- Translation (offline) -------------------------------------------
   getTranslationStatus(): Promise<Record<string, unknown>>;

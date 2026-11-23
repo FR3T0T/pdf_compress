@@ -74,6 +74,29 @@ class TestShippedLock:
         spec = (ROOT / "pdf_toolkit.spec").read_text(encoding="utf-8")
         assert "pdf_ocr" in spec and pdf_ocr.LOCK_FILENAME in spec
 
+    def test_its_licence_is_committed_as_the_lock_pins_it(self):
+        """The language file is Apache-2.0: its licence, from tessdata_fast at
+        the pinned commit, is in the repository byte for byte (git must not
+        change its line ends), and the lock records it."""
+        lock = json.loads((ROOT / pdf_ocr.LOCK_FILENAME).read_text(encoding="utf-8"))
+        assert lock["licence_url"] == ("https://raw.githubusercontent.com/tesseract-ocr/"
+                                       f"tessdata_fast/{lock['commit']}/LICENSE")
+        data = (ROOT / lock["licence_file"]).read_bytes()
+        assert len(data) == lock["licence_size"]
+        assert hashlib.sha256(data).hexdigest() == lock["licence_sha256"]
+        assert b"Apache License" in data and b"Version 2.0, January 2004" in data
+        attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
+        assert f"{lock['licence_file']} -text" in attributes
+
+    def test_the_packaged_app_carries_the_licence_beside_the_file(self):
+        lock = json.loads((ROOT / pdf_ocr.LOCK_FILENAME).read_text(encoding="utf-8"))
+        spec = (ROOT / "pdf_toolkit.spec").read_text(encoding="utf-8")
+        block = spec[spec.index("import pdf_ocr"):]
+        assert "licence_file" in block and "licence_sha256" in block
+        assert '"ocr-data"' in block[block.index("licence_file"):]
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        assert lock["licence_file"] in readme[readme.index("## License"):]
+
 
 class TestStatus:
     def test_nothing_set_up(self, place, no_network):
@@ -149,8 +172,8 @@ class TestStatus:
         (place["data"] / "eng.traineddata").write_bytes(FAKE)
         assert pdf_ocr.ocr_status()["source"] == "installed"
 
-    @pytest.mark.parametrize("short, ready", [(None, False), ("D:\\ARCHIV~1\\OCR-DA~1", True),
-                                              ("D:\\Archiv-\u00fc\\ocr-data", False)])
+    @pytest.mark.parametrize("short, ready", [(None, False), ("\\\\srv\\ARCHIV~1\\OCR-DA~1", True),
+                                              ("\\\\srv\\Archiv-\u00fc\\ocr-data", False)])
     def test_a_folder_named_with_letters_tesseract_cannot_open(self, place, monkeypatch,
                                                                 short, ready):
         """On Windows Tesseract opens its file by a path in the ANSI code
