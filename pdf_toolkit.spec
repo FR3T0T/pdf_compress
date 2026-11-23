@@ -38,7 +38,23 @@ datas = [
     # (= _internal/ when frozen). The EXE() below embeds the same file
     # for Explorer/taskbar.
     (os.path.join(PROJECT_ROOT, "pdf_toolkit.ico"), "."),
+    # The OCR pin (#128) -- pdf_ocr.py resolves it beside its own module.
+    (os.path.join(PROJECT_ROOT, "ocr_data_lock.json"), "."),
 ]
+
+# The OCR language file itself (#128): not in the repository, so the build
+# machine fetches it first (python setup_ocr.py --install). Only the pinned
+# file is bundled, at ocr-data/ (pdf_ocr.bundled_dir()); a build without it
+# stops here rather than ship an app that cannot read scans.
+sys.path.insert(0, PROJECT_ROOT)
+import pdf_ocr  # noqa: E402
+
+_ocr = pdf_ocr.ocr_status()
+if not (_ocr["ready"] and _ocr["pinned"] and _ocr["source"] in ("installed", "bundled")):
+    raise SystemExit("The OCR language file is missing or not the pinned one: run "
+                     "python setup_ocr.py --install, then build again.\n"
+                     + (_ocr["problem"] or ""))
+datas.append((_ocr["file"], "ocr-data"))
 
 # ── Hidden imports ───────────────────────────────────────────────────
 # Modules that PyInstaller can't detect from static analysis.

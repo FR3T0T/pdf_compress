@@ -76,10 +76,12 @@ alone. If a change makes a doc wrong, fixing the doc is part of that change.
 - **Offline is a hard invariant.** The app must never make a network request
   on its own. `ui/net_guard.py` blocks every non-local web-view request and
   the CSP sets `connect-src 'none'`. Don't add anything that phones home.
-  The ONLY sanctioned network use is explicit, user-initiated translation
-  setup: the in-app flow (`translate_runtime.install_runtime` +
+  The ONLY sanctioned network use is explicit, user-initiated setup:
+  translation's in-app flow (`translate_runtime.install_runtime` +
   `pdf_translate.install_languages`, behind a button in the Translate tool)
-  and the `setup_translation.py` CLI. Nothing else may touch the network.
+  and the `setup_translation.py` CLI; and fetching the pinned OCR language
+  file with `setup_ocr.py` (`pdf_ocr.install_language_data`, #128 — never
+  during a redaction). Nothing else may touch the network.
 
 - **The frozen build must not bundle the translation ML stack.**
   torch/spacy/stanza/ctranslate2/… are excluded in `pdf_toolkit.spec` — a

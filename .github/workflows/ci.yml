@@ -58,12 +58,26 @@ jobs:
         # image doesn't ship. No-op on Windows (Qt bundles its own DLLs).
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+      - name: Fetch the OCR language file (#128)
+        # The one file OCR needs, pinned by commit, size and SHA-256 in
+        # ocr_data_lock.json; setup_ocr.py checks all three and --status
+        # fails unless the pinned file is in place.
+        shell: bash
+        env:
+          PDFTOOLKIT_OCR_DATA: ${{ runner.temp }}/ocr-data
+        run: |
+          python setup_ocr.py --install
+          python setup_ocr.py --status
       - name: Run tests
         # QT_QPA_PLATFORM=offscreen lets any Qt objects a future test builds
         # run without a display server. Harmless for the current suite, which
-        # never constructs a QApplication.
+        # never constructs a QApplication. PDFTOOLKIT_REQUIRE_OCR turns a
+        # test that needs the OCR language file and cannot find it from a
+        # skip into a failure.
         env:
           QT_QPA_PLATFORM: offscreen
+          PDFTOOLKIT_OCR_DATA: ${{ runner.temp }}/ocr-data
+          PDFTOOLKIT_REQUIRE_OCR: "1"
         run: pytest -q --cov=. --cov-report=term-missing
 
   next-pdf-library:
@@ -88,7 +102,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
           pip install "PyMuPDF==2.1"
+      - name: Fetch the OCR language file (#128)
+        shell: bash
+        env:
+          PDFTOOLKIT_OCR_DATA: ${{ runner.temp }}/ocr-data
+        run: |
+          python setup_ocr.py --install
+          python setup_ocr.py --status
       - name: Run tests
         env:
           QT_QPA_PLATFORM: offscreen
+          PDFTOOLKIT_OCR_DATA: ${{ runner.temp }}/ocr-data
+          PDFTOOLKIT_REQUIRE_OCR: "1"
         run: pytest -q

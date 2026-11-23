@@ -115,9 +115,11 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import re
 import unicodedata
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional
@@ -169,6 +171,11 @@ class VerificationCheck:
     #: check found, in the order of its evidence lines. The evidence says the
     #: same thing in plain words; the paths are kept for an exported report.
     object_paths: list[str] = field(default_factory=list)
+    #: False when turning the pages it failed on into pictures would not
+    #: fix it: a term OCR still reads in a page's picture is in the picture
+    #: of that picture too (#128). Such a failure makes the flatten offer
+    #: None, as a document-level one does.
+    flattenable: bool = True
 
     def __post_init__(self):
         if not self.pages:
@@ -242,7 +249,7 @@ class VerificationReport:
         failed = self.failed_checks()
         if not failed:
             return None
-        if any(c.is_document_level for c in failed):
+        if any(c.is_document_level or not c.flattenable for c in failed):
             return None
         pages: set[int] = set()
         for c in failed:
@@ -1924,13 +1931,237 @@ def _rect_line_art_check(doc, rects: list[dict]) -> VerificationCheck:
         passed=not ev, evidence=ev)
 
 
+#: The most decoded bytes a picture may have for the check that its data is
+#: blanked under a box to read it; a larger one is "could not be checked".
+_OCR_IMAGE_BYTES = 400_000_000
+
+
+def _shown_pixels(page, dpi: int, *, grey: bool = False, annots: bool = True):
+    """*page* as shown at *dpi* as an array of pixels, and the matrix that
+    takes page space to them (pdf_ocr._render's, unturned)."""
+    import numpy as np
+    zoom = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=zoom, colorspace=fitz.csGRAY if grey else fitz.csRGB,
+                          alpha=False, annots=annots)
+    to_pixels = page_to_picture_matrix(page) * zoom * fitz.Matrix(1, 0, 0, 1, -pix.x, -pix.y)
+    pixels = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+    return pixels, to_pixels
+
+
+def _inside(rect, shape, margin: float = 1.0):
+    """The rows and columns of the pixels of an array of *shape* that lie
+    wholly inside *rect* (pixel space), *margin* pixels in from its edge."""
+    r = fitz.Rect(rect).normalize()
+    y0, y1 = max(int(math.ceil(r.y0 + margin)), 0), min(int(math.floor(r.y1 - margin)), shape[0])
+    x0, x1 = max(int(math.ceil(r.x0 + margin)), 0), min(int(math.floor(r.x1 - margin)), shape[1])
+    return slice(y0, max(y0, y1)), slice(x0, max(x0, x1))
+
+
+def _user_unit(doc, page) -> float:
+    """The page's /UserUnit, 1 when it has none."""
+    try:
+        kind, value = doc.xref_get_key(page.xref, "UserUnit")
+        return float(value) if kind in ("int", "real") else 1.0
+    except Exception:
+        return 1.0
+
+
+def _pixels_blank_under(pix, transform, box) -> bool:
+    """Whether the decoded picture *pix*, drawn by *transform*, holds one
+    value under *box* (page space), counting the pixels wholly inside it."""
+    import numpy as np
+    data = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+    # The box in the picture's own pixels, rows counted from its top.
+    r = fitz.Rect(box) * ~fitz.Matrix(transform)
+    r = fitz.Rect(r.x0 * pix.width, r.y0 * pix.height, r.x1 * pix.width, r.y1 * pix.height)
+    under = data[_inside(r, data.shape)]
+    return not under.size or int((under.max(axis=(0, 1)) - under.min(axis=(0, 1))).max()) <= 4
+
+
+def _image_blank_under(doc, xref: int, transform, box) -> Optional[bool]:
+    """Whether the data of the picture *xref*, drawn by *transform*, is one
+    value under *box* (page space) — in its own pixels and in those of its
+    soft mask or mask, if it has one. None when it cannot be read."""
+    streams = [xref]
+    for key in ("SMask", "Mask"):
+        kind, value = doc.xref_get_key(xref, key)
+        if kind == "xref":
+            streams.append(int(value.split()[0]))
+    for x in streams:
+        try:
+            width = int(doc.xref_get_key(x, "Width")[1])
+            height = int(doc.xref_get_key(x, "Height")[1])
+            if width * height * 4 > _OCR_IMAGE_BYTES:
+                return None
+            pix = fitz.Pixmap(doc, x)
+        except Exception:
+            return None
+        if not _pixels_blank_under(pix, transform, box):
+            return False
+    return True
+
+
+def _inline_blank_under(blocks: list, transform, box) -> Optional[bool]:
+    """The same for a picture written into the page's content (BI ... EI),
+    which has no object of its own: read from the page's text dictionary,
+    *blocks*, by where it is drawn. None when it cannot be found or read."""
+    found = [b for b in blocks if fitz.Matrix(b.get("transform") or (0,) * 6) == fitz.Matrix(transform)]
+    if not found:
+        return None
+    try:
+        return all(_pixels_blank_under(fitz.Pixmap(b["image"]), transform, box) for b in found)
+    except Exception:
+        return None
+
+
+def _ocr_checks(doc, ocr_pages: list, terms: list[str], case_sensitive: bool,
+                tessdata: Optional[str], rects: list) -> list[VerificationCheck]:
+    """The checks of the places OCR found (#128): a picture cannot be read
+    for text, so what the page shows and what its pictures hold is looked at.
+
+    ``redaction.ocr_fill``
+        On the page as shown, every box shows only the fill colour (black):
+        nothing is drawn over it.
+    ``redaction.ocr_image``
+        The data of every picture the page draws under a box is blanked
+        there — its own pixels, and those of its soft mask — so that the
+        term is not in the picture for anyone who takes it out of the file.
+        The picture as the page has it, not only as it is shown: a picture
+        can be drawn twice, or on another page.
+    ``redaction.ocr_reread``
+        OCR reads the page again at each turn it found the term at, and
+        does not find it anywhere on the page. Turning the page into a
+        picture would not change what OCR reads, so no flatten is offered.
+    ``redaction.ocr_outside``
+        Given a fingerprint of the page from before (pdf_ocr.fingerprint),
+        the page as shown, without annotations, is the same outside the
+        boxes on it (every box of *rects* on the page, grown by two pixels
+        of the fingerprint). Damage, not a leak: no flatten either. On a
+        page with a user unit, where PyMuPDF draws the black fill larger
+        than the box, a pixel that turned black is not counted.
+
+    *ocr_pages* is redact_pdf's account of the pages: {"page" (0-based),
+    "boxes" ([x0, y0, x1, y1] in page space), "dpi", "turns", "before"
+    (optional)}. A box of a page the file does not have, a picture that
+    cannot be decoded, or no language file: could not be checked."""
+    import numpy as np
+
+    import pdf_ocr
+    fill_ev: list[str] = []
+    image_ev: list[str] = []
+    read_ev: list[str] = []
+    outside_ev: list[str] = []
+    unchecked: list[str] = []
+    fingerprints = False
+    for entry in ocr_pages:
+        try:
+            pno = int(entry["page"])
+            boxes = [fitz.Rect(b) for b in entry.get("boxes") or []]
+            page = doc[pno]
+        except Exception:
+            unchecked.append("OCR places on a page the output does not have could not be checked")
+            continue
+        on = f"on page {pno + 1}"
+        dpi = int(entry.get("dpi") or pdf_ocr.MIN_DPI)
+        # (a) What the page shows under each box.
+        shown, to_pixels = _shown_pixels(page, min(dpi, 150))
+        for box in boxes:
+            under = shown[_inside(box * to_pixels, shown.shape)]
+            if under.size and int(under.max()) > 8:
+                fill_ev.append(f"an OCR box {on} does not show only black (something is drawn over it)")
+                break
+        # (b) What the pictures under each box hold.
+        inline = None
+        for info in page.get_image_info(xrefs=True):
+            hit = [box for box in boxes if fitz.Rect(info["bbox"]).intersects(box)]
+            if not hit:
+                continue
+            xref = info.get("xref") or 0
+            if xref:
+                blank = [_image_blank_under(doc, xref, info["transform"], box) for box in hit]
+            else:
+                if inline is None:
+                    inline = [b for b in page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
+                              if b.get("type") == 1]
+                blank = [_inline_blank_under(inline, info["transform"], box) for box in hit]
+            if any(b is None for b in blank):
+                unchecked.append(f"a picture under an OCR box {on} could not be read, so it could not be checked")
+            elif not all(blank):
+                image_ev.append(f"a picture under an OCR box {on} still holds what was under the box")
+        # (c) What OCR reads on the page now.
+        if not tessdata:
+            unchecked.append(f"the OCR language file was not given: what OCR reads {on} could not be checked")
+        else:
+            for turn in entry.get("turns") or [0]:
+                again = pdf_ocr.read_at(page, terms, case_sensitive, tessdata, int(turn), dpi)
+                if again.boxes:
+                    read_ev.append(f"OCR still reads a term {on}, turned {int(turn)} degrees "
+                                   f"({len(again.boxes)} place{'' if len(again.boxes) == 1 else 's'})")
+        # (d) Nothing changed outside the boxes.
+        before = entry.get("before")
+        if before:
+            fingerprints = True
+            now, to_print = _shown_pixels(page, int(before["dpi"]), grey=True, annots=False)
+            now = now[:, :, 0]
+            then = np.frombuffer(zlib.decompress(before["samples"]), np.uint8)
+            if now.shape != (before["height"], before["width"]):
+                outside_ev.append(f"the page {on} is not the size it was")
+                continue
+            then = then.reshape(now.shape)
+            changed = np.abs(now.astype(np.int16) - then.astype(np.int16)) > 24
+            if _user_unit(doc, page) != 1:
+                # PyMuPDF draws a redaction's black fill larger than its box
+                # on a page with a user unit (a known limit, README): a
+                # pixel that turned black there, or lies within two pixels
+                # of one (the fill's edge, half covered), is put down to it.
+                fill = now <= 24
+                for _ in range(2):
+                    grown = fill.copy()
+                    grown[1:] |= fill[:-1]
+                    grown[:-1] |= fill[1:]
+                    grown[:, 1:] |= fill[:, :-1]
+                    grown[:, :-1] |= fill[:, 1:]
+                    fill = grown
+                changed &= ~fill
+            for r in rects:
+                try:
+                    if int(r["page"]) != pno:
+                        continue
+                    box = fitz.Rect(float(r["x0"]), float(r["y0"]), float(r["x1"]), float(r["y1"]))
+                except Exception:
+                    continue
+                changed[_inside(box * to_print, changed.shape, margin=-2.0)] = False
+            if changed.any():
+                outside_ev.append(f"{int(changed.sum()):,} pixels changed outside the boxes {on}")
+    checks = [
+        VerificationCheck(id="redaction.ocr_fill",
+                          description="Every place OCR found shows only black",
+                          passed=not fill_ev, evidence=fill_ev),
+        VerificationCheck(id="redaction.ocr_image",
+                          description="The pictures under the places OCR found are blanked there",
+                          passed=not image_ev and not unchecked, evidence=image_ev + unchecked,
+                          unevaluated=bool(unchecked) and not image_ev),
+        VerificationCheck(id="redaction.ocr_reread",
+                          description="OCR no longer reads the term on the pages it was found on",
+                          passed=not read_ev, evidence=read_ev, flattenable=False),
+    ]
+    if fingerprints:
+        checks.append(VerificationCheck(
+            id="redaction.ocr_outside",
+            description="The pages OCR redacted are unchanged outside the boxes",
+            passed=not outside_ev, evidence=outside_ev, flattenable=False))
+    return checks
+
+
 def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                      rects: Optional[list[dict]] = None,
                      case_sensitive: bool = False,
                      password: Optional[str] = None,
                      input_path: str = "",
                      source_ids: Optional[list[str]] = None,
-                     source_sha256: Optional[str] = None) -> VerificationReport:
+                     source_sha256: Optional[str] = None,
+                     ocr_pages: Optional[list[dict]] = None,
+                     tessdata: Optional[str] = None) -> VerificationReport:
     """Independently confirm a redacted output no longer carries its targets.
 
     Mirrors redact_pdf's selection model: *terms* (search-term redactions)
@@ -1994,6 +2225,9 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
             report.checks.append(_rect_region_check(doc, rects))
             report.checks.append(_rect_annotation_check(doc, output_path, rects, password))
             report.checks.append(_rect_line_art_check(doc, rects))
+        if ocr_pages and terms:
+            report.checks.extend(_ocr_checks(doc, ocr_pages, terms, case_sensitive,
+                                             tessdata, rects))
     finally:
         doc.close()
     report.checks.extend(_whole_file_checks(output_path, password))
@@ -2988,6 +3222,17 @@ def _refusal_lines(check: VerificationCheck, named: frozenset = frozenset()) -> 
     elif cid == "redaction.file_id":
         lines.append("The new file would still carry the original file's ID, which links the "
                      "two files.")
+    elif cid == "redaction.ocr_fill":
+        lines.append(f"Something is drawn over a place on {where} where OCR found what you "
+                     f"searched for, so it does not show black.")
+    elif cid == "redaction.ocr_image":
+        lines.append(f"A picture on {where} still holds what OCR found, under the black box. "
+                     f"It could be taken out of the file.")
+    elif cid == "redaction.ocr_reread":
+        lines.append(f"OCR can still read {_SEARCHED.lower()} in the picture of {where}.")
+    elif cid == "redaction.ocr_outside":
+        lines.append(f"The picture of {where} would have changed outside the places that were "
+                     f"blacked out.")
     else:
         lines.append("Something you asked to remove is still in the new file.")
     return lines
@@ -3020,10 +3265,15 @@ def redaction_refusal_detail(report: VerificationReport, offer: Optional[list] =
     unread = bool(failed) and all(
         c.unevaluated or all("could not be" in e or "did not cover" in e for e in c.evidence)
         for c in failed)
+    damage = bool(failed) and all(c.id == "redaction.ocr_outside" for c in failed)
     if identifier:
         headline = ("Redaction refused: the new file would still be linked to the original. "
                     "Nothing was saved.")
         step = "The ID is not on any page, so turning pages into pictures cannot change it."
+    elif damage:
+        headline = ("Redaction refused: it would have changed more of the page than the places "
+                    "found. Nothing was saved.")
+        step = "The file was left as it was."
     else:
         headline = ("Redaction refused: part of the new file could not be read, so it could "
                     "not be checked. Nothing was saved." if unread else
@@ -3044,6 +3294,9 @@ def redaction_refusal_detail(report: VerificationReport, offer: Optional[list] =
                     f"{'pictures' if many else 'a picture'} did not remove it.")
         elif unread:
             step = "Nothing was found there, but a file that could not be checked is not saved."
+        elif any(c.id == "redaction.ocr_reread" for c in failed):
+            step = ("It is in the picture of the page, so turning the page into a picture would "
+                    "not remove it.")
         else:
             step = "It is not drawn on a page, so turning pages into pictures would not remove it."
     return {"headline": headline, "found": found, "nextStep": step}

@@ -38,6 +38,9 @@ htmlcov/
 # Logs
 *.log
 
+# OCR language data: fetched by setup_ocr.py, never committed (#128)
+*.traineddata
+
 # Backups created by the app
 *.backup
 *.backup.old

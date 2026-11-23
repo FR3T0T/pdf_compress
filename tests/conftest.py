@@ -77,6 +77,23 @@ def _make_simple_pdf(path: str, *, num_pages: int = 1,
 # ── Fixtures ─────────────────────────────────────────────────────────────
 
 
+@pytest.fixture(scope="session")
+def tessdata():
+    """The folder holding the OCR language file (#128), for a test that
+    reads pictures. Without it such a test is skipped and says why
+    (``python setup_ocr.py --install`` fetches the file); where
+    PDFTOOLKIT_REQUIRE_OCR is set, as on CI, it fails instead. It never
+    passes without having read anything."""
+    import pdf_ocr
+    status = pdf_ocr.ocr_status()
+    if not status["ready"]:
+        message = f"OCR language data is not set up: {status['problem']}"
+        if os.environ.get("PDFTOOLKIT_REQUIRE_OCR"):
+            pytest.fail(message)
+        pytest.skip(message)
+    return status["tessdata"]
+
+
 @pytest.fixture
 def sample_pdf(tmp_path):
     """A single-page PDF with an embedded JPEG image."""
