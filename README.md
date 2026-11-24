@@ -27,8 +27,17 @@ it, and the result says so. The test suite also runs on 2.1 as an early
 warning.
 
 **Optional dependencies:**
-- [Ghostscript](https://www.ghostscript.com/releases/gsdnld.html) — font subsetting (auto-detected if on PATH)
-- **Offline translation** (Translate tool) — provisioned on demand: open the Translate tool, pick your languages, and it downloads what it needs once (in the packaged app that includes the ML runtime itself, ~204 MB — pinned wheels verified against `translate_runtime_lock.json`); afterwards translation is fully offline. From a source checkout you can also do it manually: `pip install argostranslate pytesseract`, the [Tesseract](https://github.com/tesseract-ocr/tesseract) binary (needed for OCR of images/scans either way), then `python setup_translation.py --install all`. These explicit setup downloads, and the OCR one below, are the only network use in the entire toolkit.
+- [Ghostscript](https://www.ghostscript.com/releases/gsdnld.html) — font subsetting. The app looks for it only where its installer puts it: on Windows `Program Files\gs\gs<version>\bin\gswin64c.exe` (or `Program Files (x86)\gs\...\gswin32c.exe`), newest version first; on macOS `/opt/homebrew/bin/gs`, `/usr/local/bin/gs` or `/opt/local/bin/gs`; on Linux `/usr/bin/gs` or `/usr/local/bin/gs`. Installed elsewhere, set `PDFTOOLKIT_GHOSTSCRIPT` to the full path of the program. It never runs one found on PATH or in the current folder
+- **Offline translation** (Translate tool) — set up on demand: open the Translate tool, pick your languages, and it downloads what they need, once. In the packaged app that starts with the translation engine itself: about 48 MB (19 pinned wheels, each checked against `translate_runtime_lock.json`), about 150 MB once unpacked. Each language then adds two Argos language packs, English to it and back (about 160 MB each once installed, for German), and a small model that splits its sentences (about 0.2 MB; 0.6 MB for Chinese), pinned with its SHA-256 in `translate_sbd_lock.json`. English's model comes with the first language. After setup, translation makes no network connection at all: if a sentence model is missing, it stops and says "Run translation setup again" instead of fetching one. A setup made before the sentence models were needed shows the setup card again until it has been run once more. Reading text from images and scans also needs the [Tesseract](https://github.com/tesseract-ocr/tesseract) program, which the app looks for only where its installer puts it: on Windows `Program Files\Tesseract-OCR\tesseract.exe` (or under `Program Files (x86)`), on macOS `/opt/homebrew/bin`, `/usr/local/bin` or `/opt/local/bin`, on Linux `/usr/bin` or `/usr/local/bin`. Installed elsewhere, set `PDFTOOLKIT_TESSERACT` to the full path of the program; one on PATH or in the current folder is never used. From a source checkout you can set translation up by hand:
+
+  ```bash
+  pip install --no-deps argostranslate==1.11.0
+  pip install "ctranslate2>=4.0,<5" minisbd packaging "sacremoses>=0.0.53,<0.2" "sentencepiece>=0.2.0,<0.3"
+  pip install pytesseract
+  python setup_translation.py --install de fr    # the languages you need, or: all
+  ```
+
+  `--no-deps` leaves out two things argostranslate asks for that the app never uses: stanza 1.10.1, which has known security flaws and brings PyTorch with it, and spaCy. The second line installs the rest of what argostranslate needs. Setting up translation, here or in the app, is one of the few things that go online; see [What goes online](#what-goes-online).
 - [NumPy](https://numpy.org/) — improves photo vs diagram detection accuracy, and is needed for Redact's OCR (`pip install numpy`)
 - **OCR for Redact** (reading scanned pages for search words) — the packaged app carries it. From a source checkout, fetch its pinned English language file once with `python setup_ocr.py --install` (about 4 MB; `--status` checks it). It uses PyMuPDF's own built-in Tesseract, so the Tesseract program is not needed. This is another explicit setup download; a redaction never downloads anything.
 - [python-docx](https://python-docx.readthedocs.io/) — PDF to Word conversion (`pip install python-docx`)
@@ -107,7 +116,8 @@ python compress_pdf.py document.pdf --linearize       # web-optimized output
 python compress_pdf.py document.pdf --gs              # Ghostscript font subsetting
 python compress_pdf.py document.pdf --backup          # create .backup before overwriting
 python compress_pdf.py *.pdf -o compressed/            # batch to output directory
-python compress_pdf.py document.pdf --log             # enable diagnostic logging
+python compress_pdf.py document.pdf --log             # write the activity log (no file names)
+python compress_pdf.py document.pdf --detailed-log    # the detailed log, which names files
 ```
 
 ---
@@ -377,7 +387,7 @@ Each preset has per-image-type DPI targets (color, grayscale, monochrome). Your 
 - `--linearize` for web-optimized output
 - `--gs` for Ghostscript font subsetting
 - `--backup` for backup creation
-- `--log` for diagnostic file logging
+- `--log` for the activity log, `--detailed-log` for the detailed one (see [What the app keeps on your computer](#what-the-app-keeps-on-your-computer))
 - Progress bar with per-image status
 
 ---
@@ -409,8 +419,8 @@ Text and vector graphics are never modified.
 
 ## Security and privacy
 
-- **Fully offline** — no network access, no telemetry, no cloud dependencies, no accounts
-- **Network kill-switch** — a `QWebEngineUrlRequestInterceptor` blocks every non-local request (anything but `file`/`qrc`/`data`/`blob`/`about`) at the engine level, plus a restrictive Content-Security-Policy (`connect-src 'none'`). The app provably cannot phone home even if a future change tried to
+- **Fully offline** — no telemetry, no cloud dependencies, no accounts. Nothing goes online unless you start one of the setup steps in [What goes online](#what-goes-online)
+- **Network kill-switch for the interface** — the app's interface runs in an embedded web view. A `QWebEngineUrlRequestInterceptor` blocks every non-local request it makes (anything but `file`/`qrc`/`data`/`blob`/`about`) at the engine level, and a restrictive Content-Security-Policy (`connect-src 'none'`) backs it up, so the interface cannot reach the network. The kill-switch does not cover the Python side of the app, where the setup downloads below run
 - **Document audit** — the Analyze Document tool inspects a PDF for trackers, scripts, and hidden data entirely on-device
 - **PDF magic validation** — rejects files without valid `%PDF-` headers before processing
 - **Decompression bomb protection** — images exceeding 200 million pixels are skipped
@@ -418,7 +428,7 @@ Text and vector graphics are never modified.
 - **File size limit** — inputs over 2 GB are rejected
 - **Ghostscript sandboxing** — `-dSAFER` flag restricts file system access; `--` separator prevents argument injection; paths are sanitized; 5-minute process timeout
 - **Enhanced encryption** — `.epdf` format with ChaCha20-Poly1305, AES-256-GCM, or Camellia-256 ciphers; Argon2id key derivation; AEAD authentication. The `.epdf` header (cipher, KDF parameters, salt, nonce) is bound as Associated Data, so tampering or downgrade attacks on the header are detected on decrypt (format v2; v1 files still readable)
-- **Encrypted PDF handling** — password-protected files prompt for credentials; passwords are cleared from memory after use
+- **Encrypted PDF handling** — password-protected files prompt for credentials. A password you type is used for that operation and not kept: it is not written to the log (detailed or not), the settings, temp files or the results the interface gets back, and the files written hold only what the PDF or `.epdf` format derives from it. Python cannot promise to wipe it from memory, so it stays in the app's memory until that memory is reused or the app quits
 - **Atomic file I/O** — temp file + `os.replace()`; original file is never corrupted on failure
 - **Verify, then commit (Redact)** — the redacted candidate is written to a temp file beside the destination, verified there, and renamed into place only if verification passes. A refused redaction never creates, replaces, or deletes the destination
 - **No identifier carry-over (Redact, Sanitize)** — PDF libraries preserve the trailer `/ID` across saves so revisions of a document can be recognised; for a redacted or sanitized copy that is a link back to the original. Both tools drop it and write a new one derived from the output's own content as their last step, and verification refuses an output that still shares an identifier with its source. The verification report records the SHA-256 of both files
@@ -427,10 +437,44 @@ Text and vector graphics are never modified.
 - **Known limits (Sanitize)** — three, each needing a file built for the purpose. A trailer `/Info` that points at a dictionary with another job and nothing but strings, names, numbers and booleans in it (and no `/Type`, `/Subtype` or `/S`) is emptied by the metadata option, taking that other job's entries with it. An `/Info` dictionary that is also held under a second key and declares a `/Type`, or holds an array or a dictionary, is only unhooked from the trailer: its entries stay in the file under the other key and the copy still verifies. And the identifier check compares the elements of the two trailer `/ID`s, so an identifier hidden inside a nested array in the source's `/ID` is not seen
 - **Backup system** — optional `.backup` copy with rotation before overwriting originals
 - **Thread-safe cancellation** — cancel at any point without leaving partial output files
-- **Diagnostic logging** — rotating file logs (5 MB, 3 backups) to platform-appropriate directories
+- **Activity log without file names** — the app logs what it does (the tool, counts, sizes, the outcome) to `pdfcompress.log` in its log folder (5 MB, three older copies), never the names or folders of your files. Anything path-like that still reaches a line, such as a file name in an error message, is replaced before the line is written; a traceback keeps the app's module names and line numbers. Other libraries add only their warnings and errors (the translation library logs the text it translates otherwise). For troubleshooting, **Detailed log (includes file names)** on the home screen turns on the full log, file names, folders and all; **Clear logs** deletes the log and its copies
 - **PDF/A awareness** — detects PDF/A conformance and warns before breaking compliance
 - **No silent failures** — all exceptions are logged with appropriate severity levels
 - **Path validation** — `os.startfile` calls are guarded with directory validation
+
+### What goes online
+
+The app never connects to the network on its own. These are the only parts of
+the toolkit that do, and each runs only when you start it:
+
+| What | When | Where it connects |
+|------|------|-------------------|
+| Translation setup: the translation engine (packaged app only) | Translate tool, *Download & set up*, the first time | files.pythonhosted.org, for the pinned wheels (each checked against its SHA-256) |
+| Translation setup: sentence models | the same button, or `python setup_translation.py --install` | github.com, which hands over to release-assets.githubusercontent.com (the MiniSBD v0.0.1 release; size and SHA-256 checked) |
+| Translation setup: language packs | the same | raw.githubusercontent.com for the Argos package index, then the addresses the index gives for the packs (argos-net.com in our checks) |
+| Redact's OCR language file (source checkout) | `python setup_ocr.py --install` | raw.githubusercontent.com (tessdata_fast at a pinned commit; size and SHA-256 checked) |
+| Regenerating the translation lock (developers) | `python translate_runtime.py --make-lockfile` | PyPI (pypi.org, files.pythonhosted.org), through pip |
+
+After setup, translating, reading text from images and redacting make no
+network connection. A translation whose sentence model is missing stops and
+says so; it does not fetch the model.
+
+### What the app keeps on your computer
+
+| What | Where | What's in it, and when it goes |
+|------|-------|--------------------------------|
+| Activity log | Windows `%APPDATA%\PDFCompress\logs`, macOS `~/Library/Logs/PDFCompress`, Linux `~/.local/share/PDFCompress/logs` | `pdfcompress.log` and up to three older copies of 5 MB each, and a marker file (`old-logs-removed`). No file names unless you turn on the detailed log. **Clear logs** on the home screen deletes the logs. The first start of this version deleted the logs earlier versions wrote, which named files and folders |
+| Settings | Windows registry `HKEY_CURRENT_USER\Software\PDFCompress\PDFCompress`, macOS `~/Library/Preferences/com.pdfcompress.PDFCompress.plist`, Linux `~/.config/PDFCompress/PDFCompress.conf` | Theme, sidebar, the detailed-log switch (`diagnostics/detailedLog`) and each tool's last choices: `merge/outputDir`, `merge/outputName`, `split/outputDir`, `split/nameTemplate`, `split/mode`, `split/everyN`, `watermark/outputDir` and the other watermark options, `protect/mode`, `protect/cipher`, `protect/kdf`, `protect/naming`. The `outputDir` keys hold the last output folder you chose. No passwords |
+| Workspace | a `pdfcompress_workspace_*` folder in your temp folder | The working document while you pass it from tool to tool. Deleted when the app quits; one left by a crash is deleted at the next start (or after a day, if an older version made it) |
+| Translation engine | Windows `%LOCALAPPDATA%\PDFToolkit\translate-runtime`, elsewhere `~/.local/share/pdftoolkit/translate-runtime` | What translation setup installed (packaged app). Replaced by the next setup |
+| Language packs and sentence models | `~/.local/share/argos-translate` (`packages`, `minisbd`), with Argos Translate's cache and settings in `~/.local/cache/argos-translate` and `~/.config/argos-translate` | What translation setup downloaded |
+| OCR language file | Windows `%LOCALAPPDATA%\PDFToolkit\ocr-data`, elsewhere `~/.local/share/pdftoolkit/ocr-data` | `eng.traineddata`, from `python setup_ocr.py --install` (the packaged app carries its own) |
+| Backups | beside the original: `<name>.pdf.backup`, and the one before it as `.backup.old` | A copy of the original, made before Compress saves over it: in the app whenever it saves over the original (it normally writes a new file beside it instead), on the command line with `--backup`. Kept until you delete it |
+| Web view | nothing on disk | The interface runs in an off-the-record profile: its cache is kept in memory and it stores no cookies or web storage. Qt may create an empty graphics cache folder under `%LOCALAPPDATA%\PDFCompress` |
+
+Temporary files written while a tool runs sit beside the output (or in the
+temp folder, for a page read with OCR during translation) and are deleted
+when the tool finishes, whether it worked or not.
 
 ---
 
@@ -446,8 +490,12 @@ Text and vector graphics are never modified.
 | `pdf_analyze.py` | Offline privacy/security audit + sanitizer engine (verify, then commit); also `sanitize_payload`, the Qt-free answer the bridge gives the Sanitize panel |
 | `pdf_verify.py` | Post-operation verification loop — independently re-checks redacted/sanitized output and reports proof of removal (Qt-free) |
 | `pdf_translate.py` | Offline translation + OCR engine (Argos + Tesseract) |
-| `translate_runtime.py` | On-demand provisioning of the translation ML runtime (frozen builds exclude torch & friends; this downloads pinned wheels into a user dir once) |
-| `translate_runtime_lock.json` | Pinned wheel manifest for that runtime (regenerate: `python translate_runtime.py --make-lockfile`) |
+| `translate_runtime.py` | On-demand provisioning of the translation runtime (frozen builds leave the translation stack out; this downloads pinned wheels into a user dir once) |
+| `translate_runtime_lock.json` | Pinned wheel manifest for that runtime, and what it leaves out of argostranslate's requirements (stanza, spaCy) and why (regenerate: `python translate_runtime.py --make-lockfile`) |
+| `translate_sbd_lock.json` | The pinned sentence models (MiniSBD v0.0.1: file, size, SHA-256) that translation setup fetches, and their licence |
+| `app_log.py` | The activity log: no file names by default, the scrubbing safety net, the detailed log, Clear logs (Qt-free) |
+| `workspace_dir.py` | The workspace's temp folder: made with an owner file, deleted at quit, stale ones swept at start (Qt-free) |
+| `trusted_programs.py` | Where Ghostscript, Tesseract and the file manager are found: a setting or their install folders, never PATH or the current folder (Qt-free) |
 | `setup_translation.py` | CLI provisioning of offline translation/OCR models (source checkouts) |
 | `pdf_ocr.py` | Redact's OCR: reading scanned pages with PyMuPDF's built-in Tesseract, its language file and whether it is ready (Qt-free) |
 | `ocr_data_lock.json` | The pinned OCR language file (commit, size, SHA-256) and its licence |
@@ -481,3 +529,9 @@ MIT — FR3T0T © 2026
 The OCR language file Redact reads scans with (`eng.traineddata`, from
 tesseract-ocr/tessdata_fast) is Apache-2.0. Its licence is in
 `licenses/tessdata_fast-LICENSE`, and the packaged app carries it beside the file.
+
+Translation is downloaded at setup, not shipped with the app. Argos Translate
+is MIT. It splits sentences with MiniSBD (LibreTranslate/MiniSBD), whose code
+is AGPL-3.0. Its models come from that project's v0.0.1 release, which names no
+separate licence for them; MiniSBD's README describes them as Stanza's tokenizer
+models converted to ONNX.

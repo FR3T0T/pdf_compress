@@ -72,6 +72,9 @@ interface RawBridge {
   revealFile(path: string): void;
   saveSetting(key: string, value: string): void;
   loadSetting(key: string): Promise<string>;
+  getLogSettings(): Promise<string>;
+  setDetailedLog(on: boolean): Promise<string>;
+  clearLogs(): Promise<string>;
   getToolRegistry(): Promise<string>;
   requestThemeToggle(): void;
   progressUpdate: RawSignal;
@@ -318,6 +321,15 @@ export function connectQWebChannel(): Promise<void> {
           // parsed'. Parsing here means callers get the real value (or
           // an actual null) instead of wire noise.
           return safeJsonParse(await raw.loadSetting(key), null);
+        },
+        async getLogSettings() {
+          return safeJsonParse(await raw.getLogSettings(), { detailedLog: false });
+        },
+        async setDetailedLog(on) {
+          return safeJsonParse(await raw.setDetailedLog(on), { detailedLog: false });
+        },
+        async clearLogs() {
+          return safeJsonParse(await raw.clearLogs(), { success: false, removed: 0 });
         },
         formatSize(bytes) {
           if (bytes < 1024) return `${bytes} B`;

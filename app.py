@@ -8,12 +8,14 @@ import logging
 import os
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication
 
-from engine import setup_file_logging
+import workspace_dir
+from app_log import setup_file_logging
 from ui import MainWindow
+from ui.bridge import DETAILED_LOG_KEY
 from ui.theme import FONT
 
 log = logging.getLogger(__name__)
@@ -32,17 +34,28 @@ def _app_icon() -> QIcon:
     """
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_toolkit.ico")
     if not os.path.isfile(path):
-        log.warning("App icon not found at %s", path)
+        log.warning("App icon not found (pdf_toolkit.ico)")
     return QIcon(path)
 
 
 def main():
     try:
-        log_file = setup_file_logging()
+        # Off by default: the detailed log names files and folders (#120).
+        # Set from the home screen (Bridge.setDetailedLog).
+        detailed = QSettings("PDFCompress", "PDFCompress").value(DETAILED_LOG_KEY, False, type=bool)
+        log_file = setup_file_logging(detailed=detailed)
         log.info("PDF Toolkit %s starting up", VERSION)
-        log.info("Log file: %s", log_file)
+        log.debug("Log file: %s", log_file)
     except Exception as e:
         print(f"Warning: Could not set up file logging: {e}", file=sys.stderr)
+
+    # Workspace folders an earlier run left behind (#120).
+    try:
+        swept = workspace_dir.sweep_stale()
+        if swept:
+            log.info("Removed %d workspace folder(s) left by an earlier run", len(swept))
+    except Exception as e:
+        log.warning("Sweeping old workspace folders failed: %s", e)
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough

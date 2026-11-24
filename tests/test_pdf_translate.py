@@ -16,7 +16,7 @@ import tempfile
 import pytest
 
 import pdf_translate
-from pdf_translate import _extract_pages, _translate_pdf_to_pdf, translate_line
+from pdf_translate import _extract_page_blocks, _translate_pdf_to_pdf, translate_line
 
 try:
     import fitz  # noqa: F401  (PyMuPDF — required by _translate_pdf_to_pdf)
@@ -182,6 +182,6 @@ class TestExtractPagesTempCleanup:
 
         # The OCR fallback fails per-page but is swallowed (txt=""); the call
         # itself must not raise, and must leave no orphaned temp PNG.
-        pages = _extract_pages(blank)
-        assert pages == [""]
+        pages = _extract_page_blocks(blank)
+        assert pages == [[]]
         assert list(scratch.iterdir()) == []

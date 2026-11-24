@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Icon, type IconName } from '../components/shared/Icon';
+import { Checkbox } from '../components/shared/formControls';
+import { useToast } from '../components/shared/Toast';
 import { bridgeApi } from '../bridge/bridgeApi';
 import { useRouter } from '../router/Router';
 import type { ToolDef, ToolRegistry } from '../types/bridge';
@@ -116,6 +118,62 @@ export function HomePage() {
           </div>
         </div>
       ))}
+
+      <ActivityLogPanel />
+    </div>
+  );
+}
+
+/**
+ * The activity log's switch and Clear logs (#120), on the home screen so
+ * they are reached without opening a tool. The detailed log (off by
+ * default, kept in QSettings diagnostics/detailedLog) names files and
+ * folders; the default one does not. See app_log.py.
+ */
+function ActivityLogPanel() {
+  const toast = useToast();
+  const [detailed, setDetailed] = useState(false);
+  const [clearing, setClearing] = useState(false);
+
+  useEffect(() => {
+    bridgeApi.getLogSettings().then((s) => setDetailed(!!s.detailedLog));
+  }, []);
+
+  const toggle = async (on: boolean) => {
+    const s = await bridgeApi.setDetailedLog(on);
+    setDetailed(!!s.detailedLog);
+  };
+
+  const clear = async () => {
+    setClearing(true);
+    try {
+      const r = await bridgeApi.clearLogs();
+      if (r.success) toast.success('Logs cleared.');
+      else toast.error(r.error || "Some log files couldn't be deleted.");
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  return (
+    <div
+      className="panel"
+      style={{ marginTop: 'var(--space-2)', display: 'flex', alignItems: 'flex-start', gap: 'var(--space-4)', flexWrap: 'wrap' }}
+    >
+      <div style={{ flex: '1 1 320px' }}>
+        <div style={{ fontWeight: 700, fontSize: 'var(--font-size-sm)', marginBottom: 2 }}>Activity log</div>
+        <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-xs)', lineHeight: 1.45 }}>
+          The app keeps a log of what it does, on this computer only. It names no files unless you turn on the
+          detailed log.
+        </div>
+        <Checkbox checked={detailed} onChange={toggle} label="Detailed log (includes file names)" />
+        <div style={{ color: 'var(--text-3)', fontSize: 'var(--font-size-xs)', lineHeight: 1.45 }}>
+          For troubleshooting. It also records the folders of the files you work on and the text being translated.
+        </div>
+      </div>
+      <button className="btn-ghost" onClick={clear} disabled={clearing}>
+        Clear logs
+      </button>
     </div>
   );
 }

@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "source": "LibreTranslate/MiniSBD, release v0.0.1",
+  "url": "https://github.com/LibreTranslate/MiniSBD/releases/download/v0.0.1/",
+  "licence": "AGPL-3.0, the licence of the MiniSBD repository. The release names no separate licence for the models; MiniSBD's README describes them as Stanza's tokenizer models converted to ONNX.",
+  "languages": {
+    "en": "en",
+    "zh": "zh-hans",
+    "hi": "hi",
+    "es": "es",
+    "ar": "ar",
+    "fr": "fr",
+    "bn": "hi",
+    "pt": "pt",
+    "ru": "ru",
+    "id": "id",
+    "de": "de",
+    "da": "da"
+  },
+  "models": {
+    "ar": {"filename": "ar.onnx", "size": 181459, "sha256": "44a1847101e1adf667d4b9e1c7a0178d0af016ce33d8e5fc58aea1340c26835f"},
+    "da": {"filename": "da.onnx", "size": 178110, "sha256": "3a7593d774f854900248ddd65468b95f0fc8244d6484648546057cd3e3da87b0"},
+    "de": {"filename": "de.onnx", "size": 189791, "sha256": "00320fe47a79269bf4a85b4e3aa9a4b367fcc2528af23aa41cbad0203b35d1e7"},
+    "en": {"filename": "en.onnx", "size": 188043, "sha256": "6fa9f3a3b201687bd43e329b2b0736789efc97b37883b5b759b31988dca9f353"},
+    "es": {"filename": "es.onnx", "size": 193234, "sha256": "9774dd5ed1bd2d0566fa8d12ee59fd1d2c57b97127d004e03aa2b7b1cc6b2652"},
+    "fr": {"filename": "fr.onnx", "size": 193461, "sha256": "f9392ffd67104d9d633c9254e5095048ce64da6a04212d3dc02940425f8c3af4"},
+    "hi": {"filename": "hi.onnx", "size": 178129, "sha256": "16924ea9912aec3d6759dbf0652a82508a8e3ec840b20941b30d264eba1798d1"},
+    "id": {"filename": "id.onnx", "size": 191396, "sha256": "10d29d9261c0a0a50334754d33d0272df71eba1522ef174b337e7869d364c80e"},
+    "pt": {"filename": "pt.onnx", "size": 182290, "sha256": "db0a8c8f273fde33b902aa660356549986de7b83f881e8538c49dceb1feb1f2f"},
+    "ru": {"filename": "ru.onnx", "size": 181514, "sha256": "53c65ef031698d99fd0c736275eeb3c37f4694613c5c0d4423745741b0843138"},
+    "zh-hans": {"filename": "zh-hans.onnx", "size": 616442, "sha256": "b2a6e45ebb43df44ac3c8e4100ea1cb30ec8319c5698b678ed3f203e5edc5d0e"}
+  }
+}

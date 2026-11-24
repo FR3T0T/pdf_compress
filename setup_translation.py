@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-setup_translation.py — provision the offline translation & OCR models.
+setup_translation.py — set up offline translation from a source checkout.
 
-This is the ONE step that uses the network.  It downloads the Argos
-Translate language packages (and tells you how to add Tesseract OCR data)
-so that, afterwards, the PDF Toolkit can translate completely offline.
-The app's network kill-switch is unaffected: it sandboxes the embedded
-web UI, while this script is a separate, explicit, user-run provisioning
-tool.
+Downloads, once, what translation needs (the same step as the Translate
+tool's setup button): for each language, the Argos Translate packs to and
+from English and the model that splits its sentences (pinned, with its
+SHA-256, in translate_sbd_lock.json, as is English's). Afterwards the PDF
+Toolkit translates offline and never fetches anything. It also tells you
+how to add Tesseract OCR data for reading images and scans, which is a
+system package.
+
+The app's network kill-switch (ui/net_guard.py) covers only the embedded
+web interface; this script is a separate, explicit, user-run step. The
+README's "What goes online" lists everything in the toolkit that can use
+the network.
 
 Usage
 -----
@@ -90,10 +96,11 @@ def _install(codes: list[str]) -> int:
         return 1
 
     if res["requested"] == 0:
-        print("Nothing to install (English needs no translation model).")
+        print("English needs no language pack; its sentence model is in place.")
         return 0
 
-    print(f"\nDone. {res['installed']} package(s) installed, {res['skipped']} skipped/failed.")
+    print(f"\nDone. {res['installed']} package(s) installed, {res['skipped']} skipped/failed; "
+          f"{res['sentenceModels']} sentence model(s) in place.")
     print("Translation now runs fully offline. For reading text from images, "
           "make sure the matching Tesseract OCR packs are installed "
           "(python setup_translation.py --list).")

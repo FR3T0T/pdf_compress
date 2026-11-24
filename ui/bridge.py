@@ -15,16 +15,19 @@ import os
 import platform
 import shutil
 import subprocess
-import tempfile
 import threading
+import time
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from PySide6.QtCore import QObject, QSettings, QThread, Signal, Slot
 from PySide6.QtWidgets import QFileDialog
 
+import app_log
 import pdf_ocr
 import translate_runtime
+import trusted_programs
+import workspace_dir
 from compress_paths import compress_output_path
 from engine import (
     PRESET_ORDER,
@@ -94,6 +97,20 @@ from pdf_translate import (
 )
 
 log = logging.getLogger(__name__)
+
+# The detailed-log setting; app.py reads it at start.
+DETAILED_LOG_KEY = "diagnostics/detailedLog"
+
+
+def _start_file_manager(args: list) -> None:
+    """Start Explorer / open / xdg-open by its full path (trusted_programs,
+    #120): a bare name would be looked up in the current folder first on
+    Windows."""
+    exe = trusted_programs.file_manager()
+    if exe is None:
+        log.warning("No file manager program found; nothing was opened")
+        return
+    subprocess.Popen([exe, *args])
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -349,6 +366,9 @@ class Bridge(QObject):
         super().__init__(parent)
         self._cancel_events: dict[str, threading.Event] = {}
         self._workers: dict[str, _Worker] = {}
+        # Every worker still running, including one a same-key rerun has
+        # replaced in _workers: shutdown() waits for all of them.
+        self._running: set[_Worker] = set()
         self._settings = QSettings("PDFCompress", "PDFCompress")
         self._qwebchannel_js_path = ""
         self._workspace_dir: str | None = None
@@ -415,12 +435,37 @@ class Bridge(QObject):
                 self._workers.pop(tool_key, None)
             if my_evt is not None and self._cancel_events.get(tool_key) is my_evt:
                 self._cancel_events.pop(tool_key, None)
+            self._running.discard(worker)
             worker.deleteLater()
 
         worker.progress.connect(_on_progress)
         worker.finished.connect(_on_finished)
         self._workers[tool_key] = worker
+        self._running.add(worker)
         worker.start()
+
+    def shutdown(self, wait_ms: int = 15000) -> None:
+        """When the app quits: stop running operations, wait for them, then
+        delete the workspace folder (#120). If an operation is still running
+        when the wait is up, the folder is left for the next start's sweep."""
+        for evt in list(self._cancel_events.values()):
+            evt.set()
+        deadline = time.monotonic() + wait_ms / 1000
+        stopped = True
+        for worker in list(self._running):
+            left = max(0, int((deadline - time.monotonic()) * 1000))
+            if worker.isRunning() and not worker.wait(left):
+                stopped = False
+        if not stopped:
+            log.warning("An operation was still running at exit; the workspace folder is left "
+                        "for the next start to remove")
+            return
+        if self._workspace_dir:
+            try:
+                workspace_dir.remove(self._workspace_dir)
+            except ValueError:
+                log.warning("The workspace folder was not where expected; not deleted")
+            self._workspace_dir = None
 
     # ── File / folder dialogs (synchronous) ───────────────────────
 
@@ -572,7 +617,7 @@ class Bridge(QObject):
                 "height": h,
             }, ensure_ascii=False)
         except Exception as exc:
-            log.exception("getThumbnail failed for %s", path)
+            log.exception("getThumbnail failed"); log.debug("getThumbnail: %s", path)
             return json.dumps({"success": False, "error": str(exc)})
 
     @Slot(str, result=str)
@@ -622,7 +667,7 @@ class Bridge(QObject):
                 "pages": pages,
             }, ensure_ascii=False)
         except Exception as exc:
-            log.exception("getPageImages failed for %s", path)
+            log.exception("getPageImages failed"); log.debug("getPageImages: %s", path)
             return json.dumps({"success": False, "error": str(exc)})
 
     @Slot(str, result=str)
@@ -643,7 +688,7 @@ class Bridge(QObject):
             entries = get_toc(path)
             return json.dumps(entries, ensure_ascii=False)
         except Exception as exc:
-            log.warning("getToc failed for %s: %s", path, exc)
+            log.warning("getToc failed: %s", exc); log.debug("getToc: %s", path)
             return json.dumps([])
 
     @Slot(str, result=str)
@@ -662,7 +707,7 @@ class Bridge(QObject):
             return json.dumps({"success": True, "report": report},
                               ensure_ascii=False)
         except Exception as exc:
-            log.exception("analyzeDocument failed for %s", path)
+            log.exception("analyzeDocument failed"); log.debug("analyzeDocument: %s", path)
             return json.dumps({"success": False, "error": str(exc)},
                               ensure_ascii=False)
 
@@ -749,14 +794,14 @@ class Bridge(QObject):
         Two sequential phases behind one progress stream (toolKey
         "translateSetup"): (1) in a frozen build without the provisioned
         runtime, download/verify/unpack the pinned ML wheels via
-        translate_runtime.install_runtime(); (2) download the Argos en<->X
-        language packages for params.codes via install_languages(). Source
-        checkouts with argos in the venv skip phase 1 automatically, so
-        this slot also serves as the in-app "add languages" path there.
-        Cancellable via cancelOperation("translateSetup"). This and the
-        Argos package fetch are the ONLY sanctioned network operations in
-        the app — both run solely from this explicit user action (the web
-        view itself stays fully sandboxed by net_guard).
+        translate_runtime.install_runtime(); (2) download the pinned
+        sentence models and the Argos en<->X language packages for
+        params.codes via install_languages(). Source checkouts with argos in
+        the venv skip phase 1 automatically, so this slot also serves as the
+        in-app "add languages" path there. Cancellable via
+        cancelOperation("translateSetup"). These downloads run solely from
+        this explicit user action (the web view itself stays fully sandboxed
+        by net_guard); see README "What goes online" for the full list.
         """
         p = _normalize_params(json.loads(json_params)) if json_params else {}
         tool_key = p.get("toolKey", "translateSetup")
@@ -825,7 +870,7 @@ class Bridge(QObject):
             return json.dumps({"success": False, "error": str(exc)},
                               ensure_ascii=False)
         except Exception as exc:
-            log.exception("translateImage failed for %s", path)
+            log.exception("translateImage failed"); log.debug("translateImage: %s", path)
             return json.dumps({"success": False, "error": str(exc)},
                               ensure_ascii=False)
 
@@ -932,6 +977,34 @@ class Bridge(QObject):
         val = self._settings.value(key, None)
         return json.dumps(val, ensure_ascii=False)
 
+    # ── Activity log (#120) ───────────────────────────────────────
+    # The home screen's "Activity log" panel. The detailed log (off by
+    # default) names files and folders; see app_log.
+
+    @Slot(result=str)
+    def getLogSettings(self) -> str:
+        """Returns JSON {"detailedLog": bool}."""
+        return json.dumps({"detailedLog": app_log.is_detailed()})
+
+    @Slot(bool, result=str)
+    def setDetailedLog(self, on: bool) -> str:
+        """Turn the detailed log on or off, now and for later starts
+        (QSettings diagnostics/detailedLog). Returns JSON {"detailedLog"}."""
+        self._settings.setValue(DETAILED_LOG_KEY, bool(on))
+        app_log.set_detailed(bool(on))
+        return json.dumps({"detailedLog": app_log.is_detailed()})
+
+    @Slot(result=str)
+    def clearLogs(self) -> str:
+        """Delete pdfcompress.log and its rotated copies in the app's log
+        folder (the handler is closed first and opened again after).
+        Returns JSON {"success": bool, "removed": n}."""
+        try:
+            return json.dumps(app_log.clear_logs())
+        except Exception as exc:
+            log.warning("Clearing the logs failed: %s", exc)
+            return json.dumps({"success": False, "removed": 0, "error": str(exc)})
+
     # ── OS integration ────────────────────────────────────────────
 
     @Slot(str)
@@ -944,17 +1017,16 @@ class Bridge(QObject):
         # so a bare string check isn't enough to guarantee this only opens
         # a local folder.
         if not (os.path.isabs(path) and os.path.exists(path)):
-            log.warning("Refusing to open non-local or nonexistent path: %s", path)
+            log.warning("Refusing to open a non-local or missing folder")
+            log.debug("openFolder refused: %s", path)
             return
         try:
             if platform.system() == "Windows":
                 os.startfile(path)
-            elif platform.system() == "Darwin":
-                subprocess.Popen(["open", path])
             else:
-                subprocess.Popen(["xdg-open", path])
+                _start_file_manager([path])
         except Exception:
-            log.exception("Failed to open folder: %s", path)
+            log.exception("Failed to open a folder")
 
     @Slot(str)
     def openFile(self, path: str):
@@ -962,17 +1034,16 @@ class Bridge(QObject):
         path = os.path.normpath(path)
         # Same rationale as openFolder above.
         if not (os.path.isabs(path) and os.path.exists(path)):
-            log.warning("Refusing to open non-local or nonexistent path: %s", path)
+            log.warning("Refusing to open a non-local or missing file")
+            log.debug("openFile refused: %s", path)
             return
         try:
             if platform.system() == "Windows":
                 os.startfile(path)
-            elif platform.system() == "Darwin":
-                subprocess.Popen(["open", path])
             else:
-                subprocess.Popen(["xdg-open", path])
+                _start_file_manager([path])
         except Exception:
-            log.exception("Failed to open file: %s", path)
+            log.exception("Failed to open a file")
 
     @Slot(str)
     def revealFile(self, path: str):
@@ -986,20 +1057,21 @@ class Bridge(QObject):
         """
         path = os.path.normpath(path)
         if not (os.path.isabs(path) and os.path.exists(path)):
-            log.warning("Refusing to reveal non-local or nonexistent path: %s", path)
+            log.warning("Refusing to reveal a non-local or missing file")
+            log.debug("revealFile refused: %s", path)
             return
         try:
             if platform.system() == "Windows":
                 # `explorer /select,<path>` highlights the file. explorer exits
                 # non-zero even on success, so Popen-and-forget (no check).
-                subprocess.Popen(["explorer", f"/select,{path}"])
+                _start_file_manager([f"/select,{path}"])
             elif platform.system() == "Darwin":
-                subprocess.Popen(["open", "-R", path])
+                _start_file_manager(["-R", path])
             else:
                 # No portable "select the file" on Linux — open the folder.
-                subprocess.Popen(["xdg-open", os.path.dirname(path)])
+                _start_file_manager([os.path.dirname(path)])
         except Exception:
-            log.exception("Failed to reveal file: %s", path)
+            log.exception("Failed to reveal a file")
 
     # ── Workspace (persistent working document) ────────────────────
     # Backs the frontend's WorkspaceContext: a single working document
@@ -1014,12 +1086,12 @@ class Bridge(QObject):
         superseded working files are deleted individually by deleteFile
         as the workspace advances (see WorkspaceContext.applyResult), so
         this directory doesn't accumulate more than the current working
-        file(s) in normal use. Not removed on exit -- ordinary OS temp
-        directory cleanup handles it, same as any other tempfile
-        consumer.
+        file(s) in normal use. Removed when the app quits (shutdown); one
+        left behind is removed by the sweep at the next start
+        (workspace_dir, #120).
         """
         if not self._workspace_dir or not os.path.isdir(self._workspace_dir):
-            self._workspace_dir = tempfile.mkdtemp(prefix="pdfcompress_workspace_")
+            self._workspace_dir = workspace_dir.create()
         return json.dumps(self._workspace_dir, ensure_ascii=False)
 
     @Slot(str, result=str)
@@ -1032,7 +1104,8 @@ class Bridge(QObject):
         ``self._workspace_dir`` rather than acting on an arbitrary path.
         """
         if not self._workspace_dir or not is_within_directory(path, self._workspace_dir):
-            log.warning("deleteFile refused: %s is outside the workspace dir", path)
+            log.warning("deleteFile refused: the file is outside the workspace folder")
+            log.debug("deleteFile refused: %s", path)
             return json.dumps(
                 {"success": False, "error": "refused: path outside workspace"},
                 ensure_ascii=False)
@@ -1041,7 +1114,8 @@ class Bridge(QObject):
                 os.remove(path)
             return json.dumps({"success": True}, ensure_ascii=False)
         except Exception as exc:
-            log.warning("deleteFile failed for %s: %s", path, exc)
+            log.warning("deleteFile failed: %s", exc)
+            log.debug("deleteFile failed for %s", path)
             return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
     @Slot(str, str, result=str)
@@ -1055,7 +1129,8 @@ class Bridge(QObject):
         outside the workspace.
         """
         if not self._workspace_dir or not is_within_directory(src_path, self._workspace_dir):
-            log.warning("copyFile refused: source %s is outside the workspace dir", src_path)
+            log.warning("copyFile refused: the source is outside the workspace folder")
+            log.debug("copyFile refused: %s", src_path)
             return json.dumps(
                 {"success": False, "error": "refused: source outside workspace"},
                 ensure_ascii=False)
@@ -1063,7 +1138,8 @@ class Bridge(QObject):
             shutil.copy2(src_path, dest_path)
             return json.dumps({"success": True}, ensure_ascii=False)
         except Exception as exc:
-            log.error("copyFile failed for %s -> %s: %s", src_path, dest_path, exc)
+            log.error("copyFile failed: %s", exc)
+            log.debug("copyFile failed for %s -> %s", src_path, dest_path)
             return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
     # ── Theme toggle (JS -> Python shell) ─────────────────────────
@@ -1288,7 +1364,7 @@ class Bridge(QObject):
                         "outputPath": out_path,
                     })
                 except Exception as exc:
-                    log.error("Protection failed for %s: %s", fpath, exc)
+                    log.error("Protection failed for a file: %s", exc); log.debug("Protection failed for %s", fpath)
                     file_results.append({
                         "file": fname,
                         "status": "error",
@@ -1377,7 +1453,7 @@ class Bridge(QObject):
                         "details": "Wrong password",
                     })
                 except Exception as exc:
-                    log.error("Unlock failed for %s: %s", fpath, exc)
+                    log.error("Unlock failed for a file: %s", exc); log.debug("Unlock failed for %s", fpath)
                     file_results.append({
                         "file": fname,
                         "status": "error",
@@ -1554,7 +1630,7 @@ class Bridge(QObject):
                         "outputPath": out_path,
                     })
                 except Exception as exc:
-                    log.error("Watermark failed for %s: %s", fpath, exc)
+                    log.error("Watermark failed for a file: %s", exc); log.debug("Watermark failed for %s", fpath)
                     file_results.append({
                         "file": fname,
                         "status": "error",

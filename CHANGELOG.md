@@ -354,7 +354,116 @@
   and error-tail parity: password/cancel/zero-match/out-of-range/empty-terms/
   save-failure) and `tests/test_pdf_verify.py` (D1 flatten targeting).
 
+### Security
+- **Translation no longer installs stanza or PyTorch (#121).** argostranslate
+  1.11.0 asks for exactly stanza 1.10.1, which has three known flaws:
+  CVE-2026-54499 (fixed in stanza 1.12.2), CVE-2026-59974 (fixed in 1.14.0)
+  and CVE-2026-115878 (fixed in 1.15.0). The translation runtime installed it,
+  and PyTorch and spaCy with it, though the app used none of them. It now
+  splits sentences with MiniSBD, which argostranslate also supports, so
+  `translate_runtime.LOCK_OVERRIDES` leaves stanza and spaCy out of
+  argostranslate's requirements when the lock is made. The lock records what
+  was left out and why (`"overrides"` in `translate_runtime_lock.json`).
+  `pdf_translate` puts a stand-in where argostranslate imports stanza, even
+  where a real stanza is installed, and the stand-in raises a plain error if
+  anything reaches into it. Because the lock changed, the Translate tool
+  offers setup again, and setting up replaces the old runtime folder, stanza
+  and PyTorch included. This corrects DOC-02 under v4.23, which said stanza
+  was never part of the toolkit (see the correction there).
+- **The activity log no longer names your files (#120).** The app logged
+  every operation at DEBUG with the full path of its input and output
+  ("Protected C:\...\a.pdf → ..."), and, through the translation library,
+  the text of every document it translated. Now (`app_log.py`, which takes
+  over from `engine.setup_file_logging`):
+  - The app's log lines say what happened without names (the tool, counts,
+    sizes, the outcome); where a name helps, it is given at DEBUG, which only
+    the detailed log writes. That covers every log call that named a file, a
+    folder or an output folder, in `pdf_ops`, `engine`, `epdf_crypto`,
+    `pdf_analyze`, `pdf_translate`, `ui/bridge.py`, `ui/web_shell.py` and
+    `app.py`.
+  - As a safety net, the finished line, error messages and tracebacks
+    included, has Windows drive paths, UNC paths, `file://` addresses,
+    absolute POSIX paths, `~` paths, document file names (.pdf, .epdf, .docx,
+    .txt, pictures) and the user's name replaced (`<path>`, `<file>`,
+    `<user>`); a traceback keeps the app's module names and line numbers.
+  - Other libraries add only their warnings and errors: argostranslate logs
+    the text it translates at INFO.
+  - **Detailed log (includes file names)**, on the home screen, turns on the
+    full log (DEBUG, nothing replaced) for troubleshooting; it is off by
+    default and kept in the settings (`diagnostics/detailedLog`). On the
+    command line, `--log` writes the default log and the new
+    `--detailed-log` the detailed one.
+  - **Clear logs**, beside it, deletes `pdfcompress.log` and its three older
+    copies in the log folder ("Logs cleared."); new bridge slots
+    `getLogSettings`, `setDetailedLog`, `clearLogs`.
+  - **The first start of this version deletes the logs earlier versions
+    wrote**, since they name files and folders, once (a marker file,
+    `old-logs-removed`, stays in the log folder).
+- **The workspace's temp folder is deleted when the app quits (#120).** The
+  `pdfcompress_workspace_*` folder holding the working document stayed in
+  the temp folder after every run. A new Qt-free `workspace_dir.py` makes it
+  with an owner file (the process and when it started); closing the window
+  stops running operations, waits for them, and deletes it. At start the app
+  deletes the ones left behind: those whose owner is no longer running, and
+  those without an owner file (from older versions) untouched for a day. It
+  never follows a link or junction, and never touches a folder a running
+  copy of the app owns.
+- **Ghostscript and Tesseract are found only where they are installed
+  (#120).** Ghostscript was looked up by name (`gs`, `gswin64c`,
+  `gswin32c`) and run, and on Windows a name is looked up in the current
+  folder first, so a file there named like it ran instead. A new Qt-free
+  `trusted_programs.py` takes them from a setting (`PDFTOOLKIT_GHOSTSCRIPT`,
+  `PDFTOOLKIT_TESSERACT`: the full path of the program; anything else is
+  ignored, with a warning that does not repeat it) or from where their
+  installers put them (Program Files on Windows, newest Ghostscript first;
+  `/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin` on macOS;
+  `/usr/bin`, `/usr/local/bin` on Linux), never PATH or the current folder,
+  and the program is always started by its full path. The same goes for
+  Tesseract (Redact's OCR looked for its language folder through a
+  `tesseract` on PATH, and translation's OCR ran a bare `tesseract`) and for
+  the file manager the app opens folders with (Explorer, `open`,
+  `xdg-open`).
+- **The README says what the app keeps and what goes online (#120).** The
+  network kill-switch line now says it covers the interface only, and a new
+  "What goes online" table lists the rest (see #121 above). "Passwords are
+  cleared from memory after use" was not true of Python; the README now
+  says what is: a password is not written to the log, the settings, temp
+  files or the results the interface gets back. A new section, "What the
+  app keeps on your computer", lists the log folder, the settings and their
+  keys, the workspace folder, the translation engine, language packs and
+  sentence models, the OCR language file, backups, and the web view's
+  off-the-record profile, which keeps nothing on disk.
+
 ### Changed
+- **The translation runtime is a quarter of the size (#121).** Without
+  stanza, PyTorch, spaCy and what they bring, the translation engine setup
+  downloads is 19 wheels and about 48 MB, down from 64 wheels and about 204
+  MB (about 150 MB on disk once unpacked). numpy moves from 2.5.0 to 2.5.3,
+  the version the app's own environment holds, and a few small packages
+  move up (filelock, setuptools, click, joblib, packaging, protobuf, PyYAML,
+  regex, tqdm); cloudpickle comes in.
+- **Translation setup also fetches each language's sentence model (#121).**
+  MiniSBD splits text into sentences with a small model per language, which
+  it downloaded from GitHub the first time it needed one, without checking
+  what it got. The models are now pinned in `translate_sbd_lock.json` (file,
+  size, SHA-256; MiniSBD v0.0.1; 11 models, 2.5 MB in all, Bengali using
+  Hindi's and Chinese the Simplified Chinese one, as argostranslate maps
+  them) and fetched by setup (`pdf_translate.install_languages`, in the app
+  and in `setup_translation.py`) for the chosen languages and English, into
+  argostranslate's own folder for them. Each is downloaded beside its final
+  name, checked, and only then put in place; one that does not match stops
+  setup with a plain message and leaves nothing behind. Setup fetches them
+  even for languages whose packs are installed, so running setup again
+  completes a set-up made before this. A language counts as installed only
+  with its packs, its model and English's, so the Translate page shows the
+  setup card to people who set up before this, until they run it again. The
+  packaged app carries the new lock (`pdf_toolkit.spec`).
+- **What goes online is listed in the README.** A new section, "What goes
+  online", lists every part of the toolkit that can use the network, when,
+  and where it connects. The network kill-switch line now says it covers the
+  app's interface (the embedded web view), not the Python side, where the
+  setup downloads run; `setup_translation.py`'s description no longer says
+  it is the only step that goes online.
 - **The Redact page says what happened in plain words (#119).** A
   redaction that verifies shows a headline ("Redacted 3 places on 2
   pages."), the line "Checked before saving: what you asked to remove is
@@ -763,6 +872,31 @@
   code with no remaining callers.
 
 ### Fixed
+- **Translation works offline, and no longer hands back English silently
+  (#121).** Before it split a language's sentences, stanza (see Security)
+  fetched its list of models from raw.githubusercontent.com, so with no
+  network every block failed. A PDF-to-PDF translation then kept each block's
+  original text and saved the file as if it had worked: the "translation" of
+  an English document was the English document. In checks on the old
+  runtime with the connection blocked, a two-page English PDF translated to
+  German came back in English, with 30 connection attempts and no error.
+  Now, after setup, translation makes no connection at all (English to German
+  and German to English, online and with the connection blocked: zero
+  attempts), and a translation whose sentence model is missing stops before
+  it starts: "The sentence model for German isn't installed. Run translation
+  setup again."
+- **Text that could not be translated is counted, and a translation with
+  none translated fails (#121).** Every output format (PDF, Word, text) now
+  translates block by block and counts the blocks that hold a letter, those
+  translated and those kept as they were. When none could be translated,
+  the translation fails with the first reason ("None of the text could be
+  translated, so nothing was saved. ...") and saves nothing. When some were
+  kept, the result says how many (`untranslatedBlocks`) and the Translate
+  page shows "2 text blocks couldn't be translated and were left as they
+  were." under the saved file. Word and text output used to translate whole
+  pages and give up on the whole document at the first page that failed;
+  a block with no letters (a page number, a year) is now left as it is
+  without asking the translator.
 - **Redaction: the black is the box on a page with a user unit (#134).** On
   a page whose `/UserUnit` is above 1 (drawn that many times larger than its
   numbers say), PyMuPDF drew a redaction's black fill at the box's size in
@@ -1817,6 +1951,12 @@
   appeared anywhere in code, dependency files, or git history outside this one
   line — nothing to correct it *to*, so it's removed rather than replaced with
   a fabricated event.
+  - **Correction (#121):** this was wrong. The CVE is real, and stanza was
+    part of the toolkit: argostranslate 1.11.0 requires stanza 1.10.1, and
+    `translate_runtime_lock.json` pinned it, with PyTorch, for the
+    translation runtime that setup installs. Fixed by #121, which leaves
+    stanza (and PyTorch and spaCy) out of the runtime; see Security under
+    Unreleased.
 - **README no longer advertises a removed Windows context-menu + About dialog
   (DOC-01).** Both belonged to the native-Qt widget UI deleted in v4.21; a
   repo-wide grep for `winreg`/`HKEY_`/About-dialog code returns nothing.

@@ -316,3 +316,51 @@ answers:
   `bridgeApi.cancel` as the bridge does (a done payload with `cancelled`),
   and the Redact search word `nothing` shows the nothing-found note.
   `web-react/dist/` rebuilt.
+
+### #121 — Translation offline after setup; no silent English (2026-11-23)
+
+No new slot; three payloads change.
+
+- **`startTranslatePdf` done payload.** `results` gains
+  **`untranslatedBlocks`**, the number of text blocks that could not be
+  translated and were kept as they were. A run in which no block could be
+  translated now fails (`success: false`, nothing saved) with a message
+  that starts "None of the text could be translated, so nothing was saved."
+  and gives the first reason (often "The sentence model for German isn't
+  installed. Run translation setup again."). `TranslatePage.tsx` shows
+  "N text blocks couldn't be translated and were left as they were." under
+  the saved file ("1 text block couldn't be translated and was left as it
+  was." for one).
+- **`startSetupTranslation` done payload.** `results` gains
+  **`sentenceModels`**, the sentence models now in place (the chosen
+  languages' and English's).
+- **Translation status (`getTranslationStatus`, `startGetTranslationStatus`).**
+  Same shape; a language's `translateTo`/`translateFrom` are true only when
+  its packs, its sentence model and English's are installed. The Translate
+  page now counts itself ready when some language other than English can be
+  translated both ways (it used to look only at `argosPairs`), so a set-up
+  made before the sentence models were needed shows the setup card, and
+  running it again completes it. The setup card says each language also
+  installs a small model for splitting its sentences.
+- **Mocks.** The setup mock returns `sentenceModels`; the PDF mock returns
+  `untranslatedBlocks: 0`, or 2 when "partial" is among the words kept
+  untranslated. `web-react/dist/` rebuilt.
+
+### #120 — The activity log: detailed log and Clear logs (2026-11-23)
+
+Three new synchronous slots, all on the home screen's new "Activity log"
+panel (`HomePage.tsx`, below the tool sections):
+
+| Slot | Returns | Used for |
+|------|---------|----------|
+| `getLogSettings()` | `{"detailedLog": bool}` | The switch's state when the home screen opens |
+| `setDetailedLog(on: bool)` | `{"detailedLog": bool}` | "Detailed log (includes file names)": saved in QSettings `diagnostics/detailedLog` and applied at once (`app_log.set_detailed`) |
+| `clearLogs()` | `{"success": bool, "removed": n}` (and `error` if it failed) | "Clear logs": the page shows "Logs cleared." |
+
+- **Types.** `BridgeAPI` in `types/global.d.ts`; the raw slots and their
+  JSON parsing in `qwebchannel-connect.ts`.
+- **Mocks.** `bridgeApi.ts` keeps the switch for the page's lifetime and
+  answers Clear logs with `{success: true, removed: 2}`.
+- **No payload changes.** `getWorkspaceDir` returns the same string; the
+  folder now holds an owner file and is deleted when the app quits.
+  `web-react/dist/` rebuilt.

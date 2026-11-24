@@ -397,8 +397,8 @@ def epdf_encrypt(input_path: str, output_path: str, password: str,
         raise
 
     output_size = os.path.getsize(output_path)
-    log.info("EPDF encrypted %s → %s (%s, %s)",
-             input_path, output_path, cipher, kdf)
+    log.info("EPDF encrypted (%s, %s, %d bytes)", cipher, kdf, output_size)
+    log.debug("EPDF encrypted %s -> %s", input_path, output_path)
 
     return {
         "input_size":  file_size,
@@ -484,8 +484,8 @@ def epdf_decrypt(input_path: str, output_path: str, password: str) -> dict:
 
     input_size = os.path.getsize(input_path)
     output_size = os.path.getsize(output_path)
-    log.info("EPDF decrypted %s → %s (%s, %s)",
-             input_path, output_path, cipher, kdf)
+    log.info("EPDF decrypted (%s, %s, %d bytes)", cipher, kdf, output_size)
+    log.debug("EPDF decrypted %s -> %s", input_path, output_path)
 
     return {
         "input_size":      input_size,

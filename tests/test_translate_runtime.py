@@ -78,16 +78,116 @@ class TestShippedLockfile:
             assert w["size"] > 0
             assert w["version"] in w["filename"], w
 
-    def test_contains_the_ml_stack(self):
-        # The whole point of the runtime: the packages excluded from the
-        # frozen bundle (pdf_toolkit.spec) must be provided by the lock.
+    def test_contains_the_translation_stack_and_nothing_it_does_not_use(self):
+        # The packages excluded from the frozen bundle (pdf_toolkit.spec) that
+        # translation uses must be in the lock; stanza (and torch with it)
+        # and spacy are not: sentences are split with MiniSBD (#121).
         lock = json.loads(
             (Path(__file__).resolve().parent.parent / tr.LOCK_FILENAME)
             .read_text(encoding="utf-8"))
         names = {w["name"].lower() for w in lock["wheels"]}
-        for required in ("argostranslate", "torch", "stanza", "spacy",
-                        "ctranslate2", "sentencepiece", "sacremoses"):
+        for required in ("argostranslate", "ctranslate2", "sentencepiece", "sacremoses",
+                         "minisbd", "onnxruntime"):
             assert required in names, f"{required} missing from lockfile"
+        for dropped in ("stanza", "torch", "spacy", "thinc"):
+            assert dropped not in names, f"{dropped} is still in the lockfile"
+
+
+def _shipped_lock() -> dict:
+    return json.loads((Path(__file__).resolve().parent.parent / tr.LOCK_FILENAME)
+                      .read_text(encoding="utf-8"))
+
+
+class TestStanzaAndSpacyAreDropped:
+    """#121: argostranslate pins stanza==1.10.1 exactly (CVE-2026-54499,
+    CVE-2026-59974, CVE-2026-115878). The app splits sentences with MiniSBD
+    and never builds a stanza pipeline, and spacy is only used for argos'
+    spaCy splitter: both are dropped from the runtime, torch with stanza."""
+
+    def test_stanza_torch_and_spacy_are_not_locked(self):
+        names = {w["name"].lower() for w in _shipped_lock()["wheels"]}
+        assert not names & {"stanza", "torch", "spacy", "thinc"}
+
+    def test_the_lock_records_the_drops(self):
+        overrides = _shipped_lock().get("overrides") or {}
+        assert overrides["stanza"]["spec"] is None
+        assert overrides["stanza"]["replaces"] == "stanza==1.10.1"
+        assert "CVE-2026-54499" in overrides["stanza"]["reason"]
+        assert overrides["spacy"]["spec"] is None
+        assert overrides["spacy"]["replaces"] == "spacy"
+        assert "SPACY" in overrides["spacy"]["reason"]
+
+    def test_argostranslate_is_still_locked(self):
+        names = {w["name"].lower() for w in _shipped_lock()["wheels"]}
+        assert "argostranslate" in names
+
+    def test_the_overrides_drop_both(self):
+        assert tr.LOCK_OVERRIDES == {"stanza": None, "spacy": None}
+
+    def test_the_heavy_stack_is_no_longer_held_to_the_venv(self):
+        assert not {"torch", "spacy", "thinc"} & set(tr.LOCK_CONSTRAIN_TO_ENV)
+        assert {"ctranslate2", "onnxruntime", "sentencepiece", "sacremoses",
+                "numpy"} <= set(tr.LOCK_CONSTRAIN_TO_ENV)
+
+
+class TestRewriteRequirements:
+    """The pure function make_lockfile rewrites the roots' requirements with."""
+
+    def test_an_exact_pin_is_replaced(self):
+        out, replaced = tr.rewrite_requirements(
+            ["ctranslate2<5,>=4.0", "stanza==1.10.1", "spacy"], {"stanza": "==1.15.1"})
+        assert out == ["ctranslate2<5,>=4.0", "stanza==1.15.1", "spacy"]
+        assert replaced == {"stanza": ["stanza==1.10.1"]}
+
+    def test_a_none_override_drops_the_requirement(self):
+        reqs = ["ctranslate2<5,>=4.0", "minisbd", "stanza==1.10.1", "spacy",
+                'tomli; python_version < "3.11"']
+        out, replaced = tr.rewrite_requirements(reqs, {"stanza": None, "spacy": None})
+        assert out == ["ctranslate2<5,>=4.0", "minisbd", 'tomli; python_version < "3.11"']
+        assert replaced == {"stanza": ["stanza==1.10.1"], "spacy": ["spacy"]}
+
+    def test_markers_and_extras_are_kept(self):
+        out, _ = tr.rewrite_requirements(
+            ['stanza[tokenizers] (==1.10.1) ; python_version < "3.15"'], {"stanza": "==1.15.1"})
+        assert out == ['stanza[tokenizers]==1.15.1; python_version < "3.15"']
+
+    def test_other_requirements_are_untouched(self):
+        reqs = ["minisbd", "sacremoses<0.2,>=0.0.53", 'tomli; python_version < "3.11"',
+                "stanzas==2.0"]
+        out, replaced = tr.rewrite_requirements(reqs, {"stanza": "==1.15.1"})
+        assert out == reqs and replaced == {}
+
+    @pytest.mark.parametrize("written", ["Stanza==1.10.1", "STANZA ==1.10.1", "stanza (==1.10.1)"])
+    def test_names_are_compared_as_pep_503_normalizes_them(self, written):
+        out, replaced = tr.rewrite_requirements([written], {"stanza": "==1.15.1"})
+        assert out[0].lower().replace(" ", "") == "stanza==1.15.1"
+        assert list(replaced) == ["stanza"]
+
+    def test_separators_normalize_too(self):
+        out, replaced = tr.rewrite_requirements(["Typing.Extensions>=4"],
+                                                {"typing_extensions": ">=4.16"})
+        assert out == ["Typing.Extensions>=4.16"]
+        assert replaced == {"typing-extensions": ["Typing.Extensions>=4"]}
+
+
+class TestLockConstraints:
+    def test_a_package_not_installed_is_held_to_the_current_lock(self, monkeypatch):
+        """#121: the dev venv no longer carries the ML stack; without this,
+        torch and the rest would float to whatever is newest."""
+        from importlib import metadata
+
+        def version(name):
+            if name == "numpy":
+                return "9.9.9"
+            raise metadata.PackageNotFoundError(name)
+        monkeypatch.setattr(metadata, "version", version)
+        lock = {"wheels": [{"name": "sentencepiece", "version": "0.2.1"},
+                           {"name": "ctranslate2", "version": "4.8.0"},
+                           {"name": "numpy", "version": "2.5.0"}]}
+        constraints = tr.lock_constraints(lock)
+        assert "sentencepiece==0.2.1" in constraints and "ctranslate2==4.8.0" in constraints
+        assert "numpy==9.9.9" in constraints          # installed: the venv's own
+        assert not any(c.startswith("onnxruntime") for c in constraints)   # in neither
 
 
 # ─────────────────────────────────────────────────────── paths / status

@@ -78,20 +78,35 @@ alone. If a change makes a doc wrong, fixing the doc is part of that change.
   the CSP sets `connect-src 'none'`. Don't add anything that phones home.
   The ONLY sanctioned network use is explicit, user-initiated setup:
   translation's in-app flow (`translate_runtime.install_runtime` +
-  `pdf_translate.install_languages`, behind a button in the Translate tool)
-  and the `setup_translation.py` CLI; and fetching the pinned OCR language
-  file with `setup_ocr.py` (`pdf_ocr.install_language_data`, #128 — never
-  during a redaction). Nothing else may touch the network.
+  `pdf_translate.install_languages`, which also fetches the pinned sentence
+  models, behind a button in the Translate tool) and the
+  `setup_translation.py` CLI; and fetching the pinned OCR language file with
+  `setup_ocr.py` (`pdf_ocr.install_language_data`, #128 — never during a
+  redaction). Nothing else may touch the network: a translation checks its
+  sentence models are there instead of letting MiniSBD download them (#121).
+  README "What goes online" lists every call site; keep it true.
 
-- **The frozen build must not bundle the translation ML stack.**
-  torch/spacy/stanza/ctranslate2/… are excluded in `pdf_toolkit.spec` — a
-  frozen torch aborts natively at import (c10 abort, no traceback) and the
-  stack is ~1 GB for one tool. `translate_runtime.py` provisions it at
-  runtime from `translate_runtime_lock.json` (pinned wheels, user-writable
-  dir). If you bump translation dependency versions, regenerate the lock
-  (`python translate_runtime.py --make-lockfile`, needs network + the target
-  Python) and re-test the frozen build. `pdf_translate.py` must keep all ML
-  imports lazy for the same reason.
+- **The log names no files (#120).** Log what happened (tool, counts,
+  sizes, outcome) at INFO and above; a path, file name or output folder goes
+  in a `log.debug` line, which only the opt-in detailed log writes
+  (`app_log.py`; its scrubber is a safety net, not a licence). Never log a
+  password or document text. `tests/test_app_log.py` checks this.
+
+- **Start programs by full path (#120).** Never `shutil.which` or a bare
+  program name in `subprocess`: Windows looks in the current folder first.
+  Use `trusted_programs` (a setting or the install folders).
+
+- **The frozen build must not bundle the translation stack.**
+  argostranslate/ctranslate2/onnxruntime/minisbd/… are excluded in
+  `pdf_toolkit.spec`. `translate_runtime.py` provisions them at runtime from
+  `translate_runtime_lock.json` (pinned wheels, user-writable dir). The lock
+  leaves out stanza and spacy (`LOCK_OVERRIDES`, #121: stanza 1.10.1 carries
+  CVEs and pulls in torch); `pdf_translate._prepare_argos` puts a stand-in
+  where argostranslate imports stanza and makes it split with MiniSBD, whose
+  models are pinned in `translate_sbd_lock.json`. If you bump translation
+  dependency versions, regenerate the lock (`python translate_runtime.py
+  --make-lockfile`, needs network + the target Python) and re-test the frozen
+  build. `pdf_translate.py` must keep all translation imports lazy.
 
 - **The frontend build is committed.** `web-react/dist/` is checked in so end
   users need no Node. If you change `web-react/src/`, rebuild

@@ -223,7 +223,8 @@ class WebMainWindow(QMainWindow):
         # Provide the qwebchannel.js path to the bridge so JS can query it
         try:
             self._qwebchannel_js_path = _find_qwebchannel_js()
-            log.info("qwebchannel.js located at %s", self._qwebchannel_js_path)
+            log.info("qwebchannel.js found")
+            log.debug("qwebchannel.js located at %s", self._qwebchannel_js_path)
         except FileNotFoundError:
             log.warning("qwebchannel.js not found; WebChannel may not work")
             self._qwebchannel_js_path = ""
@@ -241,10 +242,12 @@ class WebMainWindow(QMainWindow):
         page = self._view.page()
         page.setWebChannel(self._channel)
 
-        # -- Hard offline enforcement --------------------------------------
-        # Block every non-local network request at the engine level so the
-        # app provably cannot phone home, even if a future change or
-        # dependency tried to. Reference is held so Qt doesn't GC it.
+        # -- Offline enforcement for the web interface ----------------------
+        # Block every non-local request the web view makes, at the engine
+        # level, so the interface cannot reach the network even if a future
+        # change to it tried to. This covers the web view only, not the
+        # Python side: the setup downloads in README "What goes online" run
+        # there. Reference is held so Qt doesn't GC it.
         self._offline_guard = install_offline_guard(page.profile())
 
         # Enable local file access and other useful settings
@@ -265,7 +268,8 @@ class WebMainWindow(QMainWindow):
 
         # -- Load the frontend HTML ----------------------------------------
         self._index_html_path = _resolve_index_html()
-        log.info("Loading frontend from %s", self._index_html_path)
+        log.info("Loading frontend")
+        log.debug("Loading frontend from %s", self._index_html_path)
         page.loadFinished.connect(self._on_page_loaded)
         self._view.setUrl(QUrl.fromLocalFile(self._index_html_path))
 
@@ -293,7 +297,8 @@ class WebMainWindow(QMainWindow):
     def _on_page_loaded(self, ok: bool):
         """Called when the web page finishes loading."""
         if not ok:
-            log.error("Failed to load frontend HTML from %s", self._index_html_path)
+            log.error("Failed to load the frontend HTML")
+            log.debug("Frontend HTML: %s", self._index_html_path)
             return
 
         log.info("Frontend loaded successfully")
@@ -345,4 +350,7 @@ class WebMainWindow(QMainWindow):
 
     def closeEvent(self, event):  # noqa: N802
         self.settings.setValue("theme", self._theme.name)
+        # Closing the window quits the app: stop running operations, then
+        # delete the workspace folder (#120).
+        self._bridge.shutdown()
         super().closeEvent(event)

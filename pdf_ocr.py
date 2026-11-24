@@ -46,7 +46,6 @@ import json
 import math
 import os
 import re
-import shutil
 import sys
 import time
 import zlib
@@ -56,6 +55,7 @@ from typing import Callable, Optional
 
 import fitz
 
+import trusted_programs
 from pdf_verify import page_to_picture_matrix, term_boxes
 
 LOCK_FILENAME = "ocr_data_lock.json"
@@ -132,15 +132,17 @@ def _tesseract_dirs() -> list:
     """The folders an installed Tesseract keeps its language data in.
 
     The places PyMuPDF's get_tessdata looks — TESSDATA_PREFIX, the tessdata
-    folder of a tesseract found on PATH, the usual system folders — found
-    by looking at folders only. get_tessdata asks the shell (``tesseract
+    folder of an installed tesseract, the usual system folders — found by
+    looking at folders only. get_tessdata asks the shell (``tesseract
     --list-langs``, ``where``, ``whereis``), and in the windowed app every
-    such command flashes a console window."""
+    such command flashes a console window. The tesseract is the one
+    trusted_programs finds (PDFTOOLKIT_TESSERACT or its install folders),
+    not one found on PATH or in the current folder (#120)."""
     found: list[Path] = []
     prefix = os.environ.get("TESSDATA_PREFIX")
     if prefix:
         found += [Path(prefix), Path(prefix) / "tessdata"]
-    exe = shutil.which("tesseract")
+    exe = trusted_programs.tesseract()
     if exe:
         home = Path(exe).resolve().parent
         found += [home / "tessdata", home.parent / "share" / "tessdata"]

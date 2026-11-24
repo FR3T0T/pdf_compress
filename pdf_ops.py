@@ -193,8 +193,8 @@ def merge_pdfs(
         raise
 
     output_size = os.path.getsize(output_path)
-    log.info("Merged %d files (%d pages) → %s (%d bytes)",
-             len(input_paths), total_pages, output_path, output_size)
+    log.info("Merged %d files (%d pages, %d bytes)", len(input_paths), total_pages, output_size)
+    log.debug("Merged %s -> %s", input_paths, output_path)
 
     return MergeResult(
         output_path=output_path,
@@ -379,7 +379,8 @@ def split_pdf(
         pages_per_output.append(end - start + 1)
 
     src.close()
-    log.info("Split %s into %d files", input_path, len(output_paths))
+    log.info("Split a PDF into %d files", len(output_paths))
+    log.debug("Split %s -> %s", input_path, output_paths)
 
     return SplitResult(
         input_path=input_path,
@@ -467,7 +468,8 @@ def apply_page_operations(
         raise
 
     ops_str = ", ".join(ops) if ops else "No changes"
-    log.info("Page ops on %s → %s: %s", input_path, output_path, ops_str)
+    log.info("Page ops: %s", ops_str)
+    log.debug("Page ops %s -> %s", input_path, output_path)
 
     return PageOpResult(
         input_path=input_path,
@@ -530,7 +532,8 @@ def protect_pdf(input_path, output_path, user_password="", owner_password="",
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    log.info("Protected %s → %s", input_path, output_path)
+    log.info("Protected a PDF")
+    log.debug("Protected %s -> %s", input_path, output_path)
 
 
 def unlock_pdf(input_path, output_path, password=""):
@@ -548,7 +551,8 @@ def unlock_pdf(input_path, output_path, password=""):
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    log.info("Unlocked %s → %s", input_path, output_path)
+    log.info("Unlocked a PDF")
+    log.debug("Unlocked %s -> %s", input_path, output_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -605,7 +609,8 @@ def pdf_to_images(input_path, output_dir, fmt="png", dpi=150, quality=85,
         image_paths.append(out_path)
 
     doc.close()
-    log.info("Exported %d pages from %s as %s", len(image_paths), input_path, fmt)
+    log.info("Exported %d pages as %s", len(image_paths), fmt)
+    log.debug("Exported pages of %s to %s", input_path, output_dir)
     return PdfToImagesResult(input_path, output_dir, image_paths, len(image_paths), fmt)
 
 
@@ -734,7 +739,8 @@ def images_to_pdf(image_paths, output_path, page_size="auto", margin_mm=10,
             os.unlink(tmp)
         raise
 
-    log.info("Created PDF from %d images → %s", len(image_paths), output_path)
+    log.info("Created a PDF from %d images", len(image_paths))
+    log.debug("Created %s from %s", output_path, image_paths)
     return ImagesToPdfResult(output_path, len(image_paths), len(image_paths))
 
 
@@ -794,7 +800,8 @@ def pdf_to_word(input_path, output_path, on_progress=None, cancel=None):
 
     pdf_doc.close()
     doc.save(output_path)
-    log.info("PDF to Word: %s → %s (%d pages)", input_path, output_path, num_pages)
+    log.info("PDF to Word (%d pages)", num_pages)
+    log.debug("PDF to Word %s -> %s", input_path, output_path)
     return PdfToWordResult(input_path, output_path, num_pages)
 
 
@@ -971,7 +978,8 @@ def add_watermark(input_path, output_path, text="WATERMARK", opacity=0.3,
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    log.info("Watermarked %s → %s", input_path, output_path)
+    log.info("Watermarked a PDF")
+    log.debug("Watermarked %s -> %s", input_path, output_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1067,7 +1075,8 @@ def add_page_numbers(input_path, output_path, position="bottom-center",
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    log.info("Added page numbers to %s → %s", input_path, output_path)
+    log.info("Added page numbers")
+    log.debug("Added page numbers %s -> %s", input_path, output_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1134,7 +1143,8 @@ def write_metadata(input_path, output_path, fields):
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    log.info("Updated metadata %s → %s", input_path, output_path)
+    log.info("Updated metadata")
+    log.debug("Updated metadata %s -> %s", input_path, output_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1233,7 +1243,8 @@ def extract_images(input_path, output_dir, fmt="png", min_size=0,
                 continue
 
     src.close()
-    log.info("Extracted %d images from %s", len(image_paths), input_path)
+    log.info("Extracted %d images", len(image_paths))
+    log.debug("Extracted images of %s to %s", input_path, output_dir)
     return ExtractImagesResult(input_path, output_dir, image_paths, len(image_paths))
 
 
@@ -1279,7 +1290,8 @@ def extract_text(input_path, output_path, page_range=None, cancel=None):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(full_text)
 
-    log.info("Extracted text from %s → %s", input_path, output_path)
+    log.info("Extracted text (%d pages, %d characters)", len(target_pages), len(full_text))
+    log.debug("Extracted text %s -> %s", input_path, output_path)
     return ExtractTextResult(input_path, output_path, len(target_pages), len(full_text))
 
 
@@ -1323,7 +1335,8 @@ def crop_pages(input_path, output_path, margins, unit="mm"):
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    log.info("Cropped %s → %s", input_path, output_path)
+    log.info("Cropped a PDF")
+    log.debug("Cropped %s -> %s", input_path, output_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1372,7 +1385,8 @@ def flatten_pdf(input_path, output_path, annotations=True, forms=True):
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    log.info("Flattened %s → %s", input_path, output_path)
+    log.info("Flattened a PDF")
+    log.debug("Flattened %s -> %s", input_path, output_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1464,7 +1478,8 @@ def nup_layout(input_path, output_path, pages_per_sheet=4,
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    log.info("N-up %d pages/sheet %s → %s", pages_per_sheet, input_path, output_path)
+    log.info("N-up, %d pages per sheet", pages_per_sheet)
+    log.debug("N-up %s -> %s", input_path, output_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1488,7 +1503,8 @@ def repair_pdf(input_path, output_path):
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    log.info("Repaired %s → %s", input_path, output_path)
+    log.info("Repaired a PDF")
+    log.debug("Repaired %s -> %s", input_path, output_path)
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -1,22 +1,23 @@
 """
 translate_runtime — on-demand provisioning of the offline-translation runtime.
 
-WHY THIS EXISTS: the Translate tool's ML stack (argostranslate → stanza →
-torch, plus spacy/thinc/ctranslate2/onnxruntime/…) is ~700 MB of
-site-packages for one tool out of 22, and frozen PyTorch does not survive
-PyInstaller on this stack (native c10 abort inside torch_python.dll during
-import — no Python traceback). So the frozen build EXCLUDES the whole ML
-stack (see pdf_toolkit.spec) and this module provisions it at runtime
-instead: wheels are downloaded once into a user-writable directory,
-verified against the pinned lockfile, unpacked, and appended to sys.path.
-The stack then imports from a real directory exactly like a source
-checkout (which works), sidestepping frozen-torch entirely.
+WHY THIS EXISTS: the Translate tool's stack (argostranslate, ctranslate2,
+sentencepiece, onnxruntime for MiniSBD's sentence splitter, …) is tens of
+MB of native wheels for one tool out of 22, kept out of the frozen build
+(see pdf_toolkit.spec) and provisioned at run time instead: wheels are
+downloaded once into a user-writable directory, verified against the
+pinned lockfile, unpacked, and appended to sys.path, so the stack imports
+from a real directory exactly like a source checkout. (Until #121 it also
+carried stanza, torch and spacy — about 204 MB — and frozen PyTorch does
+not survive PyInstaller; LOCK_OVERRIDES drops them: sentences are split
+with MiniSBD.)
 
 The download happens only when the user explicitly starts it from the
-Translate tool (or setup_translation.py). After that one-time step,
-translation runs fully offline. A source checkout with argostranslate in
-the venv never needs any of this — activate() is a no-op when the stack
-is already importable.
+Translate tool (or setup_translation.py), together with the language packs
+and their sentence models (pdf_translate.install_languages). After that,
+translation makes no network connection. A source checkout with
+argostranslate in the venv never needs any of this — activate() is a no-op
+when the stack is already importable.
 
 Lockfile: translate_runtime_lock.json (repo root, bundled beside this
 module in the frozen build) pins every wheel by name/version/url/sha256 —
@@ -32,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import zipfile
@@ -53,12 +55,36 @@ LOCK_ROOTS = ["argostranslate"]
 # Heavy native packages mirrored from the generating venv (the combination
 # actually tested from source). Everything else resolves freely from the
 # roots' metadata — deliberately NOT the whole venv: a full freeze
-# over-constrains (e.g. a venv stanza newer than argostranslate's own pin
+# over-constrains (e.g. a venv package newer than argostranslate's own pin
 # makes resolution impossible).
 LOCK_CONSTRAIN_TO_ENV = [
-    "torch", "ctranslate2", "spacy", "thinc", "onnxruntime",
-    "sentencepiece", "sacremoses", "numpy",
+    "ctranslate2", "onnxruntime", "sentencepiece", "sacremoses", "numpy",
 ]
+
+# Requirements of the roots changed before resolving (#121): a version
+# specifier puts that in place of the root's own; None drops the
+# requirement. pip has no way to override a dependency's pin, and every
+# argostranslate release pins stanza exactly (1.10.0 and 1.11.0:
+# stanza==1.10.1; 1.9.x: ==1.1.1).
+#   stanza: 1.10.1 is affected by CVE-2026-54499 (unsafe pickle fallback in
+#     model loading, <=1.12.1, fixed in 1.12.2), CVE-2026-59974 (zip slip
+#     when stanza unzips its resources, <1.14.0, fixed in 1.14.0) and
+#     CVE-2026-115878 (pickle in the lemmatizer, 1.14.0 only, fixed in
+#     1.15.0). The app splits sentences with MiniSBD and never builds a
+#     stanza pipeline (pdf_translate puts a stand-in in its place, since
+#     argostranslate.sbd imports stanza at the top), so it is not shipped,
+#     and torch, which only stanza needs, goes with it.
+#   spacy: argostranslate imports it only for its spaCy sentence splitter
+#     (ChunkType.SPACY), which the app does not use; thinc goes with it.
+LOCK_OVERRIDES = {"stanza": None, "spacy": None}
+OVERRIDE_REASONS = {
+    "stanza": ("argostranslate pins stanza==1.10.1 (CVE-2026-54499, fixed 1.12.2; "
+               "CVE-2026-59974, fixed 1.14.0; CVE-2026-115878, fixed 1.15.0); the app "
+               "splits sentences with MiniSBD and never builds a stanza pipeline, so "
+               "stanza, and torch with it, is not shipped"),
+    "spacy": ("argostranslate uses spacy only for its spaCy sentence splitter "
+              "(ChunkType.SPACY), which the app does not use"),
+}
 
 ProgressFn = Callable[[int, int, str], None]
 CancelFn = Callable[[], bool]
@@ -135,8 +161,8 @@ def runtime_installed() -> bool:
 def _native_stack_present() -> bool:
     """Is argostranslate importable WITHOUT the provisioned runtime?
 
-    find_spec is used instead of importing (importing argos pulls in the
-    whole torch stack — seconds of work); an origin under runtime_dir()
+    find_spec is used instead of importing (importing argos pulls in
+    ctranslate2 and the rest — seconds of work); an origin under runtime_dir()
     doesn't count as native.
     """
     import importlib.util
@@ -307,41 +333,129 @@ def install_runtime(progress: Optional[ProgressFn] = None,
 #  Lockfile generator (dev-only; needs network + the target Python)
 # ════════════════════════════════════════════════════════════════════
 
-def make_lockfile() -> dict:
-    """Resolve LOCK_ROOTS with pip against the current environment's
-    installed versions (as constraints) and write the lockfile.
+# A PEP 508 requirement as Requires-Dist writes it: a name, extras, a
+# version specifier (bare, or in parentheses in older metadata) and an
+# environment marker after ";".
+_REQUIREMENT = re.compile(
+    r"^\s*(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*"
+    r"(?P<extras>\[[^\]]*\])?\s*"
+    r"(?P<spec>\(?[^;()]*\)?)?\s*"
+    r"(?P<marker>;.*)?$")
 
-    Run on the same Python/platform the frozen app targets — the lock
-    records exactly the combination that was tested from source.
-    """
-    import subprocess
-    import tempfile
-    import urllib.request
+
+def normalize_name(name: str) -> str:
+    """A project name as PEP 503 compares it."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def rewrite_requirements(requirements: list, overrides: dict) -> tuple:
+    """*requirements* (PEP 508 strings, as in Requires-Dist) with every
+    requirement on an overridden project changed (#121): an override that is
+    a version specifier takes the place of the requirement's own; one that
+    is None drops the requirement. Names are compared normalized (PEP 503);
+    the requirement's own spelling of the name, its extras and its
+    environment marker are kept; every other requirement is returned as it
+    was.
+
+    Returns (rewritten requirements, {normalized name: [the requirements that
+    were changed, each written plainly: "stanza==1.10.1" for metadata's
+    "stanza (==1.10.1)"]}), the second for the lock's record."""
+    wanted = {normalize_name(name): spec for name, spec in overrides.items()}
+    out, replaced = [], {}
+    for text in requirements:
+        m = _REQUIREMENT.match(text)
+        key = normalize_name(m.group("name")) if m else None
+        if key not in wanted:
+            out.append(text)
+            continue
+        marker = m.group("marker")
+        tail = f"; {marker[1:].strip()}" if marker else ""
+        head = f"{m.group('name')}{m.group('extras') or ''}"
+        old = (m.group("spec") or "").strip().strip("()").replace(" ", "")
+        replaced.setdefault(key, []).append(f"{head}{old}{tail}")
+        if wanted[key] is not None:          # None drops the requirement
+            out.append(f"{head}{wanted[key]}{tail}")
+    return out, replaced
+
+
+def lock_constraints(current_lock: Optional[dict]) -> list:
+    """The constraints make_lockfile resolves with: each LOCK_CONSTRAIN_TO_ENV
+    package at the version installed here — the combination tested from
+    source — or, when it is not installed, at its version in the current
+    lock. The dev venv may no longer carry the ML stack (it is provisioned
+    at run time); unconstrained, ctranslate2 and the rest would float to whatever
+    is newest on the day the lock is made, untested (#121)."""
     from importlib import metadata
 
+    locked = {normalize_name(w["name"]): w["version"]
+              for w in (current_lock or {}).get("wheels", [])}
     constraints = []
     for name in LOCK_CONSTRAIN_TO_ENV:
         try:
             constraints.append(f"{name}=={metadata.version(name)}")
         except metadata.PackageNotFoundError:
-            pass
+            if normalize_name(name) in locked:
+                constraints.append(f"{name}=={locked[normalize_name(name)]}")
+    return constraints
+
+
+def _pip_report(requirements: list, constraints_file: str, workdir: str,
+                no_deps: bool = False) -> dict:
+    """pip's dry-run install report for *requirements* (wheels only)."""
+    import subprocess
+
+    report_file = os.path.join(workdir, "report-nodeps.json" if no_deps else "report.json")
+    cmd = [sys.executable, "-m", "pip", "install", "--dry-run",
+           "--ignore-installed", "--only-binary=:all:",
+           "--report", report_file, "-c", constraints_file,
+           *(["--no-deps"] if no_deps else []), *requirements]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeInstallError(f"pip resolve failed:\n{res.stderr}")
+    with open(report_file, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def make_lockfile() -> dict:
+    """Resolve LOCK_ROOTS with pip and write the lockfile.
+
+    (a) The roots alone (--no-deps): their wheels and Requires-Dist.
+    (b) Their requirements with LOCK_OVERRIDES applied (rewrite_requirements):
+        argostranslate's stanza==1.10.1 and spacy dropped.
+    (c) That list resolved, with lock_constraints.
+    (d) The two merged.
+    (e) The overrides recorded in the lock: what was asked for, what it
+        replaced, and why.
+
+    Run on the same Python/platform the frozen app targets — the lock
+    records exactly the combination that was tested from source.
+    """
+    import tempfile
+    import urllib.request
+
+    try:
+        current = load_lock()
+    except Exception:
+        current = None
+    constraints = lock_constraints(current)
 
     with tempfile.TemporaryDirectory() as td:
         cfile = os.path.join(td, "constraints.txt")
         with open(cfile, "w", encoding="utf-8") as fh:
             fh.write("\n".join(sorted(constraints)))
-        report_file = os.path.join(td, "report.json")
-        cmd = [sys.executable, "-m", "pip", "install", "--dry-run",
-               "--ignore-installed", "--only-binary=:all:",
-               "--report", report_file, "-c", cfile, *LOCK_ROOTS]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeInstallError(f"pip resolve failed:\n{res.stderr}")
-        with open(report_file, encoding="utf-8") as fh:
-            report = json.load(fh)
+        roots = _pip_report(LOCK_ROOTS, cfile, td, no_deps=True)["install"]
+        # Requirements behind an extra are not installed with the roots.
+        requires = [r for item in roots for r in item["metadata"].get("requires_dist") or []
+                    if "extra" not in (r.split(";", 1)[1] if ";" in r else "")]
+        rewritten, replaced = rewrite_requirements(requires, LOCK_OVERRIDES)
+        deps = _pip_report(rewritten, cfile, td)["install"]
+
+    items = {}
+    for item in [*roots, *deps]:
+        items.setdefault(normalize_name(item["metadata"]["name"]), item)
 
     wheels = []
-    for item in report["install"]:
+    for item in items.values():
         url = item["download_info"]["url"]
         sha = item["download_info"].get("archive_info", {}).get("hashes", {}).get("sha256")
         meta = item["metadata"]
@@ -368,6 +482,11 @@ def make_lockfile() -> dict:
         "python": f"cp{sys.version_info.major}{sys.version_info.minor}",
         "platform": sys.platform,
         "roots": LOCK_ROOTS,
+        "overrides": {
+            name: {"spec": spec,
+                   "replaces": "; ".join(replaced.get(normalize_name(name), [])) or None,
+                   "reason": OVERRIDE_REASONS.get(name, "")}
+            for name, spec in LOCK_OVERRIDES.items()},
         "wheels": wheels,
     }
     with open(lock_path(), "w", encoding="utf-8") as fh:

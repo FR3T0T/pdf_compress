@@ -29,10 +29,8 @@ DPI-aware image recompression with:
 import hashlib
 import io
 import logging
-import logging.handlers
 import math
 import os
-import platform
 import re
 import shutil
 import stat
@@ -46,6 +44,8 @@ from typing import Callable, Optional
 import pikepdf
 from PIL import Image
 
+import trusted_programs
+
 try:
     import numpy as np
     HAS_NUMPY = True
@@ -55,46 +55,7 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-# ── File logging setup ──────────────────────────────────────────
-_LOG_DIR: Optional[str] = None
-
-
-def setup_file_logging(log_dir: Optional[str] = None) -> str:
-    """
-    Configure file-based logging for diagnostics.
-    Returns the log file path.
-    """
-    global _LOG_DIR
-    if log_dir is None:
-        if platform.system() == "Windows":
-            appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
-            log_dir = os.path.join(appdata, "PDFCompress", "logs")
-        elif platform.system() == "Darwin":
-            log_dir = os.path.expanduser("~/Library/Logs/PDFCompress")
-        else:
-            log_dir = os.path.expanduser("~/.local/share/PDFCompress/logs")
-
-    os.makedirs(log_dir, exist_ok=True)
-    _LOG_DIR = log_dir
-
-    log_file = os.path.join(log_dir, "pdfcompress.log")
-
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_file, maxBytes=5 * 1024 * 1024, backupCount=3,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-
-    root_logger = logging.getLogger()
-    root_logger.addHandler(file_handler)
-    if root_logger.level > logging.DEBUG:
-        root_logger.setLevel(logging.DEBUG)
-
-    return log_file
+# The activity log is set up by app_log.setup_file_logging (#120).
 
 
 # ── Decompression bomb protection ────────────────────────────────
@@ -174,10 +135,12 @@ def create_backup(filepath: str) -> Optional[str]:
 
     try:
         shutil.copy2(filepath, backup_path)
-        log.info("Backup created: %s", backup_path)
+        log.info("Backup created")
+        log.debug("Backup created: %s", backup_path)
         return backup_path
     except OSError as e:
-        log.warning("Failed to create backup of %s: %s", filepath, e)
+        log.warning("Failed to create a backup: %s", e)
+        log.debug("Backup failed for %s", filepath)
         return None
 
 
@@ -1231,9 +1194,12 @@ def optimize_structure(pdf: pikepdf.Pdf, strip_meta: bool = False):
 
 def find_ghostscript(*, force_refresh: bool = False) -> Optional[str]:
     """
-    Check for Ghostscript on PATH. Result is cached after first call.
-    Returns the executable name/path if found, None otherwise.
-    Checks: gs, gswin64c, gswin32c
+    The absolute path of a working Ghostscript, or None. Cached after the
+    first call.
+
+    Taken from PDFTOOLKIT_GHOSTSCRIPT or Ghostscript's install folders only
+    (trusted_programs.ghostscript, #120) — never a search of PATH or the
+    current folder, where a file named like it would run instead.
     """
     cache_key = "gs"
     with _gs_cache_lock:
@@ -1241,19 +1207,14 @@ def find_ghostscript(*, force_refresh: bool = False) -> Optional[str]:
             return _gs_cache[cache_key]
 
     result_path = None
-    for candidate in ("gs", "gswin64c", "gswin32c"):
-        path = shutil.which(candidate)
-        if path is not None:
-            try:
-                result = subprocess.run(
-                    [path, "--version"],
-                    capture_output=True, timeout=10,
-                )
-                if result.returncode == 0:
-                    result_path = path
-                    break
-            except (subprocess.TimeoutExpired, OSError):
-                continue
+    path = trusted_programs.ghostscript()
+    if path is not None:
+        try:
+            result = subprocess.run([path, "--version"], capture_output=True, timeout=10)
+            if result.returncode == 0:
+                result_path = path
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
     with _gs_cache_lock:
         _gs_cache[cache_key] = result_path
@@ -1567,7 +1528,8 @@ def analyze_pdf(path: str, password: Optional[str] = None) -> PDFAnalysis:
             gs_available=gs_available,
         )
     except Exception as exc:
-        log.warning("Failed to analyze %s: %s", path, exc)
+        log.warning("Failed to analyze a PDF: %s", exc)
+        log.debug("Analysis failed for %s", path)
         return PDFAnalysis(
             file_size=file_size, page_count=0,
             image_count=0, image_bytes=0,
@@ -1834,13 +1796,11 @@ def compress_pdf(
             pdfa_level = detect_pdfa_conformance(pdf)
             pdfa_warning = False
             if pdfa_level:
-                log.info("Detected %s conformance in %s", pdfa_level, input_path)
+                log.info("Detected %s conformance", pdfa_level)
+                log.debug("%s conformance in %s", pdfa_level, input_path)
                 if preset.strip_metadata:
                     pdfa_warning = True
-                    log.warning(
-                        "%s: stripping metadata will break %s conformance",
-                        os.path.basename(input_path), pdfa_level,
-                    )
+                    log.warning("Stripping metadata will break %s conformance", pdfa_level)
 
             stats = compress_images_smart(pdf, preset, on_progress, cancel)
 

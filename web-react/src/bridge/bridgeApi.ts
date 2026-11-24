@@ -24,6 +24,8 @@ export const isRealBridge = (): boolean => typeof window !== 'undefined' && !!wi
 
 const MOCK_DELAY_MS = 450;
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// Browser-dev mock of the detailed-log switch (#120).
+let mockDetailedLog = false;
 
 function basenameOf(path: string): string {
   return path.split(/[/\\]/).pop() ?? path;
@@ -347,6 +349,8 @@ export const bridgeApi = {
         installed: (params.codes as string[] | undefined)?.length ?? 0,
         skipped: 0,
         requested: (params.codes as string[] | undefined)?.length ?? 0,
+        // The chosen languages' sentence models and English's (#121).
+        sentenceModels: ((params.codes as string[] | undefined)?.length ?? 0) + 1,
       }));
     }
   },
@@ -383,6 +387,8 @@ export const bridgeApi = {
         pages: 6,
         source: params.source === 'auto' ? 'en' : String(params.source ?? 'en'),
         target: String(params.target ?? 'es'),
+        // Blocks kept as they were (#121); the kept word "partial" shows two.
+        untranslatedBlocks: ((params.protectTerms as string[] | undefined) ?? []).includes('partial') ? 2 : 0,
       }));
     }
   },
@@ -778,6 +784,24 @@ export const bridgeApi = {
   async loadSetting(key: string): Promise<string | null> {
     if (window.BridgeAPI) return window.BridgeAPI.loadSetting(key);
     return '';
+  },
+
+  // -- Activity log (#120): the home screen's panel ------------------------
+  // Browser-dev mock: the switch is remembered for the page's lifetime, and
+  // clearing removes two files.
+  async getLogSettings(): Promise<{ detailedLog: boolean }> {
+    if (window.BridgeAPI) return window.BridgeAPI.getLogSettings();
+    return { detailedLog: mockDetailedLog };
+  },
+  async setDetailedLog(on: boolean): Promise<{ detailedLog: boolean }> {
+    if (window.BridgeAPI) return window.BridgeAPI.setDetailedLog(on);
+    mockDetailedLog = on;
+    return { detailedLog: mockDetailedLog };
+  },
+  async clearLogs(): Promise<{ success: boolean; removed: number; error?: string }> {
+    if (window.BridgeAPI) return window.BridgeAPI.clearLogs();
+    await delay(MOCK_DELAY_MS);
+    return { success: true, removed: 2 };
   },
 
   // -- Utility helpers (pure JS, no bridge call) ---------------------------

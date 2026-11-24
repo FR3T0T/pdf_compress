@@ -16,6 +16,8 @@ interface Language {
   code: string;
   name: string;
   native?: string;
+  // True only with the language packs AND the sentence models installed
+  // (#121) — see pdf_translate.translation_status.
   translateTo?: boolean;
   translateFrom?: boolean;
 }
@@ -38,6 +40,8 @@ interface SetupResult {
   installed?: number;
   skipped?: number;
   requested?: number;
+  // Sentence models now in place: the chosen languages' and English's (#121).
+  sentenceModels?: number;
   status?: TranslationStatus;
 }
 interface ImageTranslateResult {
@@ -55,8 +59,17 @@ interface PdfTranslateResult {
   source: string;
   target: string;
   note?: string;
+  // Text blocks that could not be translated and were kept as they were
+  // (#121); a run in which none could be translated fails instead.
+  untranslatedBlocks?: number;
 }
 type TranslateResult = PdfTranslateResult | ImageTranslateResult;
+
+function untranslatedNote(n: number): string {
+  return n === 1
+    ? "1 text block couldn't be translated and was left as it was."
+    : `${n} text blocks couldn't be translated and were left as they were.`;
+}
 type TranslateMode = 'image' | 'pdf';
 
 type OutputFormat = 'pdf' | 'docx' | 'txt';
@@ -104,8 +117,8 @@ function defaultTarget(langs: Language[]): string {
  * is in flight so the result/progress UI knows how to interpret
  * op.result.results, since the two flows return different shapes.
  * translate_pdf's result ({output, outputSize, pages, source, target,
- * files, output_dir}, verified in pdf_translate.py) is one of the pages
- * vanilla already reads correctly via data.results.
+ * files, output_dir, untranslatedBlocks}, verified in pdf_translate.py) is
+ * one of the pages vanilla already reads correctly via data.results.
  */
 export function TranslatePage() {
   const toast = useToast();
@@ -356,7 +369,12 @@ export function TranslatePage() {
   };
 
   const running = op.status === 'running';
-  const ready = !!status?.argosAvailable && (status?.argosPairs.length ?? 0) > 0;
+  // Ready once at least one language can be translated both ways. Packs
+  // alone are not enough: each language also needs its sentence model
+  // (#121), so a set-up from before those were needed shows the setup card.
+  const ready =
+    !!status?.argosAvailable &&
+    (status?.languages ?? []).some((l) => l.code !== 'en' && l.translateTo && l.translateFrom);
   const runtime = status?.runtime;
   const needsEngine = !!runtime?.needed && !runtime.installed;
   const setupRunning = setupOp.status === 'running';
@@ -434,8 +452,8 @@ export function TranslatePage() {
                 Set up offline translation
               </div>
               <div style={{ color: 'var(--text-2)', fontSize: 'var(--font-size-sm)', marginBottom: 'var(--space-3)' }}>
-                Each language installs the English ↔ language model pair (other combinations pivot through
-                English automatically).
+                Each language installs the English ↔ language model pair and a small model for splitting
+                its sentences (other combinations pivot through English automatically).
                 {needsEngine
                   ? ` The first setup also downloads the translation engine (~${runtime?.downloadSizeMB ?? 0} MB).`
                   : ''}
@@ -705,6 +723,11 @@ export function TranslatePage() {
                 Open
               </button>
             </div>
+            {(pdfResult.untranslatedBlocks ?? 0) > 0 && (
+              <div style={{ marginTop: 8, color: 'var(--sev-medium)', fontSize: 'var(--font-size-sm)' }}>
+                {untranslatedNote(pdfResult.untranslatedBlocks ?? 0)}
+              </div>
+            )}
           </Card>
         </div>
       )}

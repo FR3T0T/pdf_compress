@@ -34,6 +34,9 @@ datas = [
     # translate_runtime.py resolves it beside its own module (repo root
     # from source, _internal/ frozen).
     (os.path.join(PROJECT_ROOT, "translate_runtime_lock.json"), "."),
+    # Pinned sentence models (#121) -- pdf_translate.py resolves it beside
+    # its own module; setup fetches the models it names.
+    (os.path.join(PROJECT_ROOT, "translate_sbd_lock.json"), "."),
     # Window icon -- app.py's _app_icon() resolves it beside app.py
     # (= _internal/ when frozen). The EXE() below embeds the same file
     # for Explorer/taskbar.
@@ -158,24 +161,24 @@ hiddenimports = _stdlib_imports + [
 excludes = [
     "tkinter",
     # NOTE: unittest is NOT excluded (it was, pre-runtime-provisioning):
-    # torch and friends import stdlib test helpers at runtime, and the
-    # runtime-provisioned ML stack must find the full stdlib in the
-    # bundle (see the stdlib hiddenimports above).
+    # runtime-provisioned packages may import stdlib test helpers (torch,
+    # when it was part of the stack, did), and they must find the full
+    # stdlib in the bundle (see the stdlib hiddenimports above).
     "test",
     "tests",
     "pytest",
-    # The entire translation ML stack is deliberately NOT bundled. Two
-    # reasons: (1) frozen PyTorch aborts natively at import on this stack
-    # (c10 AbortHandler inside torch_python.dll, Python 3.14 + PyInstaller
-    # 6.21) -- import argostranslate -> sbd -> stanza -> torch fires it;
-    # (2) it's ~1 GB of the bundle for one tool of 22. The Translate tool
-    # provisions these at runtime instead, into a user-writable dir via
-    # translate_runtime.py (pinned wheels, one-time explicit download) --
-    # where torch imports from a real directory layout exactly like a
-    # source checkout and works. pdf_translate.py only ever imports the
-    # stack lazily, so freezing without it is safe for the other tools;
-    # these excludes stop PyInstaller's static analysis from collecting
-    # the venv copies.
+    # The translation stack is deliberately NOT bundled: the Translate tool
+    # provisions it at runtime instead, into a user-writable dir via
+    # translate_runtime.py (pinned wheels, one-time explicit download), so
+    # the build carries nothing for a tool most people may never set up.
+    # pdf_translate.py only ever imports the stack lazily, so freezing
+    # without it is safe for the other tools; these excludes stop
+    # PyInstaller's static analysis from collecting the venv copies.
+    # torch, stanza, spacy and thinc are no longer part of the stack at all
+    # (#121: argostranslate splits sentences with MiniSBD, and pdf_translate
+    # puts a stand-in where it imports stanza) -- they stay listed so a
+    # build venv that still has them never bundles them (a frozen torch
+    # also aborted natively at import).
     "argostranslate",
     "torch",
     "torchgen",

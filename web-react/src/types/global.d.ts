@@ -138,6 +138,13 @@ export interface RealBridgeAPI {
   // qwebchannel-connect.ts), not the raw wire string.
   loadSetting(key: string): Promise<string | null>;
 
+  // -- Activity log (#120) ------------------------------------------------
+  // The detailed log (off by default) names files and folders; clearLogs
+  // deletes the log and its rotated copies in the app's log folder.
+  getLogSettings(): Promise<{ detailedLog: boolean }>;
+  setDetailedLog(on: boolean): Promise<{ detailedLog: boolean }>;
+  clearLogs(): Promise<{ success: boolean; removed: number; error?: string }>;
+
   // -- Pure JS utility helpers (no bridge call) --------------------------
   formatSize(bytes: number): string;
   formatPct(value: number): string;

@@ -23,6 +23,7 @@ import argparse
 import os
 import sys
 
+from app_log import setup_file_logging
 from engine import (
     PRESET_ORDER,
     PRESETS,
@@ -31,7 +32,6 @@ from engine import (
     InvalidPDFError,
     compress_pdf,
     fmt_size,
-    setup_file_logging,
     validate_pdf_magic,
 )
 
@@ -82,12 +82,16 @@ def main():
     )
     parser.add_argument(
         "--log", action="store_true",
-        help="Enable file logging for diagnostics",
+        help="Write the activity log (no file names; see --detailed-log)",
+    )
+    parser.add_argument(
+        "--detailed-log", action="store_true",
+        help="Write the detailed activity log, which includes file names",
     )
     args = parser.parse_args()
 
-    if args.log:
-        log_file = setup_file_logging()
+    if args.log or args.detailed_log:
+        log_file = setup_file_logging(detailed=args.detailed_log)
         print(f"  Logging to: {log_file}")
 
     preset = PRESETS[args.preset]

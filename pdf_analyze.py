@@ -1761,7 +1761,8 @@ def analyze_image(path: str) -> dict:
         with Image.open(path) as img:
             tags, gps, ifd1 = _read_exif_blocks(img)
     except Exception as exc:
-        log.warning("EXIF read failed for %s: %s", path, exc)
+        log.warning("EXIF read failed: %s", exc)
+        log.debug("EXIF read failed for %s", path)
 
     scanners = (
         (_scan_image_gps, gps),

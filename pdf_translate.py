@@ -10,9 +10,11 @@ on-device:
                    images and scanned pages, with per-language trained data.
   * Detection    — langdetect for source-language auto-detection.
 
-Nothing here makes a network request.  The language models and OCR data
-are provisioned separately and explicitly by ``setup_translation.py`` (the
-one online step); after that, everything runs locally.
+Nothing here makes a network request except install_languages, the
+explicit setup step (the in-app setup button or ``setup_translation.py``),
+which fetches the language packs and the pinned sentence models; after
+that, everything runs locally, and a translation whose models are missing
+fails instead of fetching them (#121).
 
 The module is import-safe: heavy optional libraries (argostranslate,
 pytesseract, langdetect, PyMuPDF, python-docx) are imported lazily so the
@@ -23,6 +25,7 @@ with a clear, actionable message.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -30,6 +33,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import translate_runtime
+import trusted_programs
 
 log = logging.getLogger(__name__)
 
@@ -101,15 +105,61 @@ def supported_languages() -> list[dict]:
 #  Lazy backends
 # ════════════════════════════════════════════════════════════════════
 
+class StanzaNotShippedError(AttributeError):
+    """Something asked the stanza stand-in for part of stanza (#121)."""
+
+
+def _stanza_stand_in():
+    """A module that stands where stanza would be.
+
+    argostranslate.sbd imports stanza at its top, for a sentence splitter
+    (StanzaSentencizer) the app never uses: sentences are split with
+    MiniSBD (_prepare_argos). stanza is not shipped — argostranslate pins
+    stanza==1.10.1, which carries CVE-2026-54499, CVE-2026-59974 and
+    CVE-2026-115878, and needs torch — so `import stanza` gets this, and
+    anything that reaches into it gets a plain error, not a stanza."""
+    import importlib.machinery
+    import types
+
+    class StandIn(types.ModuleType):
+        def __getattr__(self, name):
+            raise StanzaNotShippedError(
+                f"stanza isn't part of PDF Toolkit's translation stack (sentences are split "
+                f"with MiniSBD), so stanza.{name} is not available.")
+
+    module = StandIn("stanza", "Stand-in for stanza, which PDF Toolkit does not ship (#121).")
+    module.__spec__ = importlib.machinery.ModuleSpec("stanza", loader=None)
+    module._pdftoolkit_stand_in = True
+    return module
+
+
+def _prepare_argos() -> None:
+    """Before argostranslate is imported: split sentences with MiniSBD, and
+    put the stanza stand-in in sys.modules — always, even where a real
+    stanza is installed, so that stanza is never imported or used (#121).
+
+    ARGOS_CHUNK_TYPE is read when argostranslate.settings is imported, and
+    the environment wins over argostranslate's settings.json; _argos also
+    sets settings.chunk_type afterwards, for a settings module imported
+    before this."""
+    import sys
+    os.environ["ARGOS_CHUNK_TYPE"] = "MINISBD"
+    if not getattr(sys.modules.get("stanza"), "_pdftoolkit_stand_in", False):
+        sys.modules["stanza"] = _stanza_stand_in()
+
+
 def _argos():
-    # In a frozen build the ML stack is deliberately NOT bundled (frozen
-    # PyTorch aborts natively; see translate_runtime's module docstring) —
-    # activate() makes a runtime provisioned by the in-app setup flow
-    # importable first. No-op in a source checkout with argos installed.
+    # In a frozen build the translation stack is deliberately NOT bundled
+    # (see translate_runtime's module docstring) — activate() makes a
+    # runtime provisioned by the in-app setup flow importable first. No-op
+    # in a source checkout with argos installed.
     translate_runtime.activate()
+    _prepare_argos()
     try:
         import argostranslate.package as p
+        import argostranslate.settings as s
         import argostranslate.translate as t
+        s.chunk_type = s.ChunkType.MINISBD
         return t, p
     except Exception as exc:  # not installed (or the stack failed to load)
         # Surface the underlying cause: a genuine not-installed reads as
@@ -126,15 +176,145 @@ def _argos():
         ) from exc
 
 
+# ════════════════════════════════════════════════════════════════════
+#  Sentence models (MiniSBD), pinned (#121)
+#
+#  argostranslate splits text into sentences before it translates them,
+#  here with MiniSBD (_prepare_argos). MiniSBD downloads a language's model
+#  from GitHub the first time it is needed, with no check of what it got,
+#  unless the file is already in its cache folder (argostranslate sets that
+#  to <argos data dir>/minisbd). So the models are pinned in
+#  translate_sbd_lock.json and fetched — size and SHA-256 checked — by
+#  install_languages, during setup; a translation checks they are there
+#  first (_require_sbd_models) and never lets MiniSBD go online.
+# ════════════════════════════════════════════════════════════════════
+
+SBD_LOCK_FILENAME = "translate_sbd_lock.json"
+
+
+def load_sbd_lock() -> dict:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SBD_LOCK_FILENAME)
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _sbd_dir():
+    """argostranslate's MiniSBD folder (settings.data_dir / "minisbd"), where
+    MiniSBD looks for a model before it would download one."""
+    from pathlib import Path
+    translate_runtime.activate()
+    _prepare_argos()
+    import argostranslate.settings as s
+    return Path(s.data_dir) / "minisbd"
+
+
+def _sbd_model(code: str, lock: dict) -> Optional[dict]:
+    """The model the language *code* (ours) splits with, from *lock*."""
+    name = lock["languages"].get(LANG_BY_CODE[code].argos) if code in LANG_BY_CODE else None
+    return lock["models"].get(name) if name else None
+
+
+def _sbd_present(code: str, directory, lock: Optional[dict] = None) -> bool:
+    model = _sbd_model(code, lock or load_sbd_lock())
+    return bool(model) and os.path.isfile(os.path.join(str(directory), model["filename"]))
+
+
+def _fetch_sbd_models(codes: list[str], directory, lock: Optional[dict] = None,
+                      progress: Optional[Callable[[int, int, str], None]] = None,
+                      should_cancel: Optional[Callable[[], bool]] = None) -> dict:
+    """Put the sentence models of *codes* and of English into *directory*.
+
+    Each is fetched to a .part file beside its final name, checked against
+    the lock's size and SHA-256, and only then renamed into place: a model
+    that does not match fails setup with a plain message and leaves nothing
+    behind. One already in place is left as it is. The download is part of
+    the explicit setup step, like the language packs."""
+    import hashlib
+    import urllib.request
+
+    lock = lock or load_sbd_lock()
+    wanted: dict = {}
+    for code in ["en", *codes]:
+        model = _sbd_model(code, lock)
+        if model and model["filename"] not in wanted:
+            wanted[model["filename"]] = (code, model)
+    os.makedirs(str(directory), exist_ok=True)
+    fetched = present = 0
+    for i, (filename, (code, model)) in enumerate(sorted(wanted.items())):
+        dest = os.path.join(str(directory), filename)
+        if os.path.isfile(dest):
+            present += 1
+            continue
+        if should_cancel and should_cancel():
+            raise InterruptedError("Cancelled")
+        name = LANG_BY_CODE[code].name
+        if progress:
+            progress(i, len(wanted), f"Downloading the sentence model for {name}")
+        part = dest + ".part"
+        try:
+            req = urllib.request.Request(lock["url"] + filename,
+                                         headers={"User-Agent": "pdf-toolkit-translate-setup"})
+            digest, size = hashlib.sha256(), 0
+            with urllib.request.urlopen(req, timeout=60) as resp, open(part, "wb") as out:
+                for chunk in iter(lambda: resp.read(256 * 1024), b""):
+                    out.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            if size != model["size"] or digest.hexdigest() != model["sha256"]:
+                raise TranslationError(
+                    f"The sentence model for {name} that was downloaded isn't the one "
+                    f"PDF Toolkit expects, so it wasn't installed. Run translation setup "
+                    f"again.")
+            os.replace(part, dest)
+            fetched += 1
+        except TranslationError:
+            raise
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            raise TranslationError(
+                f"The sentence model for {name} could not be downloaded ({exc}).") from exc
+        finally:
+            if os.path.exists(part):
+                os.unlink(part)
+    return {"fetched": fetched, "present": present}
+
+
+def _require_sbd_models(source: str, target: str) -> None:
+    """Before a translation: the sentence models it will split with are
+    there — the source language's, and English's when the text goes through
+    English (the app installs English<->X packs only). Missing, it fails
+    with a plain message instead of letting MiniSBD download one."""
+    needed = [source] + (["en"] if "en" not in (source, target) else [])
+    directory = _sbd_dir()
+    lock = load_sbd_lock()
+    for code in needed:
+        if not _sbd_present(code, directory, lock):
+            raise ModelMissingError(
+                f"The sentence model for {LANG_BY_CODE[code].name} isn't installed. "
+                f"Run translation setup again.")
+
+
 def _pytesseract():
+    """pytesseract, set to run the Tesseract that trusted_programs finds
+    (PDFTOOLKIT_TESSERACT or its install folders) by its full path. Left to
+    itself pytesseract runs a bare "tesseract", which Windows looks for in
+    the current folder first (#120)."""
     try:
         import pytesseract
-        return pytesseract
     except Exception as exc:
         raise ModelMissingError(
             "OCR isn't available — pytesseract is not installed "
             "(pip install pytesseract) and Tesseract must be on the system."
         ) from exc
+    exe = trusted_programs.tesseract()
+    if exe is None:
+        raise ModelMissingError(
+            "OCR isn't available — the Tesseract program wasn't found where its installer "
+            "puts it. Install Tesseract, or set PDFTOOLKIT_TESSERACT to the full path of "
+            "the tesseract program.")
+    pytesseract.pytesseract.tesseract_cmd = exe
+    return pytesseract
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -164,15 +344,23 @@ def translation_status() -> dict:
     """Report what is provisioned so the UI can guide the user.
 
     Returns target languages reachable from English (the Argos pivot) and
-    which OCR packs are present — never raises.
+    which OCR packs are present — never raises. A language counts as ready
+    only when its packs, its sentence model and English's are installed
+    (text in any other language goes through English).
     """
     ocr = set(_installed_ocr_langs())
     pairs = set(_installed_argos_pairs())
+    try:
+        sbd_dir, sbd_lock = _sbd_dir(), load_sbd_lock()
+        has_model = {l.code: _sbd_present(l.code, sbd_dir, sbd_lock) for l in SUPPORTED_LANGUAGES}
+    except Exception:
+        has_model = {}
 
     langs = []
     for l in SUPPORTED_LANGUAGES:
-        to_ok = l.argos == "en" or ("en", l.argos) in pairs
-        from_ok = l.argos == "en" or (l.argos, "en") in pairs
+        models = has_model.get(l.code, False) and has_model.get("en", False)
+        to_ok = models and (l.argos == "en" or ("en", l.argos) in pairs)
+        from_ok = models and (l.argos == "en" or (l.argos, "en") in pairs)
         langs.append({
             "code": l.code,
             "name": l.name,
@@ -208,15 +396,19 @@ def translation_status() -> dict:
 def install_languages(codes: list[str],
                       progress: Optional[Callable[[int, int, str], None]] = None,
                       should_cancel: Optional[Callable[[], bool]] = None) -> dict:
-    """Download + install the Argos en<->X packages for ``codes``.
+    """Download + install the Argos en<->X packages for ``codes``, and the
+    sentence models of ``codes`` and English.
 
     THE sanctioned in-app network operation (with translate_runtime's
     wheel download): runs only when the user explicitly starts translation
     setup from the Translate tool, or via setup_translation.py's CLI.
     Argos stores the packages in its own per-user data dir, so they
-    survive app upgrades and work offline afterwards.
+    survive app upgrades and work offline afterwards; the sentence models
+    go into its minisbd folder (see _fetch_sbd_models). The models are
+    fetched first and every time, so that running setup again completes a
+    set-up made before they were needed (#121).
 
-    Returns {"installed": n, "skipped": n, "requested": n}.
+    Returns {"installed": n, "skipped": n, "requested": n, "sentenceModels": n}.
     """
     _t, package = _argos()
 
@@ -226,6 +418,10 @@ def install_languages(codes: list[str],
     if unknown:
         raise TranslationError(f"Unknown language code(s): {', '.join(unknown)}")
 
+    models = _fetch_sbd_models(sorted(set(codes) | {"en"}), _sbd_dir(),
+                               progress=progress, should_cancel=should_cancel)
+    sentence_models = models["fetched"] + models["present"]
+
     pairs: set[tuple[str, str]] = set()
     for c in codes:
         argos = LANG_BY_CODE[c].argos
@@ -234,7 +430,7 @@ def install_languages(codes: list[str],
         pairs.add(("en", argos))
         pairs.add((argos, "en"))
     if not pairs:
-        return {"installed": 0, "skipped": 0, "requested": 0}
+        return {"installed": 0, "skipped": 0, "requested": 0, "sentenceModels": sentence_models}
 
     try:
         package.update_package_index()
@@ -268,7 +464,8 @@ def install_languages(codes: list[str],
             skipped += 1
     if progress:
         progress(len(ordered), len(ordered), "Language packs installed")
-    return {"installed": ok, "skipped": skipped, "requested": len(ordered)}
+    return {"installed": ok, "skipped": skipped, "requested": len(ordered),
+            "sentenceModels": sentence_models}
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -423,6 +620,7 @@ def translate_text(text: str, target: str, source: str = "auto",
         return {"translated": text, "source": src, "target": target}
 
     t, _p = _argos()
+    _require_sbd_models(src, target)      # once the source language is known
     from_code = LANG_BY_CODE[src].argos
     to_code = LANG_BY_CODE[target].argos
 
@@ -514,15 +712,62 @@ def translate_image(image_path: str, target: str, source: str = "auto",
 #  PDF translation
 # ════════════════════════════════════════════════════════════════════
 
-def _extract_pages(path: str, ocr_fallback_source: str = "auto") -> list[str]:
-    """Return the text of each page. OCRs pages that have no text layer."""
+class _BlockTally:
+    """The text blocks of one document translation (#121): how many held a
+    letter and so were tried, how many were translated, and the first reason
+    one was not. A block that could not be translated is kept as it was —
+    but if none could be, the translation fails instead of saving a copy
+    of the original (check)."""
+
+    def __init__(self):
+        self.tried = self.translated = 0
+        self.first_error: Optional[Exception] = None
+
+    @property
+    def kept(self) -> int:
+        return self.tried - self.translated
+
+    def check(self) -> None:
+        if self.tried and not self.translated:
+            raise TranslationError(
+                f"None of the text could be translated, so nothing was saved. "
+                f"{self.first_error}") from self.first_error
+
+
+def _translate_block(text: str, target: str, source: str,
+                     protect_terms: Optional[list[str]], tally: _BlockTally,
+                     page_no: int) -> tuple[str, Optional[str]]:
+    """Translate one text block; returns (text, detected source or None).
+
+    A block with no letter in any script (a page number, a year) is left as
+    it is and not counted. One that fails — a short block whose language
+    can't be detected, a missing model — is kept as it was and counted, and
+    the document goes on (TRN-01)."""
+    if not any(ch.isalpha() for ch in text):
+        return text, None
+    tally.tried += 1
+    try:
+        res = translate_text(text, target, source, protect_terms)
+    except Exception as exc:
+        log.debug("keeping a block untranslated on page %d (%s)", page_no, type(exc).__name__)
+        tally.first_error = tally.first_error or exc
+        return text, None
+    tally.translated += 1
+    return res["translated"], res["source"]
+
+
+def _extract_page_blocks(path: str, ocr_fallback_source: str = "auto") -> list[list[str]]:
+    """Return the text of each page as its text blocks, in order — joined,
+    they are the page's text. OCRs pages that have no text layer, and splits
+    what OCR reads at its blank lines."""
     import fitz  # PyMuPDF
-    pages: list[str] = []
+    pages: list[list[str]] = []
     doc = fitz.open(path)
     try:
         for page in doc:
-            txt = page.get_text("text").strip()
-            if not txt:
+            blocks = [b[4] for b in page.get_text("blocks") if b[6] == 0]
+            if not "".join(blocks).strip():
+                blocks = []
                 # Scanned page — rasterize and OCR it.
                 try:
                     import tempfile
@@ -545,7 +790,9 @@ def _extract_pages(path: str, ocr_fallback_source: str = "auto") -> list[str]:
                 except Exception as exc:
                     log.debug("page OCR fallback failed: %s", exc)
                     txt = ""
-            pages.append(txt)
+                parts = re.split(r"(\n\s*\n)", txt)
+                blocks = ["".join(parts[j:j + 2]) for j in range(0, len(parts), 2)] if txt else []
+            pages.append(blocks)
     finally:
         doc.close()
     return pages
@@ -609,12 +856,12 @@ def _font_kwargs_for_target(target: str) -> dict:
         if font_path:
             return {"fontfile": font_path, "fontname": "unicode-body"}
         log.warning(
-            "No Unicode TTF found for PDF translation target '%s' (checked "
-            "%s); falling back to the built-in Latin-only font -- Cyrillic/"
-            "Greek characters will not render correctly. Drop a font (e.g. "
-            "DejaVuSans.ttf) into %s to fix this.",
-            target, _UNICODE_FONT_CANDIDATES, _FONTS_DIR,
+            "No Unicode TTF found for PDF translation target '%s'; falling "
+            "back to the built-in Latin-only font -- Cyrillic/Greek characters "
+            "will not render correctly. Drop a font (e.g. DejaVuSans.ttf) into "
+            "the app's assets/fonts folder to fix this.", target,
         )
+        log.debug("Fonts looked for: %s", _UNICODE_FONT_CANDIDATES)
     return {"fontname": "helv"}
 
 
@@ -651,6 +898,7 @@ def _translate_pdf_to_pdf(input_path: str, output_path: str, target: str,
     string's length, so text is auto-shrunk to fit its original block's
     rect (see _insert_autofit_text) rather than reflowing the page. Callers
     must not route _COMPLEX_SHAPING_TARGETS here -- see that constant.
+    Nothing is saved when no block could be translated (_BlockTally).
     """
     import fitz  # PyMuPDF
 
@@ -659,6 +907,7 @@ def _translate_pdf_to_pdf(input_path: str, output_path: str, target: str,
     total = src.page_count
     detected_source = None
     font_kwargs = _font_kwargs_for_target(target)
+    tally = _BlockTally()
 
     try:
         for i in range(total):
@@ -689,18 +938,9 @@ def _translate_pdf_to_pdf(input_path: str, output_path: str, target: str,
                 effective_source = (
                     detected_source if source == "auto" and detected_source else source
                 )
-                try:
-                    res = translate_text(text, target, effective_source, protect_terms)
-                    detected_source = detected_source or res["source"]
-                    translated = res["translated"]
-                except Exception as exc:
-                    # An undetectable/untranslatable block (e.g. a bare number
-                    # that fails detect_language) must NOT abort the document --
-                    # keep it verbatim so the loop continues and out.save() is
-                    # still reached (TRN-01). Covers TranslationError and any
-                    # backstop failure.
-                    log.debug("keeping block untranslated on page %d: %s", i, exc)
-                    translated = text
+                translated, found = _translate_block(text, target, effective_source,
+                                                     protect_terms, tally, i)
+                detected_source = detected_source or found
                 rect = fitz.Rect(x0, y0, x1, y1)
                 try:
                     _insert_autofit_text(new_page, rect, translated, font_kwargs)
@@ -713,6 +953,7 @@ def _translate_pdf_to_pdf(input_path: str, output_path: str, target: str,
                 except Exception:
                     pass
 
+        tally.check()
         out.save(output_path)
     finally:
         src.close()
@@ -726,6 +967,7 @@ def _translate_pdf_to_pdf(input_path: str, output_path: str, target: str,
         "target": target,
         "files": [output_path],
         "output_dir": os.path.dirname(os.path.abspath(output_path)),
+        "untranslatedBlocks": tally.kept,
     }
 
 
@@ -781,26 +1023,33 @@ def translate_pdf(input_path: str, output_path: str, target: str,
             result["note"] = note
         return result
 
-    page_texts = _extract_pages(input_path, source)
-    total = len(page_texts)
+    pages = _extract_page_blocks(input_path, source)
+    total = len(pages)
     translated_pages: list[str] = []
     detected_source = None
+    tally = _BlockTally()
 
-    for i, ptext in enumerate(page_texts):
+    for i, blocks in enumerate(pages):
         if should_cancel and should_cancel():
             raise InterruptedError("Cancelled")
-        if not ptext.strip():
-            translated_pages.append("")
-        else:
-            res = translate_text(ptext, target, source, protect_terms)
-            detected_source = detected_source or res["source"]
-            translated_pages.append(res["translated"])
+        # Detect the language from the whole page, as before blocks were
+        # translated one by one; short blocks alone are often undetectable.
+        page_source = source
+        if source == "auto":
+            page_source = detect_language("".join(blocks)) or detected_source or "auto"
+        out_blocks = []
+        for block in blocks:
+            text, found = _translate_block(block, target, page_source, protect_terms, tally, i)
+            detected_source = detected_source or found
+            out_blocks.append(text)
+        translated_pages.append("".join(out_blocks).strip())
         if progress:
             try:
                 progress(i + 1, total)
             except Exception:
                 pass
 
+    tally.check()
     if ext == ".docx":
         _write_docx(translated_pages, output_path)
     else:
@@ -814,6 +1063,7 @@ def translate_pdf(input_path: str, output_path: str, target: str,
         "target": target,
         "files": [output_path],
         "output_dir": os.path.dirname(os.path.abspath(output_path)),
+        "untranslatedBlocks": tally.kept,
     }
     if note:
         result["note"] = note
