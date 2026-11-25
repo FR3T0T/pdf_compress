@@ -305,7 +305,7 @@ export const MOCK_REDACT_SUMMARY_EVERYTHING = {
   ],
   "notes": [
     "Pages 3, 6, 9, 12, 15, 18 and 94 more have no text to search. They may be scans or pictures, so any words in them were not searched.",
-    "Pages 1 and 2 are scans with a hidden text layer. The search read that layer and found 2 matches there. If the layer misread a word, that word is still in the picture.",
+    "Pages 1 and 2 are scans with a hidden text layer. The search read that layer and found 2 matches there. If the layer misread a word, or put it in the wrong place, that word is still in the picture. Tick “Also read scanned pages with OCR” to read the pictures too.",
     "This file has 12 attached files: quarterly-report-final-version-00.zip, quarterly-report-final-version-01.zip, quarterly-report-final-version-02.zip, quarterly-report-final-version-03.zip, quarterly-report-final-version-04.zip and 7 more. Attached files were searched as they are stored, and were not opened. 12 of them are packed (like a zip or Word file), so nothing inside them could be searched.",
     "Page 4 was turned into a picture, with 2 areas blacked out on it. Its text can no longer be selected or searched.",
     "A form field under one of your boxes is also shown elsewhere, on pages 1-3 and 9. It is still shown there, and anything filled into it is still in the file.",
@@ -412,15 +412,62 @@ export const MOCK_REDACT_NOT_POSSIBLE = "This file's form is stored in a format 
 /** #128: a run with "Also read scanned pages with OCR" ticked (any search
  *  word; "damage" shows the refusal for a page that would have changed
  *  outside the places found), and the line shown when OCR is not set up
- *  (add ?ocr=off to the address). Made by the same Python functions. */
+ *  (add ?ocr=off to the address). Page 4 is a scan with a text layer that
+ *  OCR read too (#140). Made by the same Python functions. */
 export const MOCK_REDACT_SUMMARY_OCR = {
-  "headline": "Redacted 3 places on 2 pages.",
-  "checked": "Checked before saving: a search of the new file no longer finds what you asked to remove, and OCR no longer reads it on page 1.",
+  "headline": "Redacted 4 places on 3 pages.",
+  "checked": "Checked before saving: a search of the new file no longer finds what you asked to remove, and OCR no longer reads it on pages 1 and 4.",
   "removed": [],
   "notes": [
-    "OCR read pages 1 and 2 and found 2 places to black out on them. OCR can miss words: check them by eye.",
-    "OCR found no words it could read on page 3. It may be a photo or a drawing, or its words may not be in English: check it by eye."
+    "OCR read pages 1 and 2 and found 1 place to black out on them. OCR can miss words: check them by eye.",
+    "OCR found no words it could read on page 3. It may be a photo or a drawing, or its words may not be in English: check it by eye.",
+    "Page 4 is a scan with a hidden text layer. The search read that layer and found 1 match there, and OCR read the picture too and found 1 more place to black out. OCR can miss words: check it by eye."
   ]
+};
+/** #143: the search word "picture" shows the refusal for a picture left
+ *  holding the word under the search's black box. */
+export const MOCK_REDACT_REFUSAL_SEARCH_IMAGE = {
+  "refusal": {
+    "headline": "Redaction refused: some of what you asked to remove is still in the new file. Nothing was saved.",
+    "found": [
+      "A picture on page 1 still holds what the search found, under the black box. It could be taken out of the file."
+    ],
+    "nextStep": "You can turn page 1 into a picture to remove it. The page keeps its look, with what was found blacked out, but its text can no longer be selected or searched."
+  },
+  "flattenablePages": [
+    1
+  ],
+  "verification": {
+    "inputPath": "",
+    "outputPath": "",
+    "tool": "redaction",
+    "timestamp": "",
+    "checks": [
+      {
+        "id": "redaction.search_image",
+        "description": "The pictures under the search's boxes are blanked there",
+        "passed": false,
+        "evidence": [
+          "a picture under a search box on page 1 still holds what was under the box"
+        ],
+        "pages": [
+          1
+        ],
+        "isDocumentLevel": false,
+        "unevaluated": false,
+        "objectPaths": []
+      }
+    ],
+    "residualFindings": [],
+    "verified": false,
+    "flattenTargetPages": [
+      1
+    ],
+    "sourceSha256": null,
+    "outputSha256": null,
+    "unevaluated": [],
+    "diagnostics": []
+  }
 };
 export const MOCK_REDACT_REFUSAL_OCR_OUTSIDE = {
   "refusal": {

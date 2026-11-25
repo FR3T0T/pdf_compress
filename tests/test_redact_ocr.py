@@ -220,7 +220,7 @@ def test_a_term_in_a_scan_is_found_and_blacked_out(tmp_path, tessdata, shape):
     assert TERM not in _ocr_read(out, tessdata)
     assert res.surface_counts.get("ocr_page_content") == 2      # "4455-" and "8870"
     assert res.redaction_count == 2 and res.pages_affected == 1
-    assert _note(res, "ocr") == {"kind": "ocr", "pages": [1], "hits": {1: 2}}
+    assert _note(res, "ocr") == {"kind": "ocr", "pages": [1], "hits": {1: 2}, "widened": {1: 0}}
     assert _note(res, "no_text") is None
 
 
@@ -442,16 +442,54 @@ def test_boxes_alone_never_use_ocr(tmp_path, tessdata, monkeypatch):
     assert res.verification["verified"] is True
 
 
-def test_a_page_with_a_text_layer_is_not_read_again(tmp_path, tessdata, monkeypatch):
+def test_a_page_with_a_text_layer_is_read_too(tmp_path, tessdata):
+    """#140: the layer can have a word wrong, or in the wrong place, so a
+    page with one is read with OCR as well when OCR is ticked. Here OCR
+    finds nothing the layer missed, and says so."""
     src, _term, _near = _scan_pair(tmp_path, "scan")
     with fitz.open(src) as doc:
         doc[0].insert_text((30, 30), "hidden layer words", render_mode=3, fontsize=10)
         doc[0].insert_text((30, 50), "Reference ABC-123", render_mode=3, fontsize=10)
         layered = str(tmp_path / "layered.pdf")
         doc.save(layered)
-    monkeypatch.setattr(pdf_ocr, "read_page", lambda *a, **k: pytest.fail("OCR ran"))
     res = redact_pdf(layered, str(tmp_path / "out.pdf"), search_terms=["ABC-123"], ocr=True)
-    assert _note(res, "text_layer")["pages"] == [1]
+    assert _note(res, "text_layer_read") == {"kind": "text_layer_read", "pages": [1],
+                                             "hits": {1: 1}, "ocr_hits": {1: 0},
+                                             "ocr_widened": {1: 0}}
+    assert _note(res, "text_layer") is None
+
+
+def test_without_ocr_a_page_with_a_text_layer_is_not_read(tmp_path, monkeypatch):
+    src, _term, _near = _scan_pair(tmp_path, "scan")
+    with fitz.open(src) as doc:
+        doc[0].insert_text((30, 50), "Reference ABC-123 and more hidden words", render_mode=3,
+                           fontsize=10)
+        layered = str(tmp_path / "layered.pdf")
+        doc.save(layered)
+    monkeypatch.setattr(pdf_ocr, "read_page", lambda *a, **k: pytest.fail("OCR ran"))
+    res = redact_pdf(layered, str(tmp_path / "out.pdf"), search_terms=["ABC-123"])
+    assert _note(res, "text_layer") == {"kind": "text_layer", "pages": [1], "hits": {1: 1},
+                                        "ocr_asked": False}
+
+
+def test_ocr_asked_for_but_not_set_up_with_a_text_layer(tmp_path, monkeypatch):
+    """A searchable scan is one of the pages not read (#140): its note comes
+    before the one saying OCR is not set up, so that "those pages" has them
+    to refer to, and does not suggest ticking OCR."""
+    monkeypatch.setattr(pdf_ocr, "ocr_status", lambda: {
+        "ready": False, "tessdata": None, "file": None, "source": None, "pinned": False,
+        "problem": "OCR is not set up"})
+    src, _term, _near = _scan_pair(tmp_path, "scan")
+    with fitz.open(src) as doc:
+        doc[0].insert_text((30, 50), f"Reference {TERM} and more hidden words", render_mode=3,
+                           fontsize=10)
+        layered = str(tmp_path / "layered.pdf")
+        doc.save(layered)
+    res = redact_pdf(layered, str(tmp_path / "out.pdf"), search_terms=[TERM], ocr=True)
+    assert [n["kind"] for n in res.notes][:2] == ["text_layer", "ocr_not_ready"]
+    assert _note(res, "text_layer")["ocr_asked"] is True
+    lines = pdf_ops.redaction_summary(res)["notes"]
+    assert "Tick" not in lines[0] and lines[1].endswith("so those pages were not read.")
 
 
 def test_ocr_asked_for_but_not_set_up(tmp_path, monkeypatch):
@@ -525,7 +563,7 @@ def test_a_scan_with_a_few_words_on_it_is_read_with_ocr(tmp_path, tessdata, how)
     assert ink > 100 and black == ink
     assert _blackened(out, src, near) < 0.25
     assert res.surface_counts.get("ocr_page_content") == 2
-    assert _note(res, "ocr") == {"kind": "ocr", "pages": [1], "hits": {1: 2}}
+    assert _note(res, "ocr") == {"kind": "ocr", "pages": [1], "hits": {1: 2}, "widened": {1: 0}}
     assert _note(res, "mostly_picture") is None
     with fitz.open(out) as doc:                          # the few words are still there
         assert doc[0].get_text().split() == before_words
@@ -656,7 +694,9 @@ def test_a_mapping_gone_wrong_is_refused(tmp_path, tessdata, monkeypatch):
     real = pdf_ocr._to_page
 
     def shifted(*a, **k):
-        return [fitz.Rect(r) + (0, 60, 0, 60) for r in real(*a, **k)]
+        boxes, cores = real(*a, **k)               # the places, and the words before growing
+        return ([fitz.Rect(r) + (0, 60, 0, 60) for r in boxes],
+                [fitz.Rect(r) + (0, 60, 0, 60) for r in cores])
     monkeypatch.setattr(pdf_ocr, "_to_page", shifted)
     src, _term, _near = _scan_pair(tmp_path, "scan")
     out = tmp_path / "out.pdf"

@@ -183,6 +183,23 @@ class TestTheLoadedFile:
         zone = zone[:zone.index("/>")]
         assert "compact={files.length > 0}" in zone and "multiple={false}" in zone
 
+    def test_every_drop_box_for_one_file_shows_the_file_once_one_is_loaded(self):
+        """#147: the same on every page whose drop box takes one file (13
+        tool pages and Analyze kept the full "Drop PDF file here" prompt
+        after a file was loaded, as if nothing had been picked)."""
+        boxes = []
+        for path in sorted((ROOT / "web-react" / "src").rglob("*.tsx")):
+            if path.name == "ComponentGallery.tsx":
+                continue
+            text = path.read_text(encoding="utf-8")
+            for m in re.finditer(r"<DropZone\b", text):
+                zone = text[m.start():text.index("/>", m.start())]
+                if "multiple={false}" in zone:
+                    boxes.append((path.name, zone))
+        assert len(boxes) >= 17                       # 14 + Redact + Compare's two
+        missing = [name for name, zone in boxes if not re.search(r"\bcompact\b", zone)]
+        assert not missing, missing
+
     def test_a_drop_box_for_one_file_offers_to_pick_another(self):
         """Compact, with a file in it: "<name> — click or drop to pick
         another" for a box that takes one file, "... to add more" for one

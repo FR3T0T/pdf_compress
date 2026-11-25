@@ -494,24 +494,25 @@ def _short_of(grown, rect, words, least: float = 0.0) -> "fitz.Rect":
     return g
 
 
-def _to_page(rects, ocr_page, pix, to_pixels, dpi: int, words=()) -> list:
-    """*rects* found on *ocr_page*, each grown (GROW_PT, GROW_SHARE) but no
-    further than the edge of another of *words* (_short_of), in page
-    space."""
+def _to_page(rects, ocr_page, pix, to_pixels, dpi: int, words=()) -> tuple[list, list]:
+    """*rects* found on *ocr_page*, in page space: each grown (GROW_PT,
+    GROW_SHARE) but no further than the edge of another of *words*
+    (_short_of), and each as OCR boxed it, before it was grown."""
     if not ocr_page.rect.width:
-        return []
+        return [], []
     scale = pix.width / ocr_page.rect.width          # pixels to a unit of the OCR page
     per_point = scale / (dpi / 72)                   # OCR units to a point of the page
     back = fitz.Matrix(scale, scale) * ~to_pixels
     words = [fitz.Rect(w) for w in words]
-    out = []
+    boxes, cores = [], []
     for rect in rects:
         rect = fitz.Rect(rect)
         grow = GROW_PT * per_point + rect.height * GROW_SHARE
         grown = _short_of(fitz.Rect(rect.x0 - grow, rect.y0 - grow, rect.x1 + grow, rect.y1 + grow),
                           rect, words, GROW_PT * per_point)
-        out.append((grown * back).normalize())
-    return out
+        boxes.append((grown * back).normalize())
+        cores.append((rect * back).normalize())
+    return boxes, cores
 
 
 @dataclass
@@ -523,6 +524,10 @@ class Reading:
     #: The terms found, grown, in page space.
     boxes: list = field(default_factory=list)
     seconds: float = 0.0
+    #: The same, as OCR boxed them before they were grown (one for each of
+    #: *boxes*, in its order): where the search can be said to have a place
+    #: covered already (pdf_ops._left_to_the_search, #143).
+    cores: list = field(default_factory=list)
 
     @property
     def words(self) -> bool:
@@ -538,8 +543,8 @@ def read_at(page, terms, case_sensitive: bool, tessdata: str, turn: int, dpi: in
         text = read.get_text()
         found = term_boxes(read, terms, case_sensitive) if terms else []
         words = [w[:4] for w in read.get_text("words")] if found else []
-        boxes = _to_page(found, read, pix, to_pixels, dpi, words)
-    return Reading(turn, dpi, text, boxes, time.perf_counter() - start)
+        boxes, cores = _to_page(found, read, pix, to_pixels, dpi, words)
+    return Reading(turn, dpi, text, boxes, time.perf_counter() - start, cores)
 
 
 def read_text(page, tessdata: str, turn: int = 0, dpi: Optional[int] = None) -> str:
@@ -560,6 +565,8 @@ class PageReading:
     #: The terms found, grown, in page space: the kept reading's, and any
     #: other reading's that lie apart from them.
     boxes: list = field(default_factory=list)
+    #: Each of *boxes* before it was grown (Reading.cores).
+    cores: list = field(default_factory=list)
 
     @property
     def turns(self) -> list:
@@ -574,33 +581,62 @@ class PageReading:
         return sum(r.seconds for r in self.readings)
 
 
-def read_page(page, terms, case_sensitive: bool, tessdata: str, *, cancel=None) -> PageReading:
+def layer_turn(page) -> Optional[int]:
+    """The turn (TURNS) at which *page*'s hidden text layer runs left to
+    right: the way its invisible text is written, by most letters, on the
+    page as shown (turned by its /Rotate). None when it has no hidden text.
+
+    A searchable scan's layer was laid by OCR the way the lines run, so it
+    says which way to read the picture (#140): checked against the turn
+    read_page picks reading all four, with the layer's lines running each
+    of the four ways, on pages with and without a /Rotate of their own."""
+    sx = sy = 0.0
+    for span in page.get_texttrace():
+        if span.get("type") != 3:
+            continue
+        letters = sum(1 for ch in span.get("chars", ()) if ch[0] > 32)
+        sx += span["dir"][0] * letters
+        sy += span["dir"][1] * letters
+    if not (sx or sy):
+        return None
+    m = page_to_picture_matrix(page)
+    x, y = sx * m.a + sy * m.c, sx * m.b + sy * m.d          # the direction, as shown
+    return round(-math.degrees(math.atan2(y, x)) / 90) % 4 * 90
+
+
+def read_page(page, terms, case_sensitive: bool, tessdata: str, *, cancel=None,
+              turns: Optional[list] = None) -> PageReading:
     """Read *page* with OCR and find *terms* on what it reads.
 
     The page as shown first; when that reading does not look like words
     (looks_like_words), the other three turns, keeping the reading that
-    looks most like words (the first of equals). The term is looked for in
-    every reading made. *cancel*, a threading.Event, is looked at before
-    each reading: once it is set, InterruptedError. A reading is one call
-    into Tesseract, which holds Python's lock while it reads, so a cancel
-    waits for the reading under way."""
+    looks most like words (the first of equals). Given *turns*, at those
+    turns only (a searchable scan's layer says which way it runs:
+    layer_turn). The term is looked for in every reading made. *cancel*, a
+    threading.Event, is looked at before each reading: once it is set,
+    InterruptedError. A reading is one call into Tesseract, which holds
+    Python's lock while it reads, so a cancel waits for the reading under
+    way."""
     dpi = reading_dpi(page)
     if dpi is None:
         return PageReading("too_large")
     readings: list[Reading] = []
-    for turn in TURNS:
+    for turn in (turns or TURNS):
         if cancel is not None and cancel.is_set():
             raise InterruptedError("Cancelled")
         readings.append(read_at(page, terms, case_sensitive, tessdata, turn, dpi))
-        if turn == TURNS[0] and readings[0].words:
+        if not turns and turn == TURNS[0] and readings[0].words:
             break
     best = max(readings, key=lambda r: _score(r.text))
-    boxes = list(best.boxes)
+    boxes, cores = list(best.boxes), list(best.cores)
     for reading in readings:
         if reading is not best:
-            boxes += [b for b in reading.boxes if not any(b.intersects(o) for o in boxes)]
+            kept = [(box, core) for box, core in zip(reading.boxes, reading.cores, strict=True)
+                    if not any(box.intersects(o) for o in boxes)]
+            boxes += [box for box, _core in kept]
+            cores += [core for _box, core in kept]
     status = "read" if best.words or boxes else "unread"
-    return PageReading(status, dpi, readings, boxes)
+    return PageReading(status, dpi, readings, boxes, cores)
 
 
 def fingerprint_dpi(page) -> int:

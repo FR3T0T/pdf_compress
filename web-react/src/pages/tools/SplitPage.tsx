@@ -199,6 +199,7 @@ export function SplitPage() {
           files={files}
           onFilesChanged={setFiles}
           multiple={false}
+          compact={files.length > 0}
           title="Drop a PDF file here"
           subtitle="or click to browse"
           disabled={op.status === 'running'}

@@ -11,6 +11,7 @@ import {
   MOCK_REDACT_REFUSAL_DOCUMENT_LEVEL,
   MOCK_REDACT_REFUSAL_LINE_ART,
   MOCK_REDACT_REFUSAL_OCR_OUTSIDE,
+  MOCK_REDACT_REFUSAL_SEARCH_IMAGE,
   MOCK_REDACT_SUMMARY,
   MOCK_REDACT_SUMMARY_EVERYTHING,
   MOCK_REDACT_SUMMARY_FLATTENED,
@@ -661,6 +662,11 @@ export const bridgeApi = {
         simulateFailure(TOOL_KEYS.redact, 'Redaction could not be verified.', { ...MOCK_REDACT_REFUSAL_DOCUMENT_LEVEL, documentLevel: true });
         return;
       }
+      if (!flattened.length && asked.includes('picture')) {
+        // #143: a picture still holding the word under the search's box.
+        simulateFailure(TOOL_KEYS.redact, 'Redaction could not be verified.', { ...MOCK_REDACT_REFUSAL_SEARCH_IMAGE, documentLevel: false });
+        return;
+      }
       if (asked.includes('xfa')) {
         simulateFailure(TOOL_KEYS.redact, MOCK_REDACT_NOT_POSSIBLE, { notPossible: true });
         return;
@@ -682,9 +688,9 @@ export const bridgeApi = {
           () => ({
             input_path: String(params.file ?? ''),
             output_path: outputPath,
-            redaction_count: 3,
-            pages_affected: 2,
-            surface_counts: { page_content: 1, ocr_page_content: 2 },
+            redaction_count: 4,
+            pages_affected: 3,
+            surface_counts: { page_content: 2, ocr_page_content: 2 },
             verification: { verified: true, checks: [], flattenTargetPages: null },
             flattened_pages: [],
             summary: MOCK_REDACT_SUMMARY_OCR,

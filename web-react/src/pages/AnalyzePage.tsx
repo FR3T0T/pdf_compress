@@ -163,6 +163,7 @@ export function AnalyzePage() {
           files={files}
           onFilesChanged={setFiles}
           multiple={false}
+          compact={files.length > 0}
           accept="PDF & Images (*.pdf *.jpg *.jpeg *.png)"
           title="Drop a PDF or image to analyze"
           subtitle="or click to browse"

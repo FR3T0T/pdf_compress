@@ -1969,40 +1969,217 @@ def _pixels_blank_under(pix, transform, box) -> bool:
     return not under.size or int((under.max(axis=(0, 1)) - under.min(axis=(0, 1))).max()) <= 4
 
 
-def _image_blank_under(doc, xref: int, transform, box) -> Optional[bool]:
-    """Whether the data of the picture *xref*, drawn by *transform*, is one
-    value under *box* (page space) — in its own pixels and in those of its
-    soft mask or mask, if it has one. None when it cannot be read."""
-    streams = [xref]
-    for key in ("SMask", "Mask"):
-        kind, value = doc.xref_get_key(xref, key)
-        if kind == "xref":
-            streams.append(int(value.split()[0]))
-    for x in streams:
-        try:
-            width = int(doc.xref_get_key(x, "Width")[1])
-            height = int(doc.xref_get_key(x, "Height")[1])
-            if width * height * 4 > _OCR_IMAGE_BYTES:
-                return None
-            pix = fitz.Pixmap(doc, x)
-        except Exception:
-            return None
-        if not _pixels_blank_under(pix, transform, box):
-            return False
-    return True
-
-
-def _inline_blank_under(blocks: list, transform, box) -> Optional[bool]:
+def _inline_blank_under(blocks: list, transform, box, size: Optional[tuple] = None) -> Optional[bool]:
     """The same for a picture written into the page's content (BI ... EI),
     which has no object of its own: read from the page's text dictionary,
-    *blocks*, by where it is drawn. None when it cannot be found or read."""
-    found = [b for b in blocks if fitz.Matrix(b.get("transform") or (0,) * 6) == fitz.Matrix(transform)]
+    *blocks*, by where it is drawn (and by its *size* in pixels, when
+    given). None when it cannot be found or read."""
+    found = [b for b in blocks if fitz.Matrix(b.get("transform") or (0,) * 6) == fitz.Matrix(transform)
+             and (size is None or (b.get("width"), b.get("height")) == size)]
     if not found:
         return None
     try:
         return all(_pixels_blank_under(fitz.Pixmap(b["image"]), transform, box) for b in found)
     except Exception:
         return None
+
+
+def _image_pixmaps(doc, xref: int) -> Optional[list]:
+    """The decoded data of the picture *xref* and of its soft mask or mask,
+    if it has one; None when one of them cannot be read, or is too large to
+    read (_OCR_IMAGE_BYTES)."""
+    streams = [xref]
+    for key in ("SMask", "Mask"):
+        kind, value = doc.xref_get_key(xref, key)
+        if kind == "xref":
+            streams.append(int(value.split()[0]))
+    out = []
+    for x in streams:
+        try:
+            width = int(doc.xref_get_key(x, "Width")[1])
+            height = int(doc.xref_get_key(x, "Height")[1])
+            if width * height * 4 > _OCR_IMAGE_BYTES:
+                return None
+            out.append(fitz.Pixmap(doc, x))
+        except Exception:
+            return None
+    return out
+
+
+def _inherited(page_obj, key: str):
+    """*key* of a page dictionary, or of the nearest page-tree node above it."""
+    node, seen = page_obj, 0
+    while node is not None and seen < 64:
+        if key in node:
+            return node[key]
+        node, seen = node.get("/Parent"), seen + 1
+    return None
+
+
+def drawn_by_content(pdf_page) -> tuple[set, list]:
+    """What a page's content draws that a redaction blanks: (the object
+    numbers of the image XObjects it draws, directly or through Form
+    XObjects; for each picture it writes into its content, BI ... EI, the
+    matrix it is drawn with, in the PDF's own space, and its width and
+    height in pixels). *pdf_page* is a pikepdf page.
+
+    Not drawn by the content, so not here: a shading (sh, or a shading
+    pattern a fill uses), an annotation's appearance, and a picture that is
+    part of a soft mask (an ExtGState's /SMask group) or of a pattern.
+    MuPDF reports each of these as a picture under a box (with no object
+    number), but apply_redactions leaves them as they are (#143)."""
+    xrefs: set = set()
+    inline: list = []
+
+    def walk(stream, resources, ctm, forms) -> None:
+        stack = []
+        xobjects = resources.get("/XObject") if resources is not None else None
+        for operands, operator in pikepdf.parse_content_stream(stream):
+            op = str(operator)
+            if op == "q":
+                stack.append(ctm)
+            elif op == "Q":
+                ctm = stack.pop() if stack else ctm
+            elif op == "cm" and len(operands) == 6:
+                ctm = fitz.Matrix(*(float(v) for v in operands)) * ctm
+            elif op == "INLINE IMAGE":
+                image = operands[0] if operands else None
+                inline.append((ctm, int(getattr(image, "width", 0) or 0),
+                               int(getattr(image, "height", 0) or 0)))
+            elif op == "Do" and operands and xobjects is not None:
+                xobject = xobjects.get(operands[0])
+                if not isinstance(xobject, pikepdf.Stream):
+                    continue
+                kind = xobject.get("/Subtype")
+                if kind == "/Image":
+                    xrefs.add(xobject.objgen[0])
+                elif kind == "/Form" and xobject.objgen not in forms and len(forms) < 32:
+                    matrix = fitz.Matrix(*(float(v) for v in xobject.get("/Matrix", [1, 0, 0, 1, 0, 0])))
+                    walk(xobject, xobject.get("/Resources", resources), matrix * ctm,
+                         forms | {xobject.objgen})
+
+    walk(pdf_page.obj, _inherited(pdf_page.obj, "/Resources"), fitz.Matrix(1, 0, 0, 1, 0, 0),
+         frozenset())
+    return xrefs, inline
+
+
+def _same_matrix(a, b) -> bool:
+    return all(abs(x - y) <= 0.05 * max(1.0, abs(x), abs(y)) for x, y in zip(a, b, strict=True))
+
+
+def _pictures_blank_under(doc, page, boxes: list, drawn: Optional[tuple] = None) -> list:
+    """For each picture *page* draws under one of *boxes* (page space): True
+    when its data is one value under every box it lies under — its own
+    pixels and those of its soft mask or mask; False when it still holds
+    something there; None when it cannot be read. A picture written into
+    the page's content (BI ... EI) is read from the page's text dictionary.
+    Each picture is decoded once, however many boxes lie over it.
+
+    With *drawn* (drawn_by_content of the page), only the pictures the
+    page's content draws are looked at: what MuPDF also reports as a picture
+    — a shading, an annotation's appearance, a picture in a soft mask — is
+    passed over. Without it, everything it reports is."""
+    verdicts = []
+    decoded: dict = {}
+    inline = None
+    if drawn is not None:
+        # MuPDF's transform for a picture puts its first row at the top:
+        # the unit square flipped, then drawn where the content says. A
+        # picture written into the content is told from a shading drawn in
+        # the same place by its size in pixels, too.
+        flip, to_page = fitz.Matrix(1, 0, 0, -1, 0, 1), pdf_to_page_matrix(page)
+        written = [(flip * ctm * to_page, w, h) for ctm, w, h in drawn[1]]
+    for info in page.get_image_info(xrefs=True):
+        hit = [box for box in boxes if fitz.Rect(info["bbox"]).intersects(box)]
+        if not hit:
+            continue
+        xref = info.get("xref") or 0
+        size = None
+        if drawn is not None:
+            if xref and xref not in drawn[0]:
+                continue
+            if not xref:
+                size = (info.get("width"), info.get("height"))
+                if not any(_same_matrix(m, info["transform"]) and (w, h) == size
+                           for m, w, h in written):
+                    continue
+        if xref:
+            if xref not in decoded:
+                decoded[xref] = _image_pixmaps(doc, xref)
+            pixmaps = decoded[xref]
+            if pixmaps is None:
+                verdicts.append(None)
+                continue
+            verdicts.append(all(_pixels_blank_under(pix, info["transform"], box)
+                                for box in hit for pix in pixmaps))
+        else:
+            if inline is None:
+                inline = [b for b in page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
+                          if b.get("type") == 1]
+            each = [_inline_blank_under(inline, info["transform"], box, size) for box in hit]
+            verdicts.append(None if any(b is None for b in each) else all(each))
+    return verdicts
+
+
+def _search_image_check(doc, search_boxes: list, output_path: str,
+                        password: Optional[str] = None) -> VerificationCheck:
+    """``redaction.search_image``: the data of every picture a page's
+    content draws under one of the search's own boxes is blanked there
+    (#143) — its own pixels and those of its soft mask or mask, pictures
+    written into the content too — so that a word the search found in the
+    page's text, and the picture shows under it, is not in the picture for
+    anyone who takes it out of the file. A picture that cannot be read is
+    "could not be checked". *search_boxes* is redact_pdf's account of them:
+    {"page" (0-based), "x0", "y0", "x1", "y1"} in page space.
+
+    Only what the redaction itself blanks is looked at (drawn_by_content):
+    pictures the page's content draws, directly or through forms, and those
+    written into it. A shading, text filled with one, an annotation's
+    appearance and a picture that is part of a soft mask are not: MuPDF
+    reports them as pictures under the box, but a redaction leaves them as
+    they are, and on real files (pdf.js's test files) this check refused
+    nine that held nothing of the word. redaction.ocr_image is stricter:
+    OCR saw the word in what the page shows, so whatever draws it there
+    must be blanked. A page whose content cannot be walked is checked the
+    strict way."""
+    evidence: list[str] = []
+    unchecked: list[str] = []
+    by_page: dict[int, list] = {}
+    for entry in search_boxes:
+        try:
+            by_page.setdefault(int(entry["page"]), []).append(fitz.Rect(
+                float(entry["x0"]), float(entry["y0"]), float(entry["x1"]), float(entry["y1"])))
+        except Exception:
+            continue
+    try:
+        pdf = pikepdf.open(output_path, password=password or "")
+    except Exception:
+        pdf = None
+    for pno, boxes in sorted(by_page.items()):
+        on = f"on page {pno + 1}"
+        try:
+            drawn = drawn_by_content(pdf.pages[pno]) if pdf is not None else None
+        except Exception:
+            drawn = None
+        try:
+            verdicts = _pictures_blank_under(doc, doc[pno], boxes, drawn)
+        except Exception:
+            unchecked.append(f"the pictures under a search box {on} could not be read, so they "
+                             f"could not be checked")
+            continue
+        for blank in verdicts:
+            if blank is None:
+                unchecked.append(f"a picture under a search box {on} could not be read, so it "
+                                 f"could not be checked")
+            elif not blank:
+                evidence.append(f"a picture under a search box {on} still holds what was under the box")
+    if pdf is not None:
+        pdf.close()
+    return VerificationCheck(
+        id="redaction.search_image",
+        description="The pictures under the search's boxes are blanked there",
+        passed=not evidence and not unchecked, evidence=evidence + unchecked,
+        unevaluated=bool(unchecked) and not evidence)
 
 
 def _changed_outside(page, now, then, to_pixels, pno: int, rects: list, on: str) -> list[str]:
@@ -2084,22 +2261,10 @@ def _ocr_checks(doc, ocr_pages: list, terms: list[str], case_sensitive: bool,
                 fill_ev.append(f"an OCR box {on} does not show only black (something is drawn over it)")
                 break
         # (b) What the pictures under each box hold.
-        inline = None
-        for info in page.get_image_info(xrefs=True):
-            hit = [box for box in boxes if fitz.Rect(info["bbox"]).intersects(box)]
-            if not hit:
-                continue
-            xref = info.get("xref") or 0
-            if xref:
-                blank = [_image_blank_under(doc, xref, info["transform"], box) for box in hit]
-            else:
-                if inline is None:
-                    inline = [b for b in page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
-                              if b.get("type") == 1]
-                blank = [_inline_blank_under(inline, info["transform"], box) for box in hit]
-            if any(b is None for b in blank):
+        for blank in _pictures_blank_under(doc, page, boxes):
+            if blank is None:
                 unchecked.append(f"a picture under an OCR box {on} could not be read, so it could not be checked")
-            elif not all(blank):
+            elif not blank:
                 image_ev.append(f"a picture under an OCR box {on} still holds what was under the box")
         # (c) Nothing changed outside the boxes: the page drawn the way its
         # fingerprint was (pdf_ocr.fingerprint_pixels), so that a picture
@@ -2155,7 +2320,8 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                      source_ids: Optional[list[str]] = None,
                      source_sha256: Optional[str] = None,
                      ocr_pages: Optional[list[dict]] = None,
-                     tessdata: Optional[str] = None) -> VerificationReport:
+                     tessdata: Optional[str] = None,
+                     search_boxes: Optional[list[dict]] = None) -> VerificationReport:
     """Independently confirm a redacted output no longer carries its targets.
 
     Mirrors redact_pdf's selection model: *terms* (search-term redactions)
@@ -2172,6 +2338,10 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
     had no /ID", None means "not supplied" — a ``redaction.file_id`` check
     asserts the output shares none of them (see :func:`_file_id_check`).
     Both hashes are recorded on the report.
+
+    *search_boxes*, the boxes the search put on the pages (redact_pdf's
+    account, the same shape as *rects*), add ``redaction.search_image``: the
+    pictures under them are blanked there (#143). Given only with terms.
 
     Never returns a false pass: an output that cannot be opened or
     decrypted yields a report with a failed ``redaction.readable`` check
@@ -2222,6 +2392,8 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
         if ocr_pages and terms:
             report.checks.extend(_ocr_checks(doc, ocr_pages, terms, case_sensitive,
                                              tessdata, rects))
+        if search_boxes and terms:
+            report.checks.append(_search_image_check(doc, search_boxes, output_path, password))
     finally:
         doc.close()
     report.checks.extend(_whole_file_checks(output_path, password))
@@ -3222,6 +3394,9 @@ def _refusal_lines(check: VerificationCheck, named: frozenset = frozenset()) -> 
     elif cid == "redaction.ocr_image":
         lines.append(f"A picture on {where} still holds what OCR found, under the black box. "
                      f"It could be taken out of the file.")
+    elif cid == "redaction.search_image":
+        lines.append(f"A picture on {where} still holds what the search found, under the black "
+                     f"box. It could be taken out of the file.")
     elif cid == "redaction.ocr_reread":
         lines.append(f"OCR can still read {_SEARCHED.lower()} in the picture of {where}.")
     elif cid == "redaction.ocr_outside":

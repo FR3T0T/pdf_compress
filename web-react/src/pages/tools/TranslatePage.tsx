@@ -585,6 +585,7 @@ export function TranslatePage() {
             files={files}
             onFilesChanged={setFiles}
             multiple={false}
+            compact={files.length > 0}
             title="Drop a PDF or an image"
             subtitle="PDF, PNG, JPG, TIFF…"
             accept="PDF & Images (*.pdf *.png *.jpg *.jpeg *.tiff *.bmp *.gif)"

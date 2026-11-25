@@ -148,7 +148,7 @@ class TestATextLayerOverAPicture:
         res = redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM])
         assert res.redaction_count == 3
         assert _note(res, "text_layer") == {"kind": "text_layer", "pages": [1, 3],
-                                            "hits": {1: 2, 3: 0}}
+                                            "hits": {1: 2, 3: 0}, "ocr_asked": False}
         assert _note(res, "no_text") is None
 
     def test_ordinary_type_beside_a_picture_is_not_a_text_layer(self, tmp_path):
@@ -241,7 +241,7 @@ class TestTheNotesReachTheApp:
         sent = json.loads(json.dumps(dataclasses.asdict(res), ensure_ascii=False))
         assert _plain(sent["notes"]) == [
             {"kind": "no_text", "pages": [2]},
-            {"kind": "text_layer", "pages": [1], "hits": {"1": 2}},
+            {"kind": "text_layer", "pages": [1], "hits": {"1": 2}, "ocr_asked": False},
             {"kind": "attachments", "names": ["bundle.zip"], "compressed": ["bundle.zip"]}]
 
     def test_every_note_is_plain_data(self, tmp_path):
@@ -249,7 +249,8 @@ class TestTheNotesReachTheApp:
         res = redact_pdf(src, str(tmp_path / "out.pdf"), search_terms=[TERM])
         for note in res.notes:
             assert set(note) <= {"kind", "pages", "hits", "names", "compressed", "areas",
-                                 "version"}
+                                 "version", "ocr_asked", "ocr_hits", "too_large", "widened",
+                                 "ocr_widened"}
             assert all(isinstance(p, int) and p >= 1 for p in note.get("pages", []))
 
 

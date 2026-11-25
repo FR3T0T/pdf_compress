@@ -125,14 +125,76 @@ class TestWhatToKnow:
     @pytest.mark.parametrize("hits, said", [(0, "found no matches"), (1, "found 1 match"),
                                             (2, "found 2 matches")])
     def test_a_text_layer(self, hits, said):
-        assert _notes({"kind": "text_layer", "pages": [1], "hits": {1: hits}}) == [
+        """OCR not asked for: the layer can have a word wrong or in the
+        wrong place, and ticking OCR reads the picture too (#140)."""
+        assert _notes({"kind": "text_layer", "pages": [1], "hits": {1: hits},
+                       "ocr_asked": False}) == [
             f"Page 1 is a scan with a hidden text layer. The search read that layer and "
-            f"{said} there. If the layer misread a word, that word is still in the picture."]
+            f"{said} there. If the layer misread a word, or put it in the wrong place, that "
+            f"word is still in the picture. Tick “Also read scanned pages with OCR” to "
+            f"read the picture too."]
+
+    def test_a_text_layer_when_ocr_was_asked_for(self):
+        """OCR asked for and not set up, or it found no words: another note
+        says so, and ticking it is not suggested."""
+        assert _notes({"kind": "text_layer", "pages": [1], "hits": {1: 1}, "ocr_asked": True}) == [
+            "Page 1 is a scan with a hidden text layer. The search read that layer and found 1 "
+            "match there. If the layer misread a word, or put it in the wrong place, that word "
+            "is still in the picture."]
 
     def test_text_layers_on_several_pages(self):
         (line,) = _notes({"kind": "text_layer", "pages": [1, 3], "hits": {1: 2, 3: 1}})
         assert line.startswith("Pages 1 and 3 are scans with a hidden text layer. The search "
                                "read that layer and found 3 matches there.")
+        assert line.endswith("to read the pictures too.")
+
+    @pytest.mark.parametrize("more, said", [(0, "found nothing more to black out"),
+                                            (1, "found 1 more place to black out"),
+                                            (3, "found 3 more places to black out")])
+    def test_a_text_layer_that_ocr_read_too(self, more, said):
+        assert _notes({"kind": "text_layer_read", "pages": [2], "hits": {2: 1},
+                       "ocr_hits": {2: more}}) == [
+            f"Page 2 is a scan with a hidden text layer. The search read that layer and found "
+            f"1 match there, and OCR read the picture too and {said}. OCR can miss words: "
+            f"check it by eye."]
+
+    def test_text_layers_that_ocr_read_on_several_pages(self):
+        (line,) = _notes({"kind": "text_layer_read", "pages": [1, 2], "hits": {"1": 0, "2": 0},
+                          "ocr_hits": {"1": 1, "2": 1}})
+        assert line == ("Pages 1 and 2 are scans with a hidden text layer. The search read that "
+                        "layer and found no matches there, and OCR read the pictures too and "
+                        "found 2 more places to black out. OCR can miss words: check them by eye.")
+
+    @pytest.mark.parametrize("more, widened, said", [
+        # Neither: OCR found nothing past the search's boxes.
+        (0, 0, "and OCR read the picture too and found nothing more to black out."),
+        # Only new places.
+        (2, 0, "and OCR read the picture too and found 2 more places to black out."),
+        # Only widened: OCR's place touched the search's box, so it is not a
+        # new place, but it blacked out the part of the word the box missed.
+        (0, 1, "and OCR read the picture too and blacked out the rest of 1 word the search "
+               "had covered only in part."),
+        (0, 3, "and OCR read the picture too and blacked out the rest of 3 words the search "
+               "had covered only in part."),
+        # Both.
+        (1, 1, "and OCR read the picture too: it found 1 more place to black out, and blacked "
+               "out the rest of 1 word the search had covered only in part.")])
+    def test_what_ocr_blacked_out_past_the_search_on_a_text_layer(self, more, widened, said):
+        """#143 review: a place OCR found that touches the search's box is
+        not counted as a new one, but it did black out more of the word;
+        the note says so, and does not say "nothing more"."""
+        (line,) = _notes({"kind": "text_layer_read", "pages": [1], "hits": {1: 1},
+                          "ocr_hits": {1: more}, "ocr_widened": {"1": widened}})
+        assert line == ("Page 1 is a scan with a hidden text layer. The search read that layer "
+                        f"and found 1 match there, {said} OCR can miss words: check it by eye.")
+
+    def test_what_ocr_blacked_out_past_the_search_on_several_text_layers(self):
+        (line,) = _notes({"kind": "text_layer_read", "pages": [1, 2], "hits": {1: 1, 2: 1},
+                          "ocr_hits": {1: 0, 2: 0}, "ocr_widened": {1: 1, 2: 1}})
+        assert line == ("Pages 1 and 2 are scans with a hidden text layer. The search read that "
+                        "layer and found 2 matches there, and OCR read the pictures too and "
+                        "blacked out the rest of 2 words the search had covered only in part. "
+                        "OCR can miss words: check them by eye.")
 
     def test_hits_given_as_text_as_they_come_through_json(self):
         (line,) = _notes({"kind": "text_layer", "pages": [1], "hits": {"1": 2}})
@@ -236,6 +298,29 @@ class TestWhatOcrDid:
             "OCR read pages 1-3 and 7 and found 3 places to black out on them. OCR can miss "
             "words: check them by eye."]
 
+    @pytest.mark.parametrize("hits, widened, line", [
+        # Neither, and only new places: as before.
+        (0, 0, "OCR read page 2 and found nothing to black out there."),
+        (2, 0, "OCR read page 2 and found 2 places to black out there."),
+        # Only widened (#143 review): the search found the word in the
+        # page's few words of text, and OCR blacked out more of it.
+        (0, 1, "OCR read page 2 and blacked out the rest of 1 word the search had covered "
+               "only in part."),
+        # Both.
+        (2, 1, "OCR read page 2: it found 2 places to black out there, and blacked out the "
+               "rest of 1 word the search had covered only in part.")])
+    def test_what_ocr_blacked_out_past_the_search(self, hits, widened, line):
+        assert _notes({"kind": "ocr", "pages": [2], "hits": {2: hits},
+                       "widened": {"2": widened}}) == [
+            f"{line} OCR can miss words: check it by eye."]
+
+    def test_what_ocr_blacked_out_past_the_search_on_several_pages(self):
+        assert _notes({"kind": "ocr", "pages": [1, 3], "hits": {1: 1, 3: 0},
+                       "widened": {1: 0, 3: 2}}) == [
+            "OCR read pages 1 and 3: it found 1 place to black out on them, and blacked out "
+            "the rest of 2 words the search had covered only in part. OCR can miss words: "
+            "check them by eye."]
+
     def test_every_page_ocr_read_is_named(self):
         import re
         pages = list(range(3, 301, 3))
@@ -283,6 +368,18 @@ class TestWhatOcrDid:
                                 "page 2.")
         assert s["removed"] == []
 
+    def test_what_was_checked_names_the_pages_where_ocr_only_widened(self):
+        """#143 review: a page where OCR's only place touched the search's
+        box was read again by OCR (redaction.ocr_reread) like any other."""
+        s = _summary(count=2, pages=2, counts={"page_content": 2},
+                     notes=[{"kind": "ocr", "pages": [2, 4], "hits": {2: 0, 4: 0},
+                             "widened": {2: 0, 4: 1}},
+                            {"kind": "text_layer_read", "pages": [5, 6], "hits": {5: 1, 6: 1},
+                             "ocr_hits": {5: 0, 6: 0}, "ocr_widened": {"5": 1, "6": 0}}])
+        assert s["checked"] == ("Checked before saving: a search of the new file no longer "
+                                "finds what you asked to remove, and OCR no longer reads it on "
+                                "pages 4 and 5.")
+
     def test_what_was_checked_when_ocr_found_nothing(self):
         s = _summary(count=1, pages=1,
                      notes=[{"kind": "ocr", "pages": [2], "hits": {2: 0}}])
@@ -295,6 +392,9 @@ class TestWhatOcrDid:
 
     def test_every_ocr_note_reads_as_words(self):
         for note in ({"kind": "ocr", "pages": [1], "hits": {1: 1}},
+                     {"kind": "ocr", "pages": [1], "hits": {1: 1}, "widened": {1: 1}},
+                     {"kind": "text_layer_read", "pages": [1], "hits": {1: 1}, "ocr_hits": {1: 1},
+                      "ocr_widened": {1: 1}},
                      {"kind": "ocr_unread", "pages": [1], "too_large": [1]},
                      {"kind": "ocr_not_ready"},
                      {"kind": "mostly_picture", "pages": [1]}):

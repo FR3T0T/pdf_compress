@@ -364,3 +364,37 @@ panel (`HomePage.tsx`, below the tool sections):
 - **No payload changes.** `getWorkspaceDir` returns the same string; the
   folder now holds an owner file and is deleted when the app quits.
   `web-react/dist/` rebuilt.
+
+### #143, #140, #147 — Searchable scans, pictures under the search's boxes, compact drop boxes (2026-11-25)
+
+No new slot. The Redact done payload changes, and so do 14 pages' drop boxes.
+
+- **Redact done payload, a saved run.** `notes` may hold the new kind
+  `{"kind": "text_layer_read", "pages": [...], "hits": {page: n},
+  "ocr_hits": {page: m}, "ocr_widened": {page: w}}`: a searchable scan
+  that OCR read too, with the search's matches in its layer, the places
+  OCR found apart from them, and the places it found touching one of the
+  search's boxes, which blacked out the rest of a word that box covered
+  only in part. The `ocr` note gains `"widened": {page: w}`, the same for
+  pages with no layer. The `text_layer` note (not read with OCR) gains
+  `"ocr_asked": bool`. The window still shows only `summary.notes`, worded
+  by `pdf_ops.redaction_summary`; `summary.checked` names the pages of
+  both notes where OCR found or widened places.
+  `surface_counts.ocr_page_content` no longer counts a place OCR found that
+  touches one of the search's boxes.
+- **Redact done payload, a refusal.** A new check id
+  `redaction.search_image` ("The pictures under the search's boxes are
+  blanked there") can fail or be "could not be checked"; `refusal.found`
+  words it ("A picture on page 1 still holds what the search found, under
+  the black box. It could be taken out of the file."), and the page is
+  offered to be turned into a picture, as for `redaction.ocr_image`.
+- **Mocks.** The search word "picture" shows that refusal; the OCR run
+  mock adds a searchable scan read with OCR (page 4) and its checked line;
+  the "everything" mock's text-layer line has the new wording. All made by
+  the real Python functions.
+- **Drop boxes (#147).** Crop, Extract Images, Extract Text, Flatten,
+  Metadata, N-up, Page Numbers, Page Operations, PDF to Images, PDF to Word,
+  Repair, Split, Translate and Analyze pass `compact={files.length > 0}` to
+  `DropZone`, as Redact does (#135): once a file is picked the box says
+  "<name> — click or drop to pick another". Checked in the browser preview
+  on all 14. `web-react/dist/` rebuilt.

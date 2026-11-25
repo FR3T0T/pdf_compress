@@ -435,6 +435,34 @@
   off-the-record profile, which keeps nothing on disk.
 
 ### Changed
+- **Redact's OCR reads searchable scans too (#140).** A "searchable" scan
+  carries a hidden text layer from an earlier OCR, and the search reads that
+  layer; a word the layer got wrong stayed in the picture. With "Also read
+  scanned pages with OCR" ticked, such a page is now read with OCR as well,
+  and a place OCR finds that the search does not have covered is blacked
+  out (see #143 under Fixed). A hidden layer over a black-and-white scan
+  stored as a stencil mask (JBIG2, CCITT; MuPDF logs it as "fill-imgmask")
+  now counts as a text layer: such a page was given no note and was not
+  read. The result's note for a searchable scan read with OCR says so. It
+  says how many places OCR found beyond the layer, and how many words it
+  blacked out the rest of where the search's box covered them only in part
+  (new note kind `text_layer_read`, with `hits`, `ocr_hits` and
+  `ocr_widened`). Such a place touches the search's box, so it is not
+  counted as a new place, but the note tells of it ("blacked out the rest
+  of 1 word the search had covered only in part"), and the "Checked before
+  saving" line names its page among those OCR read again. The `ocr` note
+  gains `widened` for the same case on a page with no layer. Without OCR,
+  the note now
+  says the layer may have misread a word "or put it in the wrong place", and
+  that ticking "Also read scanned pages with OCR" reads the picture too
+  (`text_layer` gains `ocr_asked`). Such a page is read only the way its
+  hidden text runs (`pdf_ocr.layer_turn`): the layer was laid the way the
+  lines run. It is not read all four ways when what OCR reads does not
+  look like English, as a page with no layer is. On pdf.js's
+  `issue12963.pdf`, a Russian searchable scan, that brought a page from
+  5.6 to 1.0 seconds here. On searchable scans made here (samples 25 to 27,
+  and letter pages at 72 to 300 dpi), a page takes 0.2 to 2.9 seconds with
+  OCR, against 0.4 or less without.
 - **The translation runtime is a quarter of the size (#121).** Without
   stanza, PyTorch, spaCy and what they bring, the translation engine setup
   downloads is 19 wheels and about 48 MB, down from 64 wheels and about 204
@@ -872,6 +900,52 @@
   code with no remaining callers.
 
 ### Fixed
+- **Redaction: a word the picture shows past the search's box is blacked
+  out too (#143).** A search's box blanks the pixels of a picture under it,
+  and always did: in every kind of picture tried (PNG, JPEG in colour, grey
+  and CMYK, 1-bit, JPEG 2000, a stencil mask, drawn directly or inside a
+  form, with the words typed over it hidden or shown, on PyMuPDF 1.27.2.3
+  and 2.1). The gap was a picture that shows the word somewhere other than
+  where the text puts it, as a careless OCR layer does (its words smaller
+  than the picture's, and shifted): the search's box blanked part of the
+  word, the rest stayed in the picture, and the run verified. And where OCR
+  read the word, its place was dropped for touching the search's box
+  (#128). Now OCR's place is dropped only when the word, as OCR boxed it,
+  lies within the search's boxes it touches, give or take a point
+  (`OCR_COVER_SLACK`: OCR's word reached at most 0.63 pt past the search's
+  box where the layer had it right, on scans made at 72 to 300 dpi, blurred
+  and turned a little; one pixel of a 72-dpi scan is a point). Otherwise it
+  is applied like any other place OCR found, in the re-reading too, and it
+  is not counted again: the search counted that occurrence. On such a page,
+  1,095 of the word's 1,924 dark pixels were left in the picture; now none
+  is. A new check, `redaction.search_image`, "The pictures under the
+  search's boxes are blanked there", looks at the data of every picture
+  the page draws under one of the search's boxes, on every page, OCR or not
+  — its own pixels, its soft mask or mask, and pictures written into the
+  page — and refuses the run if one still holds something there ("A picture
+  on page 1 still holds what the search found, under the black box. It
+  could be taken out of the file."), or if one cannot be read ("could not be
+  checked"). It looks only at what the redaction blanks: pictures the page's
+  content draws, directly or through forms, and pictures written into its
+  content, told apart by where they are drawn and their size
+  (`pdf_verify.drawn_by_content`). A shading, text filled with one, an
+  annotation's appearance and a picture that is part of a soft mask, which
+  MuPDF also reports as pictures under the box, are not looked at: doing so
+  refused nine of pdf.js's test files that held nothing of the word.
+  `redaction.ocr_image` stays as strict as it was.
+  The boxes the search's second look adds are now left out of the check that
+  a page OCR read changed nothing outside the boxes, as its first boxes
+  were. Samples 25 (a searchable scan made by MuPDF's OCR whose layer
+  misreads one word), 26 (a careless layer) and 27 (a layer over a stencil
+  mask) in `tests/manual/make_redact_samples.py`. Tests:
+  `tests/test_redact_text_layer.py`.
+- **Single-file tool pages show the file once one is loaded (#147).** On
+  Crop, Extract Images, Extract Text, Flatten, Metadata, N-up, Page Numbers,
+  Page Operations, PDF to Images, PDF to Word, Repair, Split, Translate and
+  Analyze, the drop box kept its full "Drop PDF file here" prompt after a
+  file was picked, as if nothing had been. It now shows the file's name and
+  "click or drop to pick another", as Redact's does (#135). Frontend rebuilt
+  (`web-react/dist/`).
 - **Translation works offline, and no longer hands back English silently
   (#121).** Before it split a language's sentences, stanza (see Security)
   fetched its list of models from raw.githubusercontent.com, so with no

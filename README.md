@@ -193,8 +193,11 @@ removed, and nothing is searched for.
 **Checked before saving.** The new file is written beside the destination
 and checked there: the page text, the page code, annotations, form fields,
 links, the document's details, bookmarks, attachments, the structure tree,
-thumbnails, what is under each box you drew, and a search of every string
-and stream in the file. It is saved only if every check passes. Otherwise
+thumbnails, what is under each box you drew, the pictures the page draws
+under each place the search found (their pixels must be blanked there, so
+the word cannot be taken out of the file with the picture; see the known
+limits), and a search of every string and
+stream in the file. It is saved only if every check passes. Otherwise
 nothing is saved, and the original is untouched, even when redacting in
 place.
 
@@ -203,8 +206,10 @@ places on how many pages were redacted, what else was removed, and what is
 good to know: pages with no text to search (a scan or a picture: any words
 in it were not searched), pages that are mostly a picture with a few words
 of text (only those words were searched), the pages OCR read and what it
-found on each (see *Reading scanned pages*), a scan's hidden text layer that was searched (a
-word the layer misread is still in the picture), attachments, which are
+found on each (see *Reading scanned pages*), a scan's hidden text layer that
+was searched (a word the layer misread or put in the wrong place is still in
+the picture, unless OCR read the picture too, and then what OCR found beyond
+the layer), attachments, which are
 searched as they are stored and never opened (a zip or a Word file is
 packed, so nothing inside it is searched), pages turned into pictures, a
 run by boxes alone, a form field under a box that is still shown in another
@@ -231,19 +236,24 @@ and runs on 2.x with a note (see Install).
 **Reading scanned pages (OCR).** Tick *Also read scanned pages with OCR
 (slower)* under the search words. It is off by default and needs search
 words. A search then also reads, with OCR, every page it has no text to read
-on (a scan, a picture), and every page that is mostly a picture with a few
-words of text on it: pictures cover half the page or more, and the search
-reads 200 characters or fewer there (a scan with a typed page or Bates
-number, a stamp, a "Scanned with" line or a note on it). Where OCR finds a
-search word, a black box covers it with a small margin, and the picture's own
-pixels under the box are blanked, so the word is not in the file for anyone
-who takes the picture out. Where OCR reads the word in such a page's typed
-text, the search has found it there already and removes it the usual way. A
-page that is sideways or upside down is read at each quarter turn. Before
-saving, these places are checked too: each shows only black, the picture
-holds nothing there any more, OCR no longer reads the word on the page, and
-nothing else on the page changed. The result names every page OCR read, so
-that you can check them by eye.
+on (a scan, a picture), every page that is mostly a picture with a few
+words of text on it (pictures cover half the page or more, and the search
+reads 200 characters or fewer there: a scan with a typed page or Bates
+number, a stamp, a "Scanned with" line or a note on it), and every page
+whose text is a hidden layer over a picture (a "searchable" scan, whose
+layer was made by OCR before and can have a word wrong, or in the wrong
+place). Where OCR finds a search word, a black box covers it with a small
+margin, and the picture's own pixels under the box are blanked, so the word
+is not in the file for anyone who takes the picture out. Where OCR reads the
+word where the search found it in the page's text, and the word lies within
+the search's own black box (give or take a point), the search has it
+covered and removes it the usual way. Where the word in the picture reaches
+past that box, or lies somewhere else, OCR's box blacks it out too; it is
+not counted twice. A page that is sideways or upside down is read at each
+quarter turn. Before saving, these places are checked too: each shows only
+black, the picture holds nothing there any more, OCR no longer reads the
+word on the page, and nothing else on the page changed. The result names
+every page OCR read, so that you can check them by eye.
 
 OCR uses PyMuPDF's own built-in Tesseract (the Tesseract program is not
 needed) and one language file: English, `eng.traineddata` from
@@ -268,13 +278,24 @@ Known limits of OCR:
   dpi, and on 26 of 64 pages tilted 1.5 degrees.
 - It is slow: a page took about 20 seconds in the owner's tests, and up to
   two and a half minutes on a large one. Cancel waits for the reading in
-  progress.
+  progress. A searchable scan is now read too, but only the way its hidden
+  text runs, since that is the way its lines run. On searchable scans made
+  here, a page took 0.2 to 2.9 seconds with OCR, against 0.4 or less
+  without. A real searchable scan in Russian, which English OCR cannot
+  read, took 1 second a page; read all four ways, it took 5.6.
+- On a searchable scan, OCR's box takes every character of the hidden layer
+  under it, which can be letters of the words on the lines just above and
+  below the search word, in the layer only: on searchable scans made here,
+  up to 41 such letters in a file. What the page shows is checked as for
+  any page OCR read.
 - A redacted scan's picture is saved without loss, so the file grows: 1.3 to
   1.6 times for a typical scan, up to about 15 times on a real page (13 times
   for a large JPEG, 14.5 times for a JPEG 2000 picture).
-- A page with an OCR text layer (a "searchable" scan) is searched through
-  that layer and not read again; a word the layer misread is still in the
-  picture, and the result says so.
+- With OCR off, a page with an OCR text layer (a "searchable" scan) is
+  searched through that layer only: a word the layer misread, or put in the
+  wrong place, is still in the picture, and the result says so and that
+  ticking OCR reads the picture too. A layer over a black-and-white scan
+  stored as a stencil mask (JBIG2, CCITT) counts as one too.
 - A page with more than a few words of text on its picture (type over a
   background picture, a form with a scanned signature) is searched as text
   and not read with OCR.
@@ -319,6 +340,16 @@ described here.
   scanned pages*). Attachments are searched as stored and never opened. A few places have no rule yet (web-capture names, an
   output intent's strings, certificates in the document security store):
   a term there is refused.
+- The check of the pictures under the search's boxes looks only at what the
+  redaction blanks: pictures the page draws, directly or through a form,
+  and pictures written into the page's own code. A shading (a colour blend),
+  text filled with one, a note's or stamp's own picture, and a picture that
+  is part of a soft mask (a picture used to fade another) are left as they
+  are and not checked. A word drawn only in one of those stays.
+- On a page whose text after a hidden OCR layer is drawn by a form, removing
+  a word can leave that text invisible (issue #150). With OCR ticked, the
+  run is refused, as it should be, if OCR found a place to black out on
+  that page. Otherwise, and always with OCR off, it is not noticed.
 
 ---
 

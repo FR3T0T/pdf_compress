@@ -1,13 +1,16 @@
-"""Write the sample files for the Redact app checklist (#119, #128, #134).
+"""Write the sample files for the Redact app checklist (#119, #128, #134,
+#140, #143).
 
 Usage: python tests/manual/make_redact_samples.py <folder>
 
 Every file is built here, object by object, with pikepdf, Pillow and
 PyMuPDF, which the app already needs; nothing is downloaded or copied. Each
-page says what the sample is for; a scan (samples 18 to 23, for reading
-scanned pages with OCR) says it in its own picture. The checklists that use
-them are in the pull requests for #119 and #128. This is not a test: pytest
-collects only test_*.py files.
+page says what the sample is for; a scan (samples 18 to 23 and 25 to 27,
+for reading scanned pages with OCR) says it in its own picture. Sample 25
+is given its text layer by MuPDF's own OCR, so it needs the OCR language
+file (python setup_ocr.py --install); without it, it is skipped. The
+checklists that use them are in the pull requests for #119, #128 and #143.
+This is not a test: pytest collects only test_*.py files.
 """
 import io
 import os
@@ -18,6 +21,9 @@ import fitz
 import pikepdf
 from pikepdf import Array, Dictionary, Name, String
 from PIL import Image, ImageDraw
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+import pdf_ocr  # noqa: E402
 
 TERM = "ACME-4471"
 
@@ -464,6 +470,94 @@ def page_with_a_user_unit(folder):
     save(pdf, folder, "24_page_with_a_user_unit.pdf")
 
 
+# ── Searchable scans, for #140 and #143 ──────────────────────────────────
+
+def _misread(pdf, page, right: str, wrong: str) -> bool:
+    """In *page*'s OCR text layer (MuPDF's: each word a string of two-byte
+    codes), make the first *right* read *wrong*, which has as many letters:
+    the layer misreads it, in the same place. False when the layer has no
+    such word."""
+    old = "".join(f"{ord(c):04x}" for c in right).encode()
+    new = "".join(f"{ord(c):04x}" for c in wrong).encode()
+    for stream in ([page["/Contents"]] if isinstance(page["/Contents"], pikepdf.Stream)
+                   else list(page["/Contents"])):
+        data = stream.read_bytes()
+        if old in data.lower():
+            at = data.lower().index(old)
+            stream.write(data[:at] + new + data[at + len(old):])
+            return True
+    return False
+
+
+def searchable_scan_with_a_misread(folder):
+    tessdata = pdf_ocr.ocr_status()["tessdata"]
+    if not tessdata:
+        print("skipped 25_searchable_scan_with_a_misread.pdf: the OCR language file is not "
+              "installed (python setup_ocr.py --install)")
+        return
+    rows = ["Sample 25: a searchable scan. Its hidden text layer was made by",
+            "OCR, and it misreads one word on purpose: in the layer, the",
+            "first reference below ends in a small L, not in a one.", "",
+            f"The account {TERM} was opened in March.",
+            f"Please quote {TERM} when you write to us.", "",
+            "Search for the reference with OCR off: the second goes, the",
+            "first stays in the picture, and the result says why. With OCR",
+            "on, both go."]
+    buf = io.BytesIO()
+    scan_picture(rows).save(buf, "JPEG", quality=85)
+    # MuPDF's OCR reads nothing on a grey picture: it is given it in colour.
+    shot = fitz.Pixmap(fitz.csRGB, fitz.Pixmap(buf.getvalue()))
+    shot.set_dpi(200, 200)
+    pdf = pikepdf.Pdf.open(io.BytesIO(shot.pdfocr_tobytes(language=pdf_ocr.LANGUAGE,
+                                                          tessdata=tessdata)))
+    if not _misread(pdf, pdf.pages[0].obj, TERM, TERM[:-1] + "l"):
+        print("note: OCR did not read the reference as one word; sample 25 has no misread")
+    save(pdf, folder, "25_searchable_scan_with_a_misread.pdf")
+
+
+def sloppy_text_layer(folder):
+    """#143: the layer's words are smaller than the picture's and somewhere
+    else. The search's box over the layer's word covers part of the word in
+    the picture; OCR, reading the picture, finds all of it."""
+    rows = ["Sample 26: the hidden text layer of this",
+            f"Account {TERM} is overdue now.",
+            "scan is small and in the wrong place. Search",
+            "for the reference, with OCR and without."]
+    doc = fitz.open()
+    page = doc.new_page(width=600, height=400)
+    for i, row in enumerate(rows):
+        page.insert_text((30, 96 + 30 * i), row, fontname="helv", fontsize=20)
+    pix = page.get_pixmap(dpi=144, colorspace=fitz.csGRAY)
+    doc.close()
+    picture = Image.frombytes("L", (pix.width, pix.height), pix.samples).point(
+        lambda v: 235 if v > 128 else 25)
+    pdf = pikepdf.Pdf.new()
+    hidden = "".join(f"\nBT 3 Tr /F1 15 Tf 34 {400 - (72 + 60 * i)} Td ({row}) Tj ET"
+                     for i, row in enumerate(rows)).encode()
+    picture_page(pdf, image(pdf, picture), "q 600 0 0 400 0 0 cm /Scan Do Q", size=(600, 400),
+                 typed=hidden)
+    save(pdf, folder, "26_scan_with_a_sloppy_text_layer.pdf")
+
+
+def text_layer_over_a_stencil(folder):
+    """#140: a black-and-white scan is often a stencil mask (JBIG2, CCITT).
+    Its hidden layer was not taken for one: no note, and no OCR."""
+    rows = ["Sample 27: a black-and-white scan, stored as a stencil mask,",
+            f"with a hidden text layer. The account {TERM} is closed.",
+            "The result should say that this page is a scan with a layer."]
+    bits = picture_of_words(rows).point(lambda v: 255 if v > 128 else 0).convert("1")
+    pdf = pikepdf.Pdf.new()
+    stencil = pdf.make_stream(zlib.compress(bits.tobytes()), Type=Name.XObject, Subtype=Name.Image,
+                              Width=bits.width, Height=bits.height, ImageMask=True,
+                              BitsPerComponent=1, Filter=Name.FlateDecode)
+    x, y, width, height = SCAN
+    hidden = "".join(
+        f"\nBT 3 Tr /F1 14 Tf {x + SCAN_ROW[0]} {y + height - SCAN_ROW[1] - i * SCAN_ROW[2]} Td "
+        f"({row}) Tj ET" for i, row in enumerate(rows)).encode()
+    picture_page(pdf, stencil, f"q 0 0 0 rg {width} 0 0 {height} {x} {y} cm /Scan Do Q", typed=hidden)
+    save(pdf, folder, "27_text_layer_over_a_stencil_mask.pdf")
+
+
 def main(folder: str) -> None:
     os.makedirs(folder, exist_ok=True)
     number_across_a_line(folder)
@@ -490,6 +584,9 @@ def main(folder: str) -> None:
     page_too_large(folder)
     large_jpeg_drawn_larger_than_the_page(folder)
     page_with_a_user_unit(folder)
+    searchable_scan_with_a_misread(folder)
+    sloppy_text_layer(folder)
+    text_layer_over_a_stencil(folder)
 
 
 if __name__ == "__main__":
