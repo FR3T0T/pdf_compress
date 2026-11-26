@@ -161,7 +161,7 @@ python compress_pdf.py document.pdf --detailed-log    # the detailed log, which 
 ### Repair & Analysis
 - **Repair PDF** — fix corrupted PDF files
 - **Compare PDFs** — find differences between two PDFs
-- **Analyze Document** — offline privacy & security audit; finds embedded JavaScript (including scripts on bookmarks and form fields), auto-run/launch actions, external trackers, embedded files and references to external files, hidden layers, invisible text, and identifying metadata (document, page or object level), and says so when part of a file could not be checked. One-click sanitizing writes a clean copy that is verified before it is saved: it reports what it removed and what the ticked options left alone, or refuses and says what is still there
+- **Analyze Document** — offline privacy & security audit; finds embedded JavaScript (including scripts on bookmarks and form fields), auto-run/launch actions, external trackers, embedded files and references to external files, hidden layers, invisible text, identifying metadata (document, page or object level), and earlier versions a file keeps from incremental saves (which can still hold what a later version removed), and says so when part of a file could not be checked. One-click sanitizing writes a clean copy, with only the current version, that is verified before it is saved: it reports what it removed and what the ticked options left alone, with a proof of removal you can save as a report, or refuses and says what is still there
 
 ---
 
@@ -197,8 +197,10 @@ thumbnails, what is under each box you drew, the pictures the page draws
 under each place the search found (their pixels must be blanked there, so
 the word cannot be taken out of the file with the picture; see the known
 limits), the text outside the boxes, that nothing a box redacted is left
-in the file, and a search of every string and stream in the file. It is
-saved only if every check passes. Otherwise nothing is saved, and the
+in the file, that the new file keeps no earlier versions of itself (an
+editor that saves incrementally leaves every earlier version in the file;
+Redact writes the file whole), and a search of every string and stream in
+the file. It is saved only if every check passes. Otherwise nothing is saved, and the
 original is untouched, even when redacting in place.
 
 The text outside the boxes is checked because the PDF library rewrites
@@ -251,6 +253,27 @@ search term, and PyMuPDF 1.28 (see Install), are refused before anything is
 written. A search that finds nothing is not an error: the page says so in a
 note, with the pages it could not read, and that nothing was saved. Neither
 is Cancel: the page says the run stopped and nothing was saved.
+
+**Proof of removal.** Under the result line of a saved run (Redact, and
+Sanitize on the Analyze page) a **Proof of removal** panel, closed until you
+open it, sets out the run in three groups, by page where there are pages:
+*removed and confirmed gone*, with the checks of the new file that confirm
+it; *found but not targeted*, each with a next step (a form field still
+shown elsewhere; for Sanitize, what the ticked options did not cover, such
+as "Run Sanitize with “Document & XMP metadata” ticked."); and *not
+checked* (pages with no text, scans searched only by their text layer, what
+OCR read, the insides of attachments, a source whose versions could not be
+counted), so that nothing reads as checked when it was not. Then how many
+earlier versions the source kept and that the new file keeps none, and what
+the app did on the network during the run ("Network: none used during this
+run."). Check ids are only under *Technical details*. **Save report**
+writes the same beside the new file, as `<name>.removal-report.json` and
+`<name>.removal-report.txt`, and never over a file that is there (" (2)" is
+added, and so on). It names the two files without their folders and gives
+both SHA-256s; it never holds the words you searched for, the text found, a
+password, a folder, an attachment's name, or the evidence lines of a check.
+It is not offered for a run on the workspace document, whose file is the
+app's own until you export it.
 
 **The black is the box.** Each place is filled black, with an edge half a
 point past it, the same on a page with a user unit (a page drawn larger than
@@ -498,7 +521,8 @@ Text and vector graphics are never modified.
 ## Security and privacy
 
 - **Fully offline** — no telemetry, no cloud dependencies, no accounts. Nothing goes online unless you start one of the setup steps in [What goes online](#what-goes-online)
-- **Network kill-switch for the interface** — the app's interface runs in an embedded web view. A `QWebEngineUrlRequestInterceptor` blocks every non-local request it makes (anything but `file`/`qrc`/`data`/`blob`/`about`) at the engine level, and a restrictive Content-Security-Policy (`connect-src 'none'`) backs it up, so the interface cannot reach the network. The kill-switch does not cover the Python side of the app, where the setup downloads below run
+- **Network kill-switch for the interface** — the app's interface runs in an embedded web view. A `QWebEngineUrlRequestInterceptor` blocks every non-local request it makes (anything but `file`/`qrc`/`data`/`blob`/`about`) at the engine level, and a restrictive Content-Security-Policy (`connect-src 'none'`) backs it up, so the interface cannot reach the network
+- **Network guard for the app's own process** — the first thing the app and the command line do is install `network_guard`: from then on Python's socket module in the app's process refuses every connection to anything but this computer (`connect`, `connect_ex`, `create_connection`, and a name lookup for a name that is not local), and says that the app makes no network connection unless you start a setup step. A proxy on this computer (a company's proxy client, an antivirus web shield, Fiddler) would carry a connection out, so a connection to the port of any proxy Python would use is refused too, even on this computer: the proxies are read when the connection is made, from the environment and, on Windows, from the system's Internet settings. The one way through is the translation setup you start in the Translate tool, which opens the guard for its downloads and shuts it again however they end. The guard covers the app's own process only, and only what goes through Python's socket module. Other programs the app starts are separate processes and are not covered: Ghostscript (Compress), and pip, which only the developers' lock generator runs. Neither is native code inside the process, such as MuPDF with its built-in Tesseract (OCR) and Qt, nor a datagram sent without connecting or a lookup through `gethostbyname`; nothing in the app does either. And a forwarder on this computer that is not set as a proxy (a tunnel, a port forward) looks to the guard like any other program on this computer: a connection to it is allowed, and the guard cannot tell that it goes further. A proxy still works during the translation setup. `setup_translation.py` and `setup_ocr.py` are download tools you run on purpose, and do not install it. A redaction or sanitize report says what the guard saw during the run
 - **Document audit** — the Analyze Document tool inspects a PDF for trackers, scripts, and hidden data entirely on-device
 - **PDF magic validation** — rejects files without valid `%PDF-` headers before processing
 - **Decompression bomb protection** — images exceeding 200 million pixels are skipped
@@ -510,8 +534,8 @@ Text and vector graphics are never modified.
 - **Atomic file I/O** — temp file + `os.replace()`; original file is never corrupted on failure
 - **Verify, then commit (Redact)** — the redacted candidate is written to a temp file beside the destination, verified there, and renamed into place only if verification passes. A refused redaction never creates, replaces, or deletes the destination
 - **No identifier carry-over (Redact, Sanitize)** — PDF libraries preserve the trailer `/ID` across saves so revisions of a document can be recognised; for a redacted or sanitized copy that is a link back to the original. Both tools drop it and write a new one derived from the output's own content as their last step, and verification refuses an output that still shares an identifier with its source. The verification report records the SHA-256 of both files
-- **Verify, then commit (Sanitize)** — the cleaned copy is written to a temp file beside the destination and audited again there, twice over: by the analyzer, and by an independent sweep of every object in the file. It is renamed into place only if everything the ticked options promise to remove is gone, every one of those checks could be carried out, and the copy shares no identifier with its source. Otherwise Sanitize refuses, says what is still present or what could not be checked, and has not created, replaced, or deleted the destination. What the ticked options do not cover is listed as remaining, not hidden
-- **"Could not check" is not "clean" (Analyze)** — a structure the audit cannot read does not end it, and does not pass silently either: the findings it could have produced are reported as not checked (`audit.incomplete`), and Analyze never answers "no concerns" for a file it could not fully read
+- **Verify, then commit (Sanitize)** — the cleaned copy is written to a temp file beside the destination and audited again there, twice over: by the analyzer, and by an independent sweep of every object in the file. It is renamed into place only if everything the ticked options promise to remove is gone, every one of those checks could be carried out, the copy keeps no earlier versions of itself, and it shares no identifier with its source. Otherwise Sanitize refuses, says what is still present or what could not be checked, and has not created, replaced, or deleted the destination. What the ticked options do not cover is listed as remaining, not hidden
+- **"Could not check" is not "clean" (Analyze)** — a structure the audit cannot read does not end it, and does not pass silently either: the findings it could have produced are reported as not checked (`audit.incomplete`), and Analyze never answers "no concerns" for a file it could not fully read. Earlier versions are counted by PyMuPDF; a damaged file it has to repair to open counts as one version whatever it keeps, so the file's own bytes decide: one `%%EOF`, one `startxref` and no object defined twice is one version, and anything else is reported as not checked
 - **Known limits (Sanitize)** — three, each needing a file built for the purpose. A trailer `/Info` that points at a dictionary with another job and nothing but strings, names, numbers and booleans in it (and no `/Type`, `/Subtype` or `/S`) is emptied by the metadata option, taking that other job's entries with it. An `/Info` dictionary that is also held under a second key and declares a `/Type`, or holds an array or a dictionary, is only unhooked from the trailer: its entries stay in the file under the other key and the copy still verifies. And the identifier check compares the elements of the two trailer `/ID`s, so an identifier hidden inside a nested array in the source's `/ID` is not seen
 - **Backup system** — optional `.backup` copy with rotation before overwriting originals
 - **Thread-safe cancellation** — cancel at any point without leaving partial output files
@@ -537,6 +561,15 @@ After setup, translating, reading text from images and redacting make no
 network connection. A translation whose sentence model is missing stops and
 says so; it does not fetch the model.
 
+In the app, the network guard (see *Security and privacy*) holds this to
+account: outside the translation setup, the app's own process cannot
+connect to anything but this computer, nor through a proxy on it. The rows
+above that are commands you run (`setup_translation.py`, `setup_ocr.py`,
+the lock generator) do not install the guard. pip, run by the lock
+generator, is a separate process, and so is Ghostscript; the guard does not
+cover other processes. Nor can it tell a forwarder on this computer that is
+not set as a proxy (a tunnel, a port forward) from any other program here.
+
 ### What the app keeps on your computer
 
 | What | Where | What's in it, and when it goes |
@@ -547,6 +580,7 @@ says so; it does not fetch the model.
 | Translation engine | Windows `%LOCALAPPDATA%\PDFToolkit\translate-runtime`, elsewhere `~/.local/share/pdftoolkit/translate-runtime` | What translation setup installed (packaged app). Replaced by the next setup |
 | Language packs and sentence models | `~/.local/share/argos-translate` (`packages`, `minisbd`), with Argos Translate's cache and settings in `~/.local/cache/argos-translate` and `~/.config/argos-translate` | What translation setup downloaded |
 | OCR language file | Windows `%LOCALAPPDATA%\PDFToolkit\ocr-data`, elsewhere `~/.local/share/pdftoolkit/ocr-data` | `eng.traineddata`, from `python setup_ocr.py --install` (the packaged app carries its own) |
+| Removal reports | beside the redacted or clean copy: `<name>.removal-report.json` and `<name>.removal-report.txt` | Only when you press **Save report**: the proof of removal of that run (file names without folders, SHA-256s, the checks, what was removed and left). Never the words searched for, the text found or a password. Kept until you delete them |
 | Backups | beside the original: `<name>.pdf.backup`, and the one before it as `.backup.old` | A copy of the original, made before Compress saves over it: in the app whenever it saves over the original (it normally writes a new file beside it instead), on the command line with `--backup`. Kept until you delete it |
 | Web view | nothing on disk | The interface runs in an off-the-record profile: its cache is kept in memory and it stores no cookies or web storage. Qt may create an empty graphics cache folder under `%LOCALAPPDATA%\PDFCompress` |
 
@@ -567,6 +601,8 @@ when the tool finishes, whether it worked or not.
 | `epdf_crypto.py` | Enhanced encryption engine (.epdf format — ChaCha20, AES-256, Camellia; header-authenticated v2) |
 | `pdf_analyze.py` | Offline privacy/security audit + sanitizer engine (verify, then commit); also `sanitize_payload`, the Qt-free answer the bridge gives the Sanitize panel |
 | `pdf_verify.py` | Post-operation verification loop — independently re-checks redacted/sanitized output and reports proof of removal (Qt-free) |
+| `removal_report.py` | The proof of removal in plain words (the panel's three groups, the earlier-versions and network lines) and the report Save report writes beside the new file (Qt-free) |
+| `network_guard.py` | The app process's network guard: refuses every connection outside this computer except in the translation setup's window, and records what it saw (Qt-free) |
 | `pdf_translate.py` | Offline translation + OCR engine (Argos + Tesseract) |
 | `translate_runtime.py` | On-demand provisioning of the translation runtime (frozen builds leave the translation stack out; this downloads pinned wheels into a user dir once) |
 | `translate_runtime_lock.json` | Pinned wheel manifest for that runtime, and what it leaves out of argostranslate's requirements (stanza, spaCy) and why (regenerate: `python translate_runtime.py --make-lockfile`) |

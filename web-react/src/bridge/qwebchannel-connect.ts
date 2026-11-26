@@ -34,6 +34,7 @@ interface RawBridge {
   analyzeDocument(path: string): Promise<string>;
   getSanitizeDefaults(scope: string): Promise<string>;
   sanitizeDocument(path: string, outputPath: string, optionsJson: string): Promise<string>;
+  saveRemovalReport(tool: string): Promise<string>;
   getTranslationStatus(): Promise<string>;
   startGetTranslationStatus(paramsJson: string): void;
   translateText(text: string, source: string, target: string, protectTermsJson: string): Promise<string>;
@@ -192,6 +193,12 @@ export function connectQWebChannel(): Promise<void> {
             await raw.sanitizeDocument(path, outputPath, JSON.stringify(options || {})),
             { success: false }
           );
+        },
+        async saveRemovalReport(tool) {
+          return safeJsonParse(await raw.saveRemovalReport(tool), {
+            success: false,
+            error: 'The report could not be saved.',
+          });
         },
         async getTranslationStatus() {
           return safeJsonParse(await raw.getTranslationStatus(), {});

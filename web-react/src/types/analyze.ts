@@ -89,6 +89,52 @@ export interface SanitizeVerification {
   /** Checks outside the selected options that could not be completed. */
   unevaluated: Array<{ id: string; reasons: string[] }>;
   diagnostics: string[];
+  /** #122: earlier versions kept by incremental saves; null = not counted. */
+  earlierVersions?: { source?: number | null; output?: number | null; sourceWhy?: string };
+  /** #120 d: what the app's process did on the network during the run. */
+  network?: { watched: boolean; windows: unknown[]; refused: number; hosts: string[] } | null;
+}
+
+/** One line of the proof of removal (removal_report.assemble, #100). Its
+ *  words never name its pages: the panel puts `where` in front. */
+export interface ProofItem {
+  what: string;
+  pages: number[];
+  /** The pages in words ("Pages 1-3 and 9"), "" for none. */
+  where: string;
+  /** Found but not targeted, and Not checked: what to do about it. */
+  next?: string | null;
+  /** Removed: where it was (page_content, docinfo, embedded_files, …). */
+  surface?: string;
+}
+
+/** A check in plain words, with its id for Technical details. */
+export interface ProofCheck {
+  id: string;
+  description: string;
+  passed: boolean;
+  pages: number[];
+}
+
+/** The proof of removal a finished Redact or Sanitize carries (#100):
+ *  three groups, the earlier-versions line and the network line, all
+ *  worded by the Python side. */
+export interface RemovalProof {
+  tool: string;
+  removed: ProofItem[];
+  notTargeted: ProofItem[];
+  notChecked: ProofItem[];
+  checks: ProofCheck[];
+  earlierVersions: string;
+  network: string;
+}
+
+/** ui/bridge.py's saveRemovalReport: the two file names written beside the
+ *  new file, or why nothing was. */
+export interface SaveReportResponse {
+  success: boolean;
+  files?: string[];
+  error?: string;
 }
 
 /** pdf_verify.py's `sanitize_refusal_detail()`: a refusal as the short lists
@@ -111,6 +157,8 @@ export interface SanitizeResponse {
   output?: string;
   output_size?: number;
   verification?: SanitizeVerification;
+  /** A PDF's finished run in plain words (#100); never on a refusal. */
+  proof?: RemovalProof;
   refusal?: SanitizeRefusal;
   error?: string;
   errorType?: string;

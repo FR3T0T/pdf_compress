@@ -12,6 +12,7 @@ from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication
 
+import network_guard
 import workspace_dir
 from app_log import setup_file_logging
 from ui import MainWindow
@@ -39,6 +40,9 @@ def _app_icon() -> QIcon:
 
 
 def main():
+    # First of all: this process connects to nothing outside the computer
+    # unless the user starts a setup step (#120 d; network_guard).
+    network_guard.install()
     try:
         # Off by default: the detailed log names files and folders (#120).
         # Set from the home screen (Bridge.setDetailedLog).

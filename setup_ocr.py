@@ -3,7 +3,8 @@
 setup_ocr.py — fetch the language file Redact reads scanned pages with.
 
 This is the one step of OCR that uses the network, and it runs only when
-you run it. It fetches tessdata_fast's eng.traineddata (about 4 MB,
+you run it: a download tool, so it does not install the app's network
+guard (network_guard.py, #120 d). It fetches tessdata_fast's eng.traineddata (about 4 MB,
 Apache-2.0) at the commit pinned in ocr_data_lock.json, checks its size
 and SHA-256, and keeps it outside the repository (PDFTOOLKIT_OCR_DATA
 names another folder). The packaged app carries the file already. An

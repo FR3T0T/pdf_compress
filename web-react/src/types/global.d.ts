@@ -1,4 +1,4 @@
-import type { AnalyzeResponse, SanitizeOptions, SanitizeResponse } from './analyze';
+import type { AnalyzeResponse, SanitizeOptions, SanitizeResponse, SaveReportResponse } from './analyze';
 import type { PresetsResponse } from './bridge';
 
 /**
@@ -28,6 +28,10 @@ export interface RealBridgeAPI {
   analyzeDocument(path: string): Promise<AnalyzeResponse>;
   getSanitizeDefaults(): Promise<SanitizeOptions>;
   sanitizeDocument(path: string, outputPath: string, options: Partial<SanitizeOptions>): Promise<SanitizeResponse>;
+  // Save report (#100): writes the proof of removal of the last finished
+  // "redact" or "sanitize" run beside its new file. Only the tool is sent;
+  // the bridge kept the run, and answers with the two file names.
+  saveRemovalReport(tool: 'redact' | 'sanitize'): Promise<SaveReportResponse>;
   // New for the Redact page's box-drawing canvas (Part 2) -- no vanilla
   // equivalent, so no arg-count overload concern. Renders every page as a
   // full-size PNG at a fixed DPI (ui/bridge.py's getPageImages); `dpi` lets

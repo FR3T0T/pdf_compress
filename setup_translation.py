@@ -10,8 +10,9 @@ Toolkit translates offline and never fetches anything. It also tells you
 how to add Tesseract OCR data for reading images and scans, which is a
 system package.
 
-The app's network kill-switch (ui/net_guard.py) covers only the embedded
-web interface; this script is a separate, explicit, user-run step. The
+The app's network guards (ui/net_guard.py for the embedded web interface,
+network_guard.py for the app's own process) are not installed here: this
+script is a download tool, a separate, explicit, user-run step. The
 README's "What goes online" lists everything in the toolkit that can use
 the network.
 

@@ -56,7 +56,10 @@ transform raises, with the report, having touched nothing at the destination:
     ``redact_pdf`` (#150), for text outside the boxes that no longer shows
     as it did (``redaction.text_outside``, damage, not a leak) and for a
     picture or form a page with a box drew that is left in the file with
-    nothing drawing it (``redaction.left_behind``).
+    nothing drawing it (``redaction.left_behind``). Every redaction's output
+    must keep no earlier versions of itself from incremental saves
+    (``redaction.one_version``, #122); the report records how many the
+    source kept.
   - :func:`verify_sanitization` — re-runs the ``pdf_analyze`` audit on the
     output and asserts absent exactly the finding categories the enabled
     sanitize options promised to remove (expectations-based — anything else
@@ -71,7 +74,8 @@ transform raises, with the report, having touched nothing at the destination:
     never seen a PDF's object graph (:func:`plain_location`); the raw object
     path stays on the check as ``object_paths``. Given the source's trailer
     /ID elements it asserts, like the redaction side, that the output
-    carries none of them (``sanitize.file_id``).
+    carries none of them (``sanitize.file_id``), and, whatever the options,
+    that it keeps no earlier versions of itself (``sanitize.one_version``).
     :func:`sanitize_refusal_message` turns a failed report into the one
     sentence a refusal shows, and :func:`sanitize_refusal_detail` into the
     short lists a screen shows under it (what is still present, what could
@@ -134,6 +138,7 @@ import pikepdf
 from pdf_analyze import (
     DEFAULT_SANITIZE,
     analyze_document,
+    earlier_versions,
     file_sha256,
     page_content_blobs,
     trailer_ids,
@@ -226,6 +231,16 @@ class VerificationReport:
     #: tolerant, and the checks judge its result, so this is the "why" a
     #: refusal would otherwise lack). Names no file.
     diagnostics: list[str] = field(default_factory=list)
+    #: Earlier versions kept by incremental saves (#122): ``{"source": n,
+    #: "output": m}``, None where they could not be counted (then
+    #: "sourceWhy" says why, in words that name no file). The source's is
+    #: what the caller counted while it had the input open (absent when it
+    #: supplied none); the output's is the one-version check's.
+    earlier_versions: dict = field(default_factory=dict)
+    #: What the app's own process did on the network while the run went on
+    #: (network_guard.activity_since, #120 d), as the caller recorded it;
+    #: None when it recorded nothing.
+    network: Optional[dict] = None
 
     @property
     def verified(self) -> bool:
@@ -301,6 +316,8 @@ class VerificationReport:
             "outputSha256": self.output_sha256,
             "unevaluated": [dict(u) for u in self.unevaluated],
             "diagnostics": list(self.diagnostics),
+            "earlierVersions": dict(self.earlier_versions),
+            "network": dict(self.network) if self.network is not None else None,
         }
 
 
@@ -357,6 +374,37 @@ def _file_id_check(cid: str, output_path: str, source_ids,
         ev = [f"the output's trailer /ID still carries the source file's "
               f"identifier {i}, which links it to the original (document-level)"
               for i in _dedupe(out_ids) if i and i in src]
+    return VerificationCheck(id=cid, description=desc, passed=not ev, evidence=ev)
+
+
+def _one_version_check(cid: str, report: VerificationReport, output_path: str,
+                       earlier_in_source: Optional[tuple] = None) -> VerificationCheck:
+    """The output keeps no earlier versions of itself (#122).
+
+    An incremental save leaves what an earlier version held in the file, so
+    a cleaned copy that keeps one could still hold what was removed. Both
+    tools write their output whole, so this holds unless that changes; the
+    check is what would notice. Counted with PyMuPDF (pdf_analyze.
+    earlier_versions); an output that cannot be counted fails, unevaluated.
+    Always document-level: no page holds a version.
+
+    Records the output's count, and *earlier_in_source* (the caller's
+    ``(n, why)`` for the source, n None when it could not be counted), on
+    *report*.
+    """
+    n, why = earlier_versions(output_path)
+    if earlier_in_source is not None:
+        report.earlier_versions["source"] = earlier_in_source[0]
+        if earlier_in_source[0] is None:
+            report.earlier_versions["sourceWhy"] = earlier_in_source[1]
+    report.earlier_versions["output"] = n
+    desc = "Output keeps no earlier versions of itself from incremental saves"
+    if n is None:
+        return VerificationCheck(id=cid, description=desc, passed=False, unevaluated=True,
+                                 evidence=[f"the output's saved versions could not be counted: "
+                                           f"{why} (document-level)"])
+    ev = ([f"the output keeps {n} earlier version{'' if n == 1 else 's'} of itself from "
+           f"incremental saves, which can hold what was removed (document-level)"] if n else [])
     return VerificationCheck(id=cid, description=desc, passed=not ev, evidence=ev)
 
 
@@ -2833,7 +2881,8 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                      search_boxes: Optional[list[dict]] = None,
                      text_before: Optional[dict] = None,
                      text_along_line: bool = False,
-                     drawn_before: Optional[dict] = None) -> VerificationReport:
+                     drawn_before: Optional[dict] = None,
+                     earlier_in_source: Optional[tuple] = None) -> VerificationReport:
     """Independently confirm a redacted output no longer carries its targets.
 
     Mirrors redact_pdf's selection model: *terms* (search-term redactions)
@@ -2866,6 +2915,12 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
     (redact_pdf's account, :func:`drawn_before`), adds
     ``redaction.left_behind``: none of them is in the output where nothing
     draws it (#150).
+
+    Every report that gets past opening the output has
+    ``redaction.one_version``: the output keeps no earlier versions of
+    itself from incremental saves (#122). *earlier_in_source*, the source's
+    ``(n, why)`` as pdf_analyze.versions_of told it while the caller had the
+    input open, is recorded on the report beside the output's count.
 
     Never returns a false pass: an output that cannot be opened or
     decrypted yields a report with a failed ``redaction.readable`` check
@@ -2927,6 +2982,8 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
     if drawn_before is not None:
         report.checks.append(_left_behind_check(output_path, drawn_before, password))
     report.checks.extend(_whole_file_checks(output_path, password))
+    report.checks.append(_one_version_check("redaction.one_version", report, output_path,
+                                            earlier_in_source))
     if source_ids is not None:
         report.checks.append(_file_id_check(
             "redaction.file_id", output_path, source_ids, source_sha256,
@@ -3665,6 +3722,7 @@ _CATEGORY_WORDS = {
     "links_uri": "external links", "sweep_external_links": "external links",
     "meta_docinfo": "document metadata", "meta_xmp": "document metadata",
     "sweep_metadata": "document metadata",
+    "one_version": "earlier versions of the file, from incremental saves",
 }
 
 
@@ -3918,6 +3976,12 @@ def _refusal_lines(check: VerificationCheck, named: frozenset = frozenset()) -> 
     elif cid == "redaction.file_id":
         lines.append("The new file would still carry the original file's ID, which links the "
                      "two files.")
+    elif cid == "redaction.one_version":
+        counts = [int(m.group(1)) for e in seen for m in [re.search(r"keeps (\d+) earlier", e)]
+                  if m]
+        what = "earlier versions" if max(counts, default=1) > 1 else "an earlier version"
+        lines.append(f"The new file would still keep {what} of itself, which can hold what was "
+                     f"removed.")
     elif cid == "redaction.ocr_fill":
         lines.append(f"Something is drawn over a place on {where} where OCR found what you "
                      f"searched for, so it does not show black.")
@@ -4045,7 +4109,8 @@ def redaction_refusal_detail(report: VerificationReport, offer: Optional[list] =
 def verify_sanitization(output_path: str, options: Optional[dict] = None, *,
                         input_path: str = "",
                         source_ids: Optional[list[str]] = None,
-                        source_sha256: Optional[str] = None) -> VerificationReport:
+                        source_sha256: Optional[str] = None,
+                        earlier_in_source: Optional[tuple] = None) -> VerificationReport:
     """Re-audit a sanitized output and assert the promised removals held.
 
     *options* is the same dict passed to ``sanitize_pdf`` (missing keys
@@ -4069,6 +4134,10 @@ def verify_sanitization(output_path: str, options: Optional[dict] = None, *,
     given, a ``sanitize.file_id`` check asserts the output shares none of
     them — unless output and source are byte-identical, which is what
     sanitizing an already-clean file produces (see :func:`_file_id_check`).
+
+    ``sanitize.one_version`` asserts, whatever the options, that the output
+    keeps no earlier versions of itself from incremental saves (#122);
+    *earlier_in_source*, the source's ``(n, why)``, is recorded beside it.
 
     Fail-closed: a locked or unreadable output yields a failed
     ``sanitization.readable`` check, never a pass (a locked file re-scans
@@ -4137,6 +4206,10 @@ def verify_sanitization(output_path: str, options: Optional[dict] = None, *,
     # The second, independent look: every object in the output, judged by
     # what it is rather than by where the analyzer expects to find it.
     report.checks.extend(_sweep_checks(output_path, opts))
+
+    # Whatever the options: a clean copy keeps one version (#122).
+    report.checks.append(_one_version_check("sanitize.one_version", report, output_path,
+                                            earlier_in_source))
 
     if source_ids is not None:
         report.checks.append(_file_id_check(

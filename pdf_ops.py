@@ -18,7 +18,9 @@ from typing import Callable, NamedTuple
 import fitz  # PyMuPDF
 import pikepdf
 
+import network_guard
 import pdf_ocr
+import removal_report
 from pdf_analyze import (
     embedded_files,
     file_sha256,
@@ -30,6 +32,7 @@ from pdf_analyze import (
     remove_scripts,
     save_with_content_id,
     trailer_ids,
+    versions_of,
     write_name_tree,
 )
 from pdf_verify import (
@@ -1668,6 +1671,9 @@ class RedactResult:
     #:     word in place: the rest of the line can move along it (always
     #:     last; see _check_library).
     notes: list = field(default_factory=list)
+    #: {page number (1-based): places redacted on it}: redaction_count, page
+    #: by page, OCR's places among them (#100, for the proof of removal).
+    removed_by_page: dict = field(default_factory=dict)
 
 
 class RedactionVerificationError(Exception):
@@ -4944,11 +4950,134 @@ def redaction_summary(result: "RedactResult") -> dict:
     return {"headline": headline, "checked": checked, "removed": removed, "notes": notes}
 
 
+#: The next step for pages a search could not read.
+_READ_WITH_OCR = ("Run Redact again with “Also read scanned pages with OCR” ticked (OCR must be "
+                  "set up), or check {them} by eye.")
+
+
+def _proof_of_notes(notes: list) -> tuple[list, list, list]:
+    """RedactResult.notes as the proof's items (#100): (removed, found but
+    not targeted, not checked), each ``{"what", "pages", ...}``. Unlike
+    _note_in_words, the words never name the pages (the reader puts them
+    in front) and never an attachment's name: the saved report must hold
+    nothing of the document's."""
+    removed, not_targeted, not_checked = [], [], []
+
+    def unread(what: str, step: str, where: list) -> None:
+        them = "them" if len(set(where)) > 1 else "it"
+        not_checked.append({"what": what, "pages": where, "next": step.format(them=them)})
+
+    for note in notes or []:
+        kind = note.get("kind")
+        try:
+            pages = sorted({int(p) for p in note.get("pages") or []})
+        except (TypeError, ValueError):
+            pages = []
+        many = len(pages) > 1
+        them = "them" if many else "it"
+        if kind == "no_text":
+            unread(f"No text to search: {'they may be scans or pictures' if many else 'it may be a scan or a picture'}"
+                   f", so any words in {them} were not searched.", _READ_WITH_OCR, pages)
+        elif kind == "mostly_picture":
+            unread(f"{'Mostly pictures' if many else 'Mostly a picture'} with a few words of text: "
+                   f"only those words were searched.", _READ_WITH_OCR, pages)
+        elif kind == "text_layer":
+            unread(f"{'Scans' if many else 'A scan'} with a hidden text layer: the search read the "
+                   f"layer, not the {'pictures' if many else 'picture'}. A word the layer misread, "
+                   f"or put in the wrong place, is still in the {'pictures' if many else 'picture'}.",
+                   "Check {them} by eye." if note.get("ocr_asked") else
+                   "Run Redact again with “Also read scanned pages with OCR” ticked to read the "
+                   f"{'pictures' if many else 'picture'} too.", pages)
+        elif kind == "ocr_not_ready":
+            unread("OCR was asked for and is not set up, so pages with no text, or mostly a "
+                   "picture, were not read with it.", "Set up OCR, then run Redact again.", [])
+        elif kind == "ocr":
+            unread("Read with OCR, which can miss words.", "Check {them} by eye.", pages)
+        elif kind == "text_layer_read":
+            unread(f"{'Scans' if many else 'A scan'} with a hidden text layer, read with OCR too. "
+                   f"OCR can miss words.", "Check {them} by eye.", pages)
+        elif kind == "ocr_unread":
+            large = sorted({int(p) for p in note.get("too_large") or []})
+            rest = [p for p in pages if p not in large]
+            if rest:
+                unread("OCR found no words it could read: a photo, a drawing, or words not in "
+                       "English.", "Check {them} by eye.", rest)
+            if large:
+                unread("Too large to read with OCR, and not read.", "Check {them} by eye.", large)
+        elif kind == "attachments":
+            n, packed = len(note.get("names") or []), len(note.get("compressed") or [])
+            if not n:
+                continue
+            one = n == 1
+            what = (f"{_how_many(n, 'attached file', 'attached files')} "
+                    f"{'was' if one else 'were'} searched as {'it is' if one else 'they are'} "
+                    f"stored, and not opened.")
+            if packed:
+                who = ("It is" if one else "All of them are" if packed == n else
+                       f"{packed:,} of them {'is' if packed == 1 else 'are'}")
+                what += (f" {who} packed (like a zip or Word file), so nothing inside "
+                         f"{'it' if packed == 1 else 'them'} could be searched.")
+            it = "it" if one else "them"
+            not_checked.append({"what": what, "pages": [], "next":
+                                f"Open {it} to check {it}, or run Sanitize with “Embedded files "
+                                f"/ attachments” ticked to remove {it}."})
+        elif kind == "boxes_only":
+            not_checked.append({"what": "The words under your boxes were not searched for "
+                                        "anywhere else in the file.", "pages": [],
+                                "next": "Redact by search terms to find them elsewhere."})
+        elif kind == "field_still_shown":
+            not_targeted.append({"what": "A form field under one of your boxes is also shown "
+                                         "here. It still shows, and anything filled into it is "
+                                         "still in the file.",
+                                 "pages": pages, "next": "Draw a box over it here too."})
+        elif kind == "flattened":
+            areas = dict(note.get("areas") or {})
+            for page in pages:
+                n = int(areas.get(page, areas.get(str(page), 0)) or 0)
+                blacked = f", with {_how_many(n, 'area', 'areas')} blacked out" if n else ""
+                removed.append({"what": f"Turned into a picture{blacked}. Its text can no longer "
+                                        f"be selected or searched.",
+                                "pages": [page], "surface": "flattened"})
+    return removed, not_targeted, not_checked
+
+
+def redaction_proof(result: "RedactResult") -> dict:
+    """A finished redaction as the proof of removal (#100; see
+    removal_report.assemble): the places blacked out, page by page, and
+    what else was removed; what a box left that it was not over; and what
+    the run did not read. Words only of counts and pages, never of the
+    document."""
+    # Pages with the same count are one item: 1,200 pages of 2 places each
+    # are one line, not 1,200.
+    by_count: dict[int, list] = {}
+    for page, n in dict(result.removed_by_page or {}).items():
+        if int(n):
+            by_count.setdefault(int(n), []).append(int(page))
+    removed = [{"what": f"{_how_many(n, 'place', 'places')} blacked out"
+                        + (" on each" if len(pages) > 1 else ""),
+                "pages": sorted(pages), "surface": "page_content"}
+               for n, pages in sorted(by_count.items(), key=lambda kv: min(kv[1]))]
+    from_notes, not_targeted, not_checked = _proof_of_notes(result.notes)
+    removed += from_notes
+    counts = dict(result.surface_counts or {})
+    removed += [{"what": _how_many(int(counts[key]), *words), "pages": [], "surface": key}
+                for key, words in _REMOVED_WORDS.items() if counts.get(key)]
+    removed += [{"what": _how_many(int(n), "other item", "other items")
+                         + f" ({key.replace('_', ' ')})", "pages": [], "surface": key}
+                for key, n in counts.items()
+                if n and key not in ("page_content", "ocr_page_content")
+                and key not in _REMOVED_WORDS]
+    return removal_report.assemble("Redact", result.verification or {}, removed,
+                                   not_targeted, not_checked)
+
+
 def redact_result_payload(result: "RedactResult") -> dict:
     """What the redact slot hands the window for a finished run: the result,
     as plain data, with its plain-words summary (redaction_summary) under
-    ``summary``."""
-    return {**asdict(result), "summary": redaction_summary(result)}
+    ``summary`` and its proof of removal (redaction_proof, #100) under
+    ``proof``."""
+    return {**asdict(result), "summary": redaction_summary(result),
+            "proof": redaction_proof(result)}
 
 
 def _names_drawn(page, resources, xobjects) -> set:
@@ -5282,6 +5411,9 @@ def redact_pdf(
     # A version of the PDF library that removes what it should leave is
     # refused before anything is opened (#119, R4).
     library_notes = _check_library()
+    # Where the network guard's record stands, for the report's line on what
+    # this process did on the network during the run (#120 d).
+    net_mark = network_guard.mark()
 
     doc = fitz.open(input_path)
     if password and doc.needs_pass:
@@ -5297,6 +5429,9 @@ def redact_pdf(
     except Exception as exc:
         doc.close()
         raise ValueError(f"Could not read the source file's identity: {exc}") from exc
+    # How many earlier versions of itself the source keeps from incremental
+    # saves, for the report (#122): told now, as MuPDF opened it.
+    earlier_in_source = versions_of(doc, input_path)
 
     rects_by_page: dict[int, list[dict]] = {}
     for r in (rects or []):
@@ -5351,7 +5486,7 @@ def redact_pdf(
         seen: dict = {"annotations": 0, "fields": 0, "links": 0, "no_text": [],
                       "mostly_picture": [], "text_layer": {}, "covered": set(),
                       "still_shown": [], "ocr": {}, "ocr_found": 0, "search_boxes": {},
-                      "text_before": {}, "digests": {}}
+                      "text_before": {}, "digests": {}, "by_page": {}}
         hand_boxes.clear()
         # What every page draws with, before anything is changed: a page no
         # box touches must come through as it was (redaction.text_outside,
@@ -5484,6 +5619,10 @@ def redact_pdf(
             if added:
                 drawn += added
                 touched.add(pno)
+            # The places on this page, for the proof of removal (#100): the
+            # same count as drawn + ocr_found, page by page.
+            if added + places:
+                seen["by_page"][pno] = added + places
             # Every box the search put on the page, for the check that the
             # pictures under them are blanked (pdf_verify, #143), and for the
             # outside check on a page read with OCR.
@@ -5699,8 +5838,10 @@ def redact_pdf(
             # text along its line; that is said, and not refused.
             text_along_line=any(n.get("kind") == "text_may_move" for n in library_notes),
             drawn_before=before_drawn,
+            earlier_in_source=earlier_in_source,
         )
         report.retarget(output_path)
+        report.network = network_guard.activity_since(net_mark)
         if not report.verified:
             failed = report.failed_checks()
             doc_level = any(c.is_document_level for c in failed)
@@ -5742,4 +5883,5 @@ def redact_pdf(
                      ocr_not_ready=ocr_state is not None and tessdata is None,
                      ocr_asked=ocr_state is not None)
               + library_notes,
+        removed_by_page={pno + 1: n for pno, n in sorted(seen["by_page"].items())},
     )

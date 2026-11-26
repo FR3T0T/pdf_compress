@@ -245,9 +245,10 @@ class WebMainWindow(QMainWindow):
         # -- Offline enforcement for the web interface ----------------------
         # Block every non-local request the web view makes, at the engine
         # level, so the interface cannot reach the network even if a future
-        # change to it tried to. This covers the web view only, not the
-        # Python side: the setup downloads in README "What goes online" run
-        # there. Reference is held so Qt doesn't GC it.
+        # change to it tried to. This covers the web view only; the Python
+        # side has its own guard (network_guard, installed in app.py), which
+        # the translation setup opens for its downloads. Reference is held so
+        # Qt doesn't GC it.
         self._offline_guard = install_offline_guard(page.profile())
 
         # Enable local file access and other useful settings

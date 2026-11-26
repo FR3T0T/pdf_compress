@@ -23,6 +23,7 @@ import argparse
 import os
 import sys
 
+import network_guard
 from app_log import setup_file_logging
 from engine import (
     PRESET_ORDER,
@@ -50,6 +51,8 @@ def progress_bar(current, total, status):
 
 
 def main():
+    # Compressing makes no network connection; the guard makes sure (#120 d).
+    network_guard.install()
     parser = argparse.ArgumentParser(
         description="Compress PDFs offline — DPI-aware, grayscale-preserving."
     )

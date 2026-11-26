@@ -11,6 +11,7 @@ import { RiskHeader } from '../components/RiskHeader';
 import { FindingRow } from '../components/FindingRow';
 import { SanitizePanel } from '../components/SanitizePanel';
 import { SanitizeOutcome } from '../components/SanitizeOutcome';
+import { ProofOfRemoval } from '../components/ProofOfRemoval';
 import { Card } from '../components/shared/Card';
 import { useWorkspace, useWorkspaceBusy } from '../workspace/WorkspaceContext';
 
@@ -202,6 +203,10 @@ export function AnalyzePage() {
                 imageMode={isImage}
               />
               {outcome && <SanitizeOutcome result={outcome} />}
+              {/* #100: a verified PDF's proof, collapsed under the result line. */}
+              {outcome?.success && outcome.proof && (
+                <ProofOfRemoval proof={outcome.proof} tool="sanitize" canSave />
+              )}
             </div>
           )}
         </>

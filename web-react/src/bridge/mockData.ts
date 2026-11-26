@@ -1,5 +1,6 @@
 import type {
   AnalyzeReport,
+  RemovalProof,
   SanitizeOptions,
   SanitizeResponse,
   SanitizeVerification,
@@ -19,7 +20,7 @@ export const MOCK_REPORT: AnalyzeReport = {
   pdfVersion: '1.7',
   encrypted: false,
   overallRisk: 'high',
-  counts: { high: 2, medium: 2, low: 2, info: 1 },
+  counts: { high: 2, medium: 3, low: 2, info: 1 },
   findings: [
     {
       id: 'scripts.js',
@@ -66,6 +67,16 @@ export const MOCK_REPORT: AnalyzeReport = {
       detail:
         "Text drawn in invisible render mode was found. This is normal for OCR scans, but it is also how failed 'redactions' leak — the black box hides text that is still selectable and searchable underneath.",
       count: 4,
+    },
+    {
+      // #122, as pdf_analyze words it.
+      id: 'content.earlier_versions',
+      category: 'content',
+      severity: 'medium',
+      title: 'Earlier versions kept in the file',
+      detail:
+        'The file keeps 2 earlier versions of itself from incremental saves. Text or pictures removed in a later version may still be in the file. Sanitize writes a copy that keeps only the current version.',
+      count: 2,
     },
     {
       id: 'links.uri',
@@ -164,7 +175,10 @@ function mockVerification(
       ),
       passing('sanitize.file_id', "Output does not carry the source file's identifier (/ID)"),
     ],
-    residualFindings: MOCK_REPORT.findings.filter((f) => !promised.has(f.id)),
+    // The clean copy keeps one version (#122), whatever the options.
+    residualFindings: MOCK_REPORT.findings.filter(
+      (f) => !promised.has(f.id) && f.id !== 'content.earlier_versions'
+    ),
     verified: failing === null,
     flattenTargetPages: null,
     sourceSha256: null,
@@ -216,6 +230,8 @@ export function mockSanitizeResult(options: SanitizeOptions): SanitizeResponse {
     output: MOCK_SANITIZE_OUTPUT,
     output_size: 4611200,
     verification: mockVerification(options, null),
+    // The proof is the default options' (#100): the mock does not reword it.
+    proof: MOCK_PROOF_SANITIZE,
   };
 }
 
@@ -513,3 +529,514 @@ export const MOCK_OCR_NOT_READY = "OCR isn't set up: run python setup_ocr.py --i
 /** #135: a search that found nothing (search for "nothing"), as redact_pdf
  *  words it for a six-page scan with OCR off. */
 export const MOCK_REDACT_NOTHING_FOUND = "No matching content found to redact. Pages 1-6 have no text: a search cannot read words in a scan or a picture. Nothing was saved.";
+
+/** The proof of removal a finished run carries (#100), made by the real
+ *  Python functions (pdf_ops.redaction_proof, removal_report.sanitize_proof)
+ *  so that the panel reads like the app: an ordinary search, the
+ *  "everything" search (every group filled, a source MuPDF repaired, a
+ *  setup window open during the run), and Sanitize with its default
+ *  options. */
+export const MOCK_PROOF_REDACT: RemovalProof = {
+  "tool": "Redact",
+  "removed": [
+    {
+      "what": "4 places blacked out",
+      "pages": [1],
+      "surface": "page_content",
+      "where": "Page 1"
+    },
+    {
+      "what": "2 places blacked out",
+      "pages": [2],
+      "surface": "page_content",
+      "where": "Page 2"
+    }
+  ],
+  "notTargeted": [],
+  "notChecked": [],
+  "checks": [
+    {
+      "id": "redaction.readable",
+      "description": "The new file opens and can be read to check it",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.page_text",
+      "description": "None of the searched-for words can be read in the text of the pages",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.raw_content",
+      "description": "None of the searched-for words is in the code that draws the pages",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.annotations",
+      "description": "None of the searched-for words is in a note or comment",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.form_fields",
+      "description": "None of the searched-for words is in what is filled into a form field",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.links",
+      "description": "None of the searched-for words is in a link",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.docinfo",
+      "description": "None of the searched-for words is in the document's details, such as the title or author",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.xmp",
+      "description": "None of the searched-for words is in the hidden document details (XMP)",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.bookmarks",
+      "description": "None of the searched-for words is in a bookmark title",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.embedded_files",
+      "description": "None of the searched-for words is in the name of an attached file",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.term_sweep",
+      "description": "A search of everything else in the file finds none of the searched-for words",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.search_image",
+      "description": "The pictures under the words found are blanked there",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.text_outside",
+      "description": "Text outside the boxes shows as it did",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.left_behind",
+      "description": "Nothing a box covered is left in the file where no page shows it",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.structure_streams",
+      "description": "Nothing is kept in the file by its structure alone",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.thumbnails",
+      "description": "No page has a small preview picture of itself",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.one_version",
+      "description": "The new file keeps no earlier versions of itself",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.file_id",
+      "description": "The new file does not carry the original's ID, which would link the two",
+      "passed": true,
+      "pages": []
+    }
+  ],
+  "earlierVersions": "The source kept 2 earlier versions; this copy keeps none.",
+  "network": "Network: none used during this run."
+};
+export const MOCK_PROOF_REDACT_EVERYTHING: RemovalProof = {
+  "tool": "Redact",
+  "removed": [
+    {
+      "what": "28 places blacked out on each",
+      "pages": Array.from({ length: 368 }, (_, i) => i + 1),
+      "surface": "page_content",
+      "where": "Pages 1-368"
+    },
+    {
+      "what": "27 places blacked out on each",
+      "pages": Array.from({ length: 832 }, (_, i) => i + 369),
+      "surface": "page_content",
+      "where": "Pages 369-1200"
+    },
+    {
+      "what": "Turned into a picture, with 2 areas blacked out. Its text can no longer be selected or searched.",
+      "pages": [4],
+      "surface": "flattened",
+      "where": "Page 4"
+    },
+    {
+      "what": "32,768 notes, stamps or other marks taken off the pages",
+      "pages": [],
+      "surface": "annotations_removed",
+      "where": ""
+    },
+    {
+      "what": "1 form field taken off a page",
+      "pages": [],
+      "surface": "fields_removed",
+      "where": ""
+    },
+    {
+      "what": "32,768 links taken off the pages",
+      "pages": [],
+      "surface": "links_removed",
+      "where": ""
+    },
+    {
+      "what": "1,200 small preview pictures of pages",
+      "pages": [],
+      "surface": "thumbnails",
+      "where": ""
+    },
+    {
+      "what": "4 descriptions of removed content, the kind screen readers read aloud",
+      "pages": [],
+      "surface": "structure_text",
+      "where": ""
+    },
+    {
+      "what": "1 hidden copy of removed content that the file still pointed to",
+      "pages": [],
+      "surface": "structure_refs",
+      "where": ""
+    },
+    {
+      "what": "2 entries in the document's details, such as the title or author",
+      "pages": [],
+      "surface": "docinfo",
+      "where": ""
+    },
+    {
+      "what": "3 bookmark titles",
+      "pages": [],
+      "surface": "bookmarks",
+      "where": ""
+    }
+  ],
+  "notTargeted": [
+    {
+      "what": "A form field under one of your boxes is also shown here. It still shows, and anything filled into it is still in the file.",
+      "pages": [1, 2, 3, 9],
+      "next": "Draw a box over it here too.",
+      "where": "Pages 1-3 and 9"
+    }
+  ],
+  "notChecked": [
+    {
+      "what": "No text to search: they may be scans or pictures, so any words in them were not searched.",
+      "pages": [3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84, 87, 90, 93, 96, 99, 102, 105, 108, 111, 114, 117, 120, 123, 126, 129, 132, 135, 138, 141, 144, 147, 150, 153, 156, 159, 162, 165, 168, 171, 174, 177, 180, 183, 186, 189, 192, 195, 198, 201, 204, 207, 210, 213, 216, 219, 222, 225, 228, 231, 234, 237, 240, 243, 246, 249, 252, 255, 258, 261, 264, 267, 270, 273, 276, 279, 282, 285, 288, 291, 294, 297, 300],
+      "next": "Run Redact again with “Also read scanned pages with OCR” ticked (OCR must be set up), or check them by eye.",
+      "where": "Pages 3, 6, 9, 12, 15, 18 and 94 more"
+    },
+    {
+      "what": "Scans with a hidden text layer: the search read the layer, not the pictures. A word the layer misread, or put in the wrong place, is still in the pictures.",
+      "pages": [1, 2],
+      "next": "Run Redact again with “Also read scanned pages with OCR” ticked to read the pictures too.",
+      "where": "Pages 1 and 2"
+    },
+    {
+      "what": "12 attached files were searched as they are stored, and not opened. All of them are packed (like a zip or Word file), so nothing inside them could be searched.",
+      "pages": [],
+      "next": "Open them to check them, or run Sanitize with “Embedded files / attachments” ticked to remove them.",
+      "where": ""
+    },
+    {
+      "what": "The words under your boxes were not searched for anywhere else in the file.",
+      "pages": [],
+      "next": "Redact by search terms to find them elsewhere.",
+      "where": ""
+    },
+    {
+      "what": "Whether the source kept earlier versions of itself: the file is damaged and was repaired to be read, so its saved versions could not be counted.",
+      "pages": [],
+      "next": null,
+      "where": ""
+    }
+  ],
+  "checks": [
+    {
+      "id": "redaction.readable",
+      "description": "The new file opens and can be read to check it",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.page_text",
+      "description": "None of the searched-for words can be read in the text of the pages",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.raw_content",
+      "description": "None of the searched-for words is in the code that draws the pages",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.annotations",
+      "description": "None of the searched-for words is in a note or comment",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.form_fields",
+      "description": "None of the searched-for words is in what is filled into a form field",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.links",
+      "description": "None of the searched-for words is in a link",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.docinfo",
+      "description": "None of the searched-for words is in the document's details, such as the title or author",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.xmp",
+      "description": "None of the searched-for words is in the hidden document details (XMP)",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.bookmarks",
+      "description": "None of the searched-for words is in a bookmark title",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.embedded_files",
+      "description": "None of the searched-for words is in the name of an attached file",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.term_sweep",
+      "description": "A search of everything else in the file finds none of the searched-for words",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.search_image",
+      "description": "The pictures under the words found are blanked there",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.text_outside",
+      "description": "Text outside the boxes shows as it did",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.left_behind",
+      "description": "Nothing a box covered is left in the file where no page shows it",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.structure_streams",
+      "description": "Nothing is kept in the file by its structure alone",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.thumbnails",
+      "description": "No page has a small preview picture of itself",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.one_version",
+      "description": "The new file keeps no earlier versions of itself",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.file_id",
+      "description": "The new file does not carry the original's ID, which would link the two",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.rect_regions",
+      "description": "No text is left under the boxes",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.rect_annotations",
+      "description": "No note, stamp or other mark lies over the boxes",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "redaction.rect_line_art",
+      "description": "No drawing has an edge inside the boxes",
+      "passed": true,
+      "pages": []
+    }
+  ],
+  "earlierVersions": "Whether the source kept earlier versions could not be checked; this copy keeps none.",
+  "network": "Network: open for translation setup during part of this run, from 14:02:11 to 14:05:40. 2 attempts to connect were refused (updates.example.com)."
+};
+export const MOCK_PROOF_SANITIZE: RemovalProof = {
+  "tool": "Sanitize",
+  "removed": [
+    {
+      "what": "1 set of the document's named scripts",
+      "pages": [],
+      "surface": "javascript",
+      "where": ""
+    },
+    {
+      "what": "1 action that starts another program",
+      "pages": [],
+      "surface": "launch_actions",
+      "where": ""
+    },
+    {
+      "what": "3 actions that run by themselves",
+      "pages": [],
+      "surface": "auto_actions",
+      "where": ""
+    }
+  ],
+  "notTargeted": [
+    {
+      "what": "Invisible text layer",
+      "pages": [],
+      "next": "Normal for a scan read with OCR. If it is text someone meant to hide, remove it with Redact.",
+      "where": ""
+    },
+    {
+      "what": "External links / URLs",
+      "pages": [],
+      "next": "Run Sanitize with “External links / URLs (trackers)” ticked.",
+      "where": ""
+    },
+    {
+      "what": "Document metadata present",
+      "pages": [],
+      "next": "Run Sanitize with “Document & XMP metadata” ticked.",
+      "where": ""
+    },
+    {
+      "what": "Interactive form fields",
+      "pages": [],
+      "next": "Use Flatten to remove the form fields, if you no longer need them.",
+      "where": ""
+    }
+  ],
+  "notChecked": [],
+  "checks": [
+    {
+      "id": "sanitization.readable",
+      "description": "The clean copy opens and can be scanned again",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.scripts_js",
+      "description": "A new scan finds no JavaScript",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.actions_launch",
+      "description": "A new scan finds no actions that start another program",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.actions_autorun",
+      "description": "A new scan finds no actions that run by themselves",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.files_embedded",
+      "description": "A new scan finds no attached files",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.forms_submit",
+      "description": "A new scan finds no actions that send or load form data",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.sweep_javascript",
+      "description": "A look at every object in the file finds no JavaScript",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.sweep_launch_actions",
+      "description": "A look at every object in the file finds no actions that start another program",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.sweep_auto_actions",
+      "description": "A look at every object in the file finds no actions that run by themselves",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.sweep_embedded_files",
+      "description": "A look at every object in the file finds no attached files",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.sweep_submit_actions",
+      "description": "A look at every object in the file finds no actions that send or load form data",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.one_version",
+      "description": "The clean copy keeps no earlier versions of itself",
+      "passed": true,
+      "pages": []
+    },
+    {
+      "id": "sanitize.file_id",
+      "description": "The clean copy does not carry the original's ID, which would link the two",
+      "passed": true,
+      "pages": []
+    }
+  ],
+  "earlierVersions": "The source kept 2 earlier versions; this copy keeps none.",
+  "network": "Network: none used during this run."
+};

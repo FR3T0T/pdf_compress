@@ -25,7 +25,7 @@ from PySide6.QtWidgets import QFileDialog
 
 import app_log
 import pdf_ocr
-import translate_runtime
+import removal_report
 import trusted_programs
 import workspace_dir
 from compress_paths import compress_output_path
@@ -88,7 +88,7 @@ from pdf_ops import (
 )
 from pdf_translate import (
     TranslationError,
-    install_languages,
+    run_setup,
     supported_languages,
     translate_image,
     translate_pdf,
@@ -372,6 +372,10 @@ class Bridge(QObject):
         self._settings = QSettings("PDFCompress", "PDFCompress")
         self._qwebchannel_js_path = ""
         self._workspace_dir: str | None = None
+        # The last finished Redact and Sanitize answers, kept here so that
+        # Save report (#100) writes beside the file this side wrote, from
+        # what this side made: the window sends only which tool.
+        self._finished_runs: dict[str, dict] = {}
 
     def set_qwebchannel_js_path(self, path: str):
         """Store the path to qwebchannel.js for potential JS queries."""
@@ -742,8 +746,21 @@ class Bridge(QObject):
             opts = json.loads(options_json) if options_json else {}
         except Exception:
             opts = {}
-        return json.dumps(sanitize_payload(path, output_path, opts),
-                          ensure_ascii=False, default=str)
+        answer = sanitize_payload(path, output_path, opts)
+        if answer.get("success") and answer.get("proof"):
+            self._finished_runs["sanitize"] = answer
+        return json.dumps(answer, ensure_ascii=False, default=str)
+
+    @Slot(str, result=str)
+    def saveRemovalReport(self, tool: str) -> str:
+        """Save the proof of removal of the last finished Redact or Sanitize
+        run (*tool* "redact" or "sanitize") beside its new file, as
+        "<name>.removal-report.json" and ".txt", never over a file (#100).
+        Answers {"success", "files": [the two names]} or {"success": False,
+        "error"}; the work and the words are removal_report.save_payload's,
+        which is tested without Qt."""
+        return json.dumps(removal_report.save_payload(self._finished_runs.get(tool)),
+                          ensure_ascii=False)
 
     # ── Translation ───────────────────────────────────────────────
 
@@ -800,8 +817,10 @@ class Bridge(QObject):
         the venv skip phase 1 automatically, so this slot also serves as the
         in-app "add languages" path there. Cancellable via
         cancelOperation("translateSetup"). These downloads run solely from
-        this explicit user action (the web view itself stays fully sandboxed
-        by net_guard); see README "What goes online" for the full list.
+        this explicit user action: pdf_translate.run_setup opens the app
+        process's network guard for them alone (network_guard, #120 d), and
+        the web view itself stays sandboxed by net_guard; see README "What
+        goes online" for the full list.
         """
         p = _normalize_params(json.loads(json_params)) if json_params else {}
         tool_key = p.get("toolKey", "translateSetup")
@@ -812,20 +831,8 @@ class Bridge(QObject):
             self.progressUpdate.emit(
                 _progress_payload(tool_key, current, total, label))
 
-        def _work():
-            result = {"runtimeInstalled": False}
-            rt = translate_runtime.runtime_status()
-            if rt["needed"] and not rt["installed"]:
-                translate_runtime.install_runtime(
-                    progress=_progress, should_cancel=cancel.is_set)
-                result["runtimeInstalled"] = True
-            if codes:
-                result.update(install_languages(
-                    codes, progress=_progress, should_cancel=cancel.is_set))
-            result["status"] = translation_status()
-            return result
-
-        self._run_in_thread(tool_key, _work)
+        self._run_in_thread(tool_key, lambda: run_setup(
+            codes, progress=_progress, should_cancel=cancel.is_set))
 
     # Overloaded: web/js/bridge.js (unmodified, per its own contract) still
     # calls this with 3 args, so that signature must keep resolving --
@@ -1862,8 +1869,9 @@ class Bridge(QObject):
             rects = p.get("rects")
             if rects:
                 rects = rects_from_page_pictures(p["inputPath"], rects, p.get("password"))
-            # The result with its plain-words summary for the window (#119).
-            return redact_result_payload(redact_pdf(
+            # The result with its plain-words summary for the window (#119),
+            # kept for Save report (#100).
+            answer = redact_result_payload(redact_pdf(
                 input_path=p["inputPath"],
                 output_path=p["outputPath"],
                 search_terms=p.get("searchTerms"),
@@ -1880,6 +1888,8 @@ class Bridge(QObject):
                 cancel=cancel,
                 on_status=on_status,
             ))
+            self._finished_runs["redact"] = answer
+            return answer
 
         self._run_in_thread(tool_key, _work)
 

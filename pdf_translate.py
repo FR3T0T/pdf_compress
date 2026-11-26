@@ -32,6 +32,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+import network_guard
 import translate_runtime
 import trusted_programs
 
@@ -466,6 +467,36 @@ def install_languages(codes: list[str],
         progress(len(ordered), len(ordered), "Language packs installed")
     return {"installed": ok, "skipped": skipped, "requested": len(ordered),
             "sentenceModels": sentence_models}
+
+
+def run_setup(codes: list[str],
+              progress: Optional[Callable[[int, int, str], None]] = None,
+              should_cancel: Optional[Callable[[], bool]] = None) -> dict:
+    """The translation setup the Translate tool's button starts: the
+    translation engine's pinned wheels where the app needs them
+    (translate_runtime.install_runtime), then the sentence models and the
+    language packs for *codes* (install_languages).
+
+    The app's process connects to nothing outside the computer
+    (network_guard, #120 d); this is the one place in it that opens the
+    network, with ``allow_network("translation setup")`` for the length of
+    the downloads, shut again however they end. Here, not in the bridge,
+    so that it is tested without Qt.
+
+    Returns {"runtimeInstalled": bool, what install_languages returns,
+    "status": translation_status()}.
+    """
+    result: dict = {"runtimeInstalled": False}
+    with network_guard.allow_network("translation setup"):
+        runtime = translate_runtime.runtime_status()
+        if runtime["needed"] and not runtime["installed"]:
+            translate_runtime.install_runtime(progress=progress, should_cancel=should_cancel)
+            result["runtimeInstalled"] = True
+        if codes:
+            result.update(install_languages(codes, progress=progress,
+                                            should_cancel=should_cancel))
+    result["status"] = translation_status()
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════

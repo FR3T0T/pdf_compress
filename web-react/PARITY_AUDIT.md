@@ -427,3 +427,46 @@ carry two more checks.
   into pictures would not remove it.
 - **Mocks.** Unchanged. Those that carry a whole report do not list the
   new check; the window does not show checks by id.
+### #100, #122, #120 d — Proof of removal, earlier versions, the network guard (2026-11-26)
+
+One new slot, one new component, new keys on two answers. `web-react/dist/`
+rebuilt: `dist/assets/index-DtZ4sgjz.js` (was `index-PvhgEqzH.js`).
+
+- **New slot `saveRemovalReport(tool)`** → `{success, files?: [name, name],
+  error?}`. *tool* is `"redact"` or `"sanitize"`; nothing else is sent. The
+  bridge keeps the last finished run of each (`_finished_runs`: the Redact
+  done payload, the Sanitize answer on success) and writes its proof beside
+  the file it wrote, as `<name>.removal-report.json` and `.txt`, never over a
+  file. The work and the words are `removal_report.save_payload`'s (Qt-free,
+  tested). Wired through `qwebchannel-connect.ts`, `global.d.ts` and
+  `bridgeApi.ts` (mock: two names, success).
+- **Redact done payload** gains `proof` (`pdf_ops.redaction_proof`) and
+  `removed_by_page` ({page: places}). **Sanitize answer** gains `proof`
+  on success only (`removal_report.sanitize_proof`); a refusal has none.
+  `proof` is `RemovalProof` (`types/analyze.ts`): `tool`, `removed`,
+  `notTargeted`, `notChecked` (items `{what, pages, where, next?,
+  surface?}`; `where` is the pages in words, made in Python), `checks`
+  (`{id, description, passed, pages}`, the description in plain words),
+  `earlierVersions` and `network` (one line each).
+- **`verification`** (both tools) gains `earlierVersions` (`{source,
+  output, sourceWhy?}`, #122) and `network` (what the app's process did on
+  the network during the run, #120 d), and the checks `redaction.one_version`
+  / `sanitize.one_version`. A failed `one_version` is document-level; its
+  refusal line says the new file would still keep earlier versions of
+  itself.
+- **New `components/ProofOfRemoval.tsx`**: the panel, collapsed, under the
+  existing result line, with **Save report** beside its title. Redact shows
+  it under `RedactSummaryPanel` (no Save report for a workspace run); the
+  Analyze page under `SanitizeOutcome` on a verified PDF. The result lines
+  are unchanged. Check ids only under *Technical details*.
+- **Analyze report** can carry a new finding, `content.earlier_versions`
+  (medium), and, for a file MuPDF repaired, `content.earlier_versions` in
+  `unevaluated` (shown through `audit.incomplete`). `FindingRow` shows it
+  like any other; no change there.
+- **Translation setup.** `startSetupTranslation` keeps its name, arguments
+  and answer; it now runs `pdf_translate.run_setup`, which opens the app
+  process's network guard for the downloads.
+- **Mocks.** `MOCK_PROOF_REDACT`, `MOCK_PROOF_REDACT_EVERYTHING` (search for
+  "everything": every group filled, a repaired source, a setup window open)
+  and `MOCK_PROOF_SANITIZE` (the default options), made by the real Python
+  functions; `MOCK_REPORT` gains the earlier-versions finding.

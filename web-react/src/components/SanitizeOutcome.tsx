@@ -4,8 +4,9 @@ import type { SanitizeResponse } from '../types/analyze';
 /**
  * What the last Sanitize run came to, shown under the Sanitize panel.
  *
- * Deliberately small: the full, exportable report is its own piece of work
- * (#100). A verified run says so, and counts what the selected options left
+ * Deliberately small: the full report, which can be saved, is the Proof of
+ * removal panel under this one (ProofOfRemoval, #100). A verified run says
+ * so, and counts what the selected options left
  * alone. A refused run says what is still present, what could not be
  * checked, or that it is the file identifier — in the words pdf_verify.py
  * produced (`refusal`); nothing is rephrased here.

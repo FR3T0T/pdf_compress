@@ -25,6 +25,8 @@ is reported and what can be removed do not drift apart.
   - Form submit / import actions (/SubmitForm, /ImportData) and XFA forms
   - Hidden optional-content layers (OCG)
   - Invisible text (text render mode 3 — common in fake "redactions")
+  - Earlier versions kept by incremental saves (#122), which can still hold
+    what a later version removed
   - Encryption status
 
 Plus :func:`sanitize_pdf`, a one-pass cleaner that strips the dangerous
@@ -54,6 +56,9 @@ from decimal import Decimal
 from typing import Any, NamedTuple, Optional
 
 import pikepdf
+
+import network_guard
+import removal_report
 
 log = logging.getLogger(__name__)
 
@@ -1316,6 +1321,106 @@ def _scan_invisible_text(path: str, res: AnalysisResult) -> None:
         ))
 
 
+#: Why the versions of a file MuPDF repaired cannot be counted (#122).
+_REPAIRED_WHY = ("the file is damaged and was repaired to be read, so its saved versions "
+                 "could not be counted")
+
+
+#: "N G obj" in a file's bytes: where object N is defined.
+_OBJECT_RE = re.compile(rb"(?<![0-9])([0-9]+)[\x00\t\n\f\r ]+[0-9]+[\x00\t\n\f\r ]+obj(?![A-Za-z0-9])")
+
+
+def _bytes_hold_one_version(path: str) -> bool:
+    """For a file MuPDF repaired: True when its own bytes show one version —
+    at most one %%EOF, at most one startxref, and no object number defined
+    twice ("N G obj"). An incremental save appends a startxref, a %%EOF and
+    a second definition of every object it changes; a file with none of
+    them has no earlier version to keep. Anything else, or bytes that cannot
+    be read, is False: not shown to be one version. Read through a memory
+    map, so a large file is not loaded whole."""
+    import mmap
+
+    def at_most_one(data, marker: bytes) -> bool:
+        first = data.find(marker)
+        return first < 0 or data.find(marker, first + 1) < 0
+
+    try:
+        with open(path, "rb") as fh:
+            if os.fstat(fh.fileno()).st_size == 0:
+                return False
+            with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                if not (at_most_one(data, b"%%EOF") and at_most_one(data, b"startxref")):
+                    return False
+                seen: set = set()
+                for m in _OBJECT_RE.finditer(data):
+                    number = int(m.group(1))
+                    if number in seen:
+                        return False
+                    seen.add(number)
+                return True
+    except (OSError, ValueError):
+        return False
+
+
+def versions_of(doc, path: Optional[str] = None) -> tuple[Optional[int], str]:
+    """How many earlier versions of itself the open PyMuPDF document *doc*
+    keeps from incremental saves (#122), as ``(n, "")``; ``(None, why)`` when
+    that cannot be told.
+
+    An incremental save appends what changed, and leaves everything the
+    earlier version held in the file. PyMuPDF's version_count counts the
+    versions; unlike counting %%EOF markers it is right for a linearized
+    file (one version, two markers). It needs no password. A file MuPDF had
+    to repair to open has had its cross-references rebuilt, and then counts
+    as one version whatever it keeps. Its own bytes (at *path*, or the
+    file *doc* was opened from) decide it then: one version when they show
+    one (_bytes_hold_one_version), not counted otherwise."""
+    try:
+        if doc.is_repaired:
+            where = path or getattr(doc, "name", "") or ""
+            if where and os.path.isfile(where) and _bytes_hold_one_version(where):
+                return 0, ""
+            return None, _REPAIRED_WHY
+        return max(0, int(doc.version_count) - 1), ""
+    except Exception as exc:
+        return None, f"its saved versions could not be counted ({type(exc).__name__})"
+
+
+def earlier_versions(path: str) -> tuple[Optional[int], str]:
+    """:func:`versions_of` for the file at *path*, opened with PyMuPDF."""
+    try:
+        import fitz  # PyMuPDF
+    except Exception as exc:
+        return None, f"PyMuPDF is not available to count its saved versions ({type(exc).__name__})"
+    try:
+        doc = fitz.open(path)
+    except Exception as exc:
+        # The type only: library messages quote the path they were reading.
+        return None, f"the file could not be opened to count its saved versions ({type(exc).__name__})"
+    try:
+        return versions_of(doc, path)
+    finally:
+        doc.close()
+
+
+def _scan_earlier_versions(path: str, res: AnalysisResult) -> None:
+    """Earlier versions kept by incremental saves (#122). A file whose
+    versions cannot be counted is recorded as not checked, not as clean."""
+    n, why = earlier_versions(path)
+    if n is None:
+        _trouble(why)
+        return
+    if n:
+        res.add(Finding(
+            id="content.earlier_versions", category="content", severity="medium",
+            title="Earlier versions kept in the file",
+            detail=f"The file keeps {n} earlier version{'' if n == 1 else 's'} of itself from "
+                   f"incremental saves. Text or pictures removed in a later version may still "
+                   f"be in the file. Sanitize writes a copy that keeps only the current version.",
+            count=n,
+        ))
+
+
 def _dedupe(seq: list[str]) -> list[str]:
     seen, out = set(), []
     for s in seq:
@@ -1422,6 +1527,8 @@ def analyze_document(path: str, password: Optional[str] = None, *,
 
     # Invisible-text scan needs the path (PyMuPDF), runs outside the pikepdf ctx
     _run_scanner(res, ("content.invisible_text",), _scan_invisible_text, path, res)
+    # So does counting the file's versions (#122).
+    _run_scanner(res, ("content.earlier_versions",), _scan_earlier_versions, path, res)
 
     if res.unevaluated:
         res.add(Finding(
@@ -1476,6 +1583,7 @@ _FINDING_INFO = {
     "forms.acro": ("forms", "info", "Interactive form fields"),
     "content.ocg": ("content", "low", "Optional-content layers"),
     "content.invisible_text": ("content", "medium", "Invisible text layer"),
+    "content.earlier_versions": ("content", "medium", "Earlier versions kept in the file"),
     "location.embedded_image": ("location", "high", "Location data in embedded images"),
     "metadata.embedded_image": ("metadata", "medium", "Camera data in embedded images"),
 }
@@ -2986,7 +3094,13 @@ def sanitize_pdf(input_path: str, output_path: str,
     "verification"}: the counters, and the verification report as a dict.
     """
     opts = {**DEFAULT_SANITIZE, **(options or {})}
+    # Where the network guard's record stands, for the report's line on what
+    # this process did on the network during the run (#120 d).
+    net_mark = network_guard.mark()
     source_sha = file_sha256(input_path)
+    # How many earlier versions of itself the source keeps from incremental
+    # saves, for the report (#122).
+    earlier_in_source = earlier_versions(input_path)
 
     # allow_overwriting_input reads the input fully into memory at open time and
     # releases the OS file handle, so the commit below can os.replace over
@@ -3058,9 +3172,11 @@ def sanitize_pdf(input_path: str, output_path: str,
         import pdf_verify
         report = pdf_verify.verify_sanitization(
             tmp, opts, input_path=input_path,
-            source_ids=source_ids, source_sha256=source_sha)
+            source_ids=source_ids, source_sha256=source_sha,
+            earlier_in_source=earlier_in_source)
         report.retarget(output_path)
         report.diagnostics = list(diagnostics)
+        report.network = network_guard.activity_since(net_mark)
         if not report.verified:
             raise SanitizationVerificationError(
                 pdf_verify.sanitize_refusal_message(report), report=report.to_dict(),
@@ -3204,7 +3320,9 @@ def sanitize_payload(input_path: str, output_path: str, options: Any = None) -> 
 
       * done — the strip_file result plus ``"success": True``. For a PDF
         that includes ``verification``, the report its output passed before
-        it was committed; an image has none.
+        it was committed, and ``proof``, the same in plain words for the
+        proof-of-removal panel and the report saved on request
+        (removal_report.sanitize_proof, #100); an image has neither.
       * refused (SanitizationVerificationError) — ``"success": False``,
         ``"error"`` the one sentence saying why, ``"verification"`` the
         report, and ``"refusal"`` the same thing as short lists for a
@@ -3235,6 +3353,9 @@ def sanitize_payload(input_path: str, output_path: str, options: Any = None) -> 
         log.error("sanitize failed (%s)\n%s", type(exc).__name__,
                   "".join(traceback.format_tb(exc.__traceback__)))
         return {"success": False, "error": str(exc), "errorType": type(exc).__name__}
+    if result.get("verification"):
+        result = {**result, "proof": removal_report.sanitize_proof(
+            result, {fid: info[2] for fid, info in _FINDING_INFO.items()})}
     return {**result, "success": True}
 
 

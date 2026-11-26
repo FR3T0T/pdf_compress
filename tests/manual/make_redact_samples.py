@@ -1,5 +1,6 @@
 """Write the sample files for the Redact app checklist (#119, #128, #134,
-#140, #143, #150).
+#140, #143, #150), and for the proof of removal and earlier versions (#100,
+#122).
 
 Usage: python tests/manual/make_redact_samples.py <folder>
 
@@ -10,8 +11,10 @@ for reading scanned pages with OCR) says it in its own picture. Sample 25
 is given its text layer by MuPDF's own OCR, so it needs the OCR language
 file (python setup_ocr.py --install); without it, it is skipped. Samples
 28 to 33 are for #150: text outside the boxes, and a picture on pages that
-share their resources. The checklists that use them are in the pull
-requests for #119, #128, #143 and #150.
+share their resources. Samples 34 to 36 are for #122 and #100: a file
+saved incrementally (Analyze), and the Proof of removal panel after Redact
+and Sanitize. The checklists that use them are in the pull requests for
+#119, #128, #143, #150 and #100.
 This is not a test: pytest collects only test_*.py files.
 """
 import io
@@ -654,6 +657,89 @@ def picture_on_pages_that_share_resources(folder):
     save(pdf, folder, "33_picture_on_pages_that_share_resources.pdf")
 
 
+def attach(pdf, name: str, data: bytes) -> None:
+    """An attached file, listed in the catalog's name tree only, as most
+    programs write one (pikepdf's own call lists it in /AF as well)."""
+    stream = pdf.make_stream(data, Type=Name.EmbeddedFile)
+    spec = pdf.make_indirect(Dictionary(Type=Name.Filespec, F=String(name), UF=String(name),
+                                        EF=Dictionary(F=stream)))
+    if "/Names" not in pdf.Root:
+        pdf.Root["/Names"] = Dictionary()
+    tree = pdf.Root.Names.get("/EmbeddedFiles")
+    if tree is None:
+        tree = pdf.Root.Names["/EmbeddedFiles"] = Dictionary(Names=Array())
+    pairs = list(zip(tree.Names[::2], tree.Names[1::2], strict=True)) + [(String(name), spec)]
+    tree.Names = Array([x for key, value in sorted(pairs, key=lambda p: str(p[0]))
+                        for x in (key, value)])
+
+
+def saved_incrementally(folder):
+    """#122: a file saved incrementally. Its later version took the
+    reference off the page; the earlier version, still in the file, has it.
+    The update is appended byte by byte (tests/_versions.append_update), as
+    an editor that saves incrementally writes one."""
+    from tests import _versions
+    name = "34_saved_incrementally.pdf"
+    pdf = pikepdf.Pdf.new()
+    add_page(pdf, text("Sample 34: this file was saved incrementally.",
+                       f"The reference {TERM} is on this page in its first version."))
+    pdf.save(os.path.join(folder, name), static_id=True)
+    pdf.close()
+    path = os.path.join(folder, name)
+    with pikepdf.open(path) as pdf:
+        size = int(pdf.trailer.Size)
+        page = pdf.pages[0].obj
+        number, parent = page.objgen[0], page.Parent.objgen[0]
+        font_ref = page.Resources.Font.F1.objgen[0]
+    content = text("Sample 34: this file was saved incrementally. This is its later",
+                   "version, which took the reference off this page. The earlier",
+                   "version is still in the file, with the reference. Analyze must",
+                   "flag: Earlier versions kept in the file (1).")
+    _versions.append_update(path, {
+        size: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        number: (b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 612 792] "
+                 b"/Resources << /Font << /F1 %d 0 R >> >> /Contents %d 0 R >>")
+                % (parent, font_ref, size),
+    })
+    print("wrote", name)
+
+
+def term_on_a_page_in_the_title_and_an_attachment(folder):
+    """#100: the reference on page 1, in the title and in an attached file's
+    name; page 2 is only a picture. Redact by words: the proof shows the
+    places on page 1, the details entry and the attachment removed, and page
+    2 under Not checked."""
+    pdf = pikepdf.Pdf.new()
+    add_page(pdf, text("Sample 35: redact by the word below. The Proof of removal panel",
+                       "must show the places on page 1, the entry in the document's",
+                       "details, the attached file removed, and page 2 under Not checked.",
+                       f"The reference {TERM} is on this page."))
+    picture = picture_of_words(["Sample 35, page 2: only a picture, with no",
+                                "text a search can read."])
+    x, y, width, height = SCAN
+    page = add_page(pdf, f"q {width} 0 0 {height} {x} {y} cm /Scan Do Q".encode())
+    page["/Resources"]["/XObject"] = Dictionary(Scan=image(pdf, picture))
+    pdf.docinfo["/Title"] = f"Statement {TERM}"
+    attach(pdf, f"{TERM}-ledger.txt", b"Sample 35: an attached file named with the reference.")
+    save(pdf, folder, "35_term_on_a_page_in_the_title_and_an_attachment.pdf")
+
+
+def metadata_and_an_attachment(folder):
+    """#100: document details and an attached file, and no reference. Sanitize
+    with Metadata unticked: the attachment is removed, and the proof lists
+    "Document metadata present" under Found but not targeted, with its next
+    step."""
+    pdf = pikepdf.Pdf.new()
+    add_page(pdf, text("Sample 36: Sanitize with Document & XMP metadata unticked.",
+                       "The attached file is removed; the proof lists Document metadata",
+                       "present under Found but not targeted, with a next step."))
+    pdf.docinfo["/Title"] = "Sample 36"
+    pdf.docinfo["/Author"] = "Sample author"
+    pdf.docinfo["/Creator"] = "make_redact_samples.py"
+    attach(pdf, "notes.txt", b"Sample 36: an attached file.")
+    save(pdf, folder, "36_metadata_and_an_attachment.pdf")
+
+
 def main(folder: str) -> None:
     os.makedirs(folder, exist_ok=True)
     number_across_a_line(folder)
@@ -689,6 +775,9 @@ def main(folder: str) -> None:
     text_outside_a_text_object(folder)
     footer_on_two_pages(folder)
     picture_on_pages_that_share_resources(folder)
+    saved_incrementally(folder)
+    term_on_a_page_in_the_title_and_an_attachment(folder)
+    metadata_and_an_attachment(folder)
 
 
 if __name__ == "__main__":

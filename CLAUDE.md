@@ -75,7 +75,12 @@ alone. If a change makes a doc wrong, fixing the doc is part of that change.
 
 - **Offline is a hard invariant.** The app must never make a network request
   on its own. `ui/net_guard.py` blocks every non-local web-view request and
-  the CSP sets `connect-src 'none'`. Don't add anything that phones home.
+  the CSP sets `connect-src 'none'`; `network_guard.py`, installed first in
+  `app.py` and `compress_pdf.py`, refuses every connection the app's own
+  Python makes outside this computer (#120 d). The one opening is
+  `network_guard.allow_network(...)`, and it is opened in one place:
+  `pdf_translate.run_setup` (`tests/test_network_guard.py` checks that no
+  other code calls it). Don't add anything that phones home.
   The ONLY sanctioned network use is explicit, user-initiated setup:
   translation's in-app flow (`translate_runtime.install_runtime` +
   `pdf_translate.install_languages`, which also fetches the pinned sentence

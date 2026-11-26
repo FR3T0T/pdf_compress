@@ -2,6 +2,80 @@
 ## Unreleased
 
 ### Added
+- **Proof of removal: a panel on the results, and a report saved on request
+  (#100).** Redact and Sanitize already returned their verification report
+  (`pdf_verify.VerificationReport`); a finished run now also carries `proof`,
+  the same in plain words (`removal_report.assemble`, the redaction's items
+  from `pdf_ops.redaction_proof`, Sanitize's from
+  `removal_report.sanitize_proof`): three groups, by page where there are
+  pages ("Pages 1-3 and 9: 2 places blacked out on each"): *Removed and
+  confirmed gone*, with the checks that confirm it; *Found but not
+  targeted*, each with a next step ("Run Sanitize with “Document & XMP
+  metadata” ticked."); *Not checked* (pages with no text, scans read only
+  by their text layer, what OCR read, the insides of attachments, a source
+  whose versions could not be counted), so nothing reads as checked when it
+  was not. Then the earlier-versions line (#122) and the network line
+  (#120 d). The **Proof of removal** panel shows it, collapsed, under the
+  existing result line on the Redact page and under Sanitize on the Analyze
+  page (check ids only under *Technical details*); the result lines are
+  unchanged. **Save report** writes it beside the new file as
+  `<name>.removal-report.json` and `<name>.removal-report.txt`, never over a
+  file (" (2)", " (3)" … on both); new bridge slot `saveRemovalReport(tool)`,
+  which sends only the tool: the bridge keeps the last finished run and writes
+  beside the file it wrote. Not offered for a workspace run. The report holds
+  tool, time, the two file names (no folders), both SHA-256s, verified, each
+  check (id, plain description, passed, pages), what was removed by surface
+  and page, what was left with its next step, what was not checked, and the
+  two lines; never the words searched for, the text found, a password, a
+  folder, an attachment's name or a check's evidence. New
+  `RedactResult.removed_by_page` ({page: places}). The branded PDF report is
+  not built. Tests: `tests/test_removal_report.py`.
+- **Earlier versions kept by incremental saves (#122).** Analyze has a new
+  finding, `content.earlier_versions` (medium): the file keeps N earlier
+  versions of itself, text or pictures removed in a later version may still
+  be in the file, and Sanitize writes a copy that keeps only the current
+  version. Counted with PyMuPDF's `version_count`
+  (`pdf_analyze.earlier_versions` / `versions_of`), which is right for a
+  linearized file where counting `%%EOF` is not, and needs no password. A
+  file MuPDF repaired as it opened it counts as one version whatever it
+  keeps, so its own bytes decide: at most one `%%EOF`, at most one
+  `startxref` and no object number defined twice (`N G obj`) is one
+  version (checked, nothing to report; 97 of the 103 repaired files in our
+  corpus); anything else is reported as not checked (`audit.incomplete`),
+  never clean. Redact and Sanitize check
+  that what they write keeps one version (`redaction.one_version`,
+  `sanitize.one_version`, document-level, worded in a refusal), and the
+  report records the source's count (`earlierVersions`: "The source kept 2
+  earlier versions; this copy keeps none."). Tests:
+  `tests/test_earlier_versions.py`, with files that keep earlier versions
+  built byte by byte (`tests/_versions.py`). Samples 34 (a file saved
+  incrementally), 35 and 36 (the Proof of removal panel after Redact and
+  Sanitize) in `tests/manual/make_redact_samples.py`.
+- **The app's own process makes no network connection (#120 d, the
+  optional half).** New `network_guard.py`, installed first thing by
+  `app.py` and `compress_pdf.py`: Python's `socket.socket.connect` and
+  `connect_ex`, `socket.create_connection`, and `socket.getaddrinfo` for a
+  name that is not local refuse anything but this computer (loopback,
+  `localhost`), with `NetworkRefusedError` (an `OSError`) saying the app
+  makes no network connection unless you start a setup step. A proxy on
+  this computer counts as leaving it: urllib connects to the proxy, on
+  loopback, and asks it for the real host. So a connection to a port that
+  a proxy Python would use is on (`urllib.request.getproxies()`: the
+  environment, and on Windows the system's Internet settings, read when
+  the connection is made) is refused too, and recorded as "a proxy on this
+  computer at 127.0.0.1:8888"; other loopback connections stay allowed. The one way
+  through is `allow_network("translation setup")`, opened only by the new
+  `pdf_translate.run_setup` (the Translate tool's setup: the engine's wheels,
+  the sentence models, the language packs; the bridge's
+  `startSetupTranslation` now calls it) and shut however the setup ends.
+  `setup_translation.py` and `setup_ocr.py` are download tools and do not
+  install the guard. It records the windows (what for, when) and the
+  refused connections (count and host name), and the removal report says
+  what happened during the run ("Network: none used during this run.").
+  Other programs (Ghostscript, pip in the lock generator), native code in
+  the process (MuPDF and its Tesseract, Qt), and a forwarder on this
+  computer that is not set as a proxy are outside it; the README says so. Tests: `tests/test_network_guard.py`, none of which reaches the
+  network.
 - **Redact can read scanned pages with OCR (#128).** A new option under the
   search words, "Also read scanned pages with OCR (slower)", off by default
   and only with search words, reads with OCR every page a search has no text

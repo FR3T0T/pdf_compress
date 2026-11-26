@@ -5,6 +5,7 @@ import { Card } from '../../components/shared/Card';
 import { DropZone } from '../../components/shared/DropZone';
 import { ProgressPanel } from '../../components/shared/ProgressPanel';
 import { ResultsPanel } from '../../components/shared/ResultsPanel';
+import { ProofOfRemoval } from '../../components/ProofOfRemoval';
 import { Checkbox } from '../../components/shared/formControls';
 import { useToast } from '../../components/shared/Toast';
 import { useOperation } from '../../bridge/useOperation';
@@ -13,6 +14,7 @@ import { usePageBusy } from '../../router/Router';
 import { useWorkspace, useWorkspaceBusy } from '../../workspace/WorkspaceContext';
 import { workspaceOutputPath } from '../../workspace/workspaceOutputPath';
 import type { PickedFile } from '../../types/bridge';
+import type { RemovalProof } from '../../types/analyze';
 
 interface VerificationCheck {
   id: string;
@@ -53,6 +55,10 @@ interface RedactResult {
   flattened_areas?: Record<string, number>;
   notes?: unknown[];
   summary?: RedactSummary;
+  // #100: the run in plain words for the Proof of removal panel
+  // (pdf_ops.redaction_proof), and the places page by page.
+  proof?: RemovalProof;
+  removed_by_page?: Record<string, number>;
 }
 
 /** A refused run in plain words (pdf_verify.redaction_refusal_detail). */
@@ -597,6 +603,10 @@ export function RedactPage() {
       )}
 
       {done?.summary && <RedactSummaryPanel summary={done.summary} />}
+
+      {/* #100: under the result line, collapsed. A workspace run's file is
+          the app's own, so its report is not offered for saving. */}
+      {done?.proof && <ProofOfRemoval proof={done.proof} tool="redact" canSave={!workspace.path} />}
 
       {failure?.verification && (
         <VerificationFailurePanel

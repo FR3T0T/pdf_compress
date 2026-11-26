@@ -360,7 +360,9 @@ class TestVerifyRedactionOutcomes:
         assert set(d) == {"inputPath", "outputPath", "tool", "timestamp",
                           "checks", "residualFindings", "verified",
                           "flattenTargetPages", "sourceSha256", "outputSha256",
-                          "unevaluated", "diagnostics"}
+                          "unevaluated", "diagnostics",
+                          # #122 and #120 d: what the report records beside its checks.
+                          "earlierVersions", "network"}
         assert d["tool"] == "redaction"
         assert d["inputPath"] == "in.pdf"
         assert d["verified"] is True

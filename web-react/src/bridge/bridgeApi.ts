@@ -1,4 +1,4 @@
-import type { AnalyzeResponse, SanitizeOptions, SanitizeResponse } from '../types/analyze';
+import type { AnalyzeResponse, SanitizeOptions, SanitizeResponse, SaveReportResponse } from '../types/analyze';
 import type { PresetsResponse, ToolRegistry } from '../types/bridge';
 import {
   MOCK_REPORT,
@@ -16,6 +16,8 @@ import {
   MOCK_REDACT_SUMMARY_EVERYTHING,
   MOCK_REDACT_SUMMARY_FLATTENED,
   MOCK_REDACT_SUMMARY_OCR,
+  MOCK_PROOF_REDACT,
+  MOCK_PROOF_REDACT_EVERYTHING,
   mockSanitizeResult,
 } from './mockData';
 import { cancelSimulated, simulateFailure, simulateOperation, type MockFileLike } from './mockEventBus';
@@ -293,6 +295,16 @@ export const bridgeApi = {
     if (window.BridgeAPI) return window.BridgeAPI.sanitizeDocument(path, outputPath, options);
     await delay(MOCK_DELAY_MS * 2);
     return mockSanitizeResult({ ...MOCK_SANITIZE_DEFAULTS, ...options });
+  },
+
+  /** Save report (#100): the proof of removal of the last finished run of
+   *  *tool*, written beside its new file. Browser-dev mock: the two names a
+   *  file called report.pdf would get. */
+  async saveRemovalReport(tool: 'redact' | 'sanitize'): Promise<SaveReportResponse> {
+    if (window.BridgeAPI) return window.BridgeAPI.saveRemovalReport(tool);
+    await delay(MOCK_DELAY_MS);
+    const stem = tool === 'redact' ? 'report_redacted' : 'report_clean';
+    return { success: true, files: [`${stem}.removal-report.json`, `${stem}.removal-report.txt`] };
   },
 
   // -- Translation (offline) ---------------------------------------------
@@ -694,6 +706,7 @@ export const bridgeApi = {
             verification: { verified: true, checks: [], flattenTargetPages: null },
             flattened_pages: [],
             summary: MOCK_REDACT_SUMMARY_OCR,
+            proof: MOCK_PROOF_REDACT,
           }),
         );
         return;
@@ -710,6 +723,8 @@ export const bridgeApi = {
         flattened_pages: flattened,
         summary: everything ? MOCK_REDACT_SUMMARY_EVERYTHING
           : flattened.length ? MOCK_REDACT_SUMMARY_FLATTENED : MOCK_REDACT_SUMMARY,
+        // #100: search for "everything" to see every group of the panel filled.
+        proof: everything ? MOCK_PROOF_REDACT_EVERYTHING : MOCK_PROOF_REDACT,
       }));
     }
   },
