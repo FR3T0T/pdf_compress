@@ -398,3 +398,32 @@ No new slot. The Redact done payload changes, and so do 14 pages' drop boxes.
   `DropZone`, as Redact does (#135): once a file is picked the box says
   "<name> — click or drop to pick another". Checked in the browser preview
   on all 14. `web-react/dist/` rebuilt.
+
+### #150 — Text outside the boxes (2026-11-25)
+
+No new slot, no frontend change, no rebuild. The Redact done payload can
+carry two more checks.
+
+- **Redact done payload.** `verification.checks` holds a new check,
+  `redaction.text_outside` ("Text outside the boxes shows as it did"), on
+  every run. When it fails the run is refused as damage, like
+  `redaction.ocr_outside`: `refusal.headline` is the damage headline ("it
+  would have changed more of the page than the places found"),
+  `refusal.found` has one line a page ("Text on page 3 outside the black
+  boxes would have stopped showing.", "Hidden text on page 3 ... would have
+  started showing.", "Text on page 3 ... would have moved or gone."),
+  `refusal.nextStep` is "The file was left as it was." and
+  `flattenablePages` is null. A page it could not compare is "could not be
+  checked", as for other checks. On PyMuPDF 2.x, which already adds the
+  `text_may_move` note, text that moved only along the line of a removed
+  word does not fail it.
+- **Redact done payload.** `verification.checks` holds a second new check,
+  `redaction.left_behind` ("Nothing a box redacted is left in the file
+  undrawn"), on every run. When it fails it is a leak: the usual leak
+  headline, `refusal.found` "A picture from page 1 is still in the file,
+  though no page shows it any more. It could be taken out of the file."
+  (or "Content from page 1 …" for a form), its evidence is document-level,
+  so `flattenablePages` is null and `refusal.nextStep` says turning pages
+  into pictures would not remove it.
+- **Mocks.** Unchanged. Those that carry a whole report do not list the
+  new check; the window does not show checks by id.

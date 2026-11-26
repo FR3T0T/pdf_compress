@@ -52,7 +52,11 @@ transform raises, with the report, having touched nothing at the destination:
     :func:`has_edge_inside`). And every redaction, by term or by box,
     is checked for a stream the structure tree alone keeps in the file
     (``redaction.structure_streams``) and for page thumbnails
-    (``redaction.thumbnails``).
+    (``redaction.thumbnails``); and, given the pages as they were by
+    ``redact_pdf`` (#150), for text outside the boxes that no longer shows
+    as it did (``redaction.text_outside``, damage, not a leak) and for a
+    picture or form a page with a box drew that is left in the file with
+    nothing drawing it (``redaction.left_behind``).
   - :func:`verify_sanitization` — re-runs the ``pdf_analyze`` audit on the
     output and asserts absent exactly the finding categories the enabled
     sanitize options promised to remove (expectations-based — anything else
@@ -2312,6 +2316,511 @@ def _ocr_checks(doc, ocr_pages: list, terms: list[str], case_sensitive: bool,
     return checks
 
 
+# ── Text outside the boxes (#150) ────────────────────────────────────
+#
+#  MuPDF's content filter, which a redaction runs over the page it redacts,
+#  can change text it should leave alone: text a form draws after a hidden
+#  text layer turns invisible, hidden text starts showing, text in a font a
+#  graphics state sets is drawn in another, text shown outside a text object
+#  or after a TJ of spacing alone moves (pdf_ops._apply has the account).
+#  redaction.text_outside compares every character a redacted page draws,
+#  outside the boxes, with what it drew before; and a page no box touched
+#  with what it was, byte for byte.
+
+#: How far, in points, a character may be from where it was and still be
+#: where it was.
+TEXT_PLACE_SLACK = 0.5
+#: How far, in points, round each box a character is left out of the
+#: comparison: one that touches a box grown by this much went with it, or
+#: may have.
+TEXT_BOX_MARGIN = 1.0
+#: The ways a character outside the boxes can have changed, as the evidence
+#: says them, in the order the refusal names one per page.
+TEXT_CHANGES = ("stopped showing", "started showing", "moved or went missing")
+#: Character codes below 128 that are white space (str.isspace).
+_ASCII_SPACE = frozenset(c for c in range(128) if chr(c).isspace())
+
+
+def drawn_characters(doc, pno: int) -> list[tuple]:
+    """Every character page *pno* of *doc* draws with its own content —
+    not with its annotations or form fields — on the visible page, white
+    space aside: (character code, x0, y0, x1, y1 of its box, x and y of its
+    origin, hidden, the direction it is written in as x and y, and its
+    line: how far its origin lies across that direction), plain values.
+    Its box is its glyph's, run on to where
+    the next character on the line starts. *hidden* is text drawn in the invisible
+    mode, or with no opacity. Read from a copy of the page made without its
+    annotations or form fields (insert_pdf copies form fields unless told
+    not to): page.get_texttrace() reads what those draw too, and they are
+    not the page content a redaction filters."""
+    one = fitz.open()
+    try:
+        one.insert_pdf(doc, from_page=pno, to_page=pno, links=False, annots=False, widgets=False)
+        page = one[0]
+        ax0, ay0, ax1, ay1 = page.rect
+        found = []
+        for span in page.get_texttrace():
+            hidden = span.get("type") == 3 or span.get("opacity", 1) == 0
+            dx, dy = (round(v, 3) for v in span.get("dir", (1.0, 0.0)))
+            chars = span.get("chars", ())
+            last = len(chars) - 1
+            for i, ch in enumerate(chars):
+                code, glyph, origin, box = ch[0], ch[1], ch[2], ch[3]
+                if code in _ASCII_SPACE or (127 < code < 0x110000 and chr(code).isspace()):
+                    continue
+                x0, x1 = (box[0], box[2]) if box[0] <= box[2] else (box[2], box[0])
+                y0, y1 = (box[1], box[3]) if box[1] <= box[3] else (box[3], box[1])
+                # The box runs on to where the next character starts: the
+                # trace measures a letter by the font's own advance, a
+                # redaction by the width the PDF gives it, which can be
+                # wider (pdf_ops._redact_chars_left_under).
+                if i < last:
+                    nx, ny = chars[i + 1][2]
+                    x0, x1 = min(x0, nx), max(x1, nx)
+                    y0, y1 = min(y0, ny), max(y1, ny)
+                if x1 < ax0 or x0 > ax1 or y1 < ay0 or y0 > ay1:
+                    continue                     # off the visible page
+                # A glyph with no character of its own is told by its number.
+                # Its line is its direction and how far its origin lies
+                # across it.
+                found.append((code if code > 0 else -1 - glyph, x0, y0, x1, y1,
+                              round(origin[0], 2), round(origin[1], 2), hidden, dx, dy,
+                              round(dx * origin[1] - dy * origin[0], 2)))
+        return found
+    finally:
+        one.close()
+
+
+#: A name drawn by Do, as it is written in content: a quick look, for a
+#: digest. A name it takes wrongly (in a string, say) is looked up, and
+#: found or not the same way before and after.
+_DO_RE = re.compile(rb"/([^\s/\[\]()<>{}%]+)\s*Do(?![^\s/\[\]()<>{}%])")
+
+
+def page_digest(doc, pno: int) -> str:
+    """A digest of what page *pno* of *doc* draws: its content streams,
+    decoded, and every XObject its content draws by name, followed down —
+    a form's own content and what it draws, a picture's data as it is
+    stored (decoded when it is stored with no filter at all: the file is
+    saved with those compressed). What a page only lists and does not draw
+    is left out: a redaction takes such names off a page it puts no box on
+    (pdf_ops._drop_undrawn_xobjects). Names and bytes, not object numbers,
+    which change when a file is saved. The same before a redaction and
+    after, on a page no box touched."""
+    import hashlib
+    page = doc[pno]
+    total = hashlib.sha256()
+
+    def stream(xref: int) -> bytes:
+        try:
+            data = doc.xref_stream(xref)
+        except Exception:
+            data = None
+        return data if data is not None else (doc.xref_stream_raw(xref) or b"")
+
+    def picture(xref: int) -> bytes:
+        if doc.xref_get_key(xref, "Filter")[0] == "null":
+            return stream(xref)
+        return doc.xref_stream_raw(xref) or b""
+
+    contents = [stream(xref) for xref in page.get_contents()]
+    for data in contents:
+        total.update(b"C" + data)
+    holder, key = page.xref, "Resources"
+    for _ in range(64):
+        if doc.xref_get_key(holder, "Resources")[0] in ("dict", "xref"):
+            break
+        what, value = doc.xref_get_key(holder, "Parent")
+        if what != "xref":
+            holder = None
+            break
+        holder = int(value.split()[0])
+    seen: set = set()
+
+    def walk(data: bytes, holder, key, depth) -> None:
+        for name in sorted(set(_DO_RE.findall(data))):
+            text = name.decode("latin-1")
+            what, value = (doc.xref_get_key(holder, f"{key}/XObject/{text}")
+                           if holder is not None else ("null", "null"))
+            total.update(b"X" + name)
+            if what != "xref":
+                continue
+            xref = int(value.split()[0])
+            kind = doc.xref_get_key(xref, "Subtype")[1]
+            if kind == "/Image":
+                total.update(b"I" + hashlib.sha256(picture(xref)).digest())
+            elif kind == "/Form" and xref not in seen and depth < 16:
+                seen.add(xref)
+                form = stream(xref)
+                total.update(b"F" + form)
+                if doc.xref_get_key(xref, "Resources")[0] in ("dict", "xref"):
+                    walk(form, xref, "Resources", depth + 1)
+                else:
+                    walk(form, holder, key, depth + 1)
+
+    walk(b"\n".join(contents), holder, key, 0)
+    return total.hexdigest()
+
+
+def _text_changes(before: list, after: list, boxes: list, along_line: bool = False) -> dict:
+    """{way (TEXT_CHANGES): how many characters} that changed between
+    *before* and *after* (drawn_characters) outside *boxes*, each grown by
+    TEXT_BOX_MARGIN. Which characters are outside is decided on the page as
+    it was: once a word is taken out, the box of the letter before it runs
+    on to the next one left, across the box. A character is where it was
+    when one of the same code and the same visibility is within
+    TEXT_PLACE_SLACK of its origin; one that is there but shown where it
+    was hidden, or hidden where it was shown, started or stopped showing;
+    any other is counted as moved or gone, and so is a character outside
+    the boxes afterwards that was nowhere before.
+
+    With *along_line* (PyMuPDF 2.x, whose redaction can move the text after
+    a removed word along its line, and says so in a note): a character on
+    the line of one the run removed (the same direction, and within
+    TEXT_PLACE_SLACK across it) that is still on that line, the same and as
+    visible, but further along it, is not counted."""
+    grown = [(b.x0 - TEXT_BOX_MARGIN, b.y0 - TEXT_BOX_MARGIN,
+              b.x1 + TEXT_BOX_MARGIN, b.y1 + TEXT_BOX_MARGIN) for b in boxes]
+
+    def outside(ch) -> bool:
+        return not any(ch[1] <= g[2] and ch[3] >= g[0] and ch[2] <= g[3] and ch[4] >= g[1]
+                       for g in grown)
+
+    under = [ch for ch in before if not outside(ch)] if grown else []
+    before = [ch for ch in before if outside(ch)] if grown else before
+    used = [False] * len(after)
+    # Most of a page is exactly where it was: those are matched by their
+    # key, and only what is left is looked for within TEXT_PLACE_SLACK.
+    exact: dict = {}
+    for i, ch in enumerate(after):
+        exact.setdefault((ch[0], ch[5], ch[6], ch[7]), []).append(i)
+    left = []
+    for ch in before:
+        same = exact.get((ch[0], ch[5], ch[6], ch[7]))
+        if same:
+            used[same.pop()] = True
+        else:
+            left.append(ch)
+    before = left
+    cells: dict = {}
+    for i, ch in enumerate(after):
+        if not used[i]:
+            cells.setdefault((ch[0], math.floor(ch[5]), math.floor(ch[6])), []).append(i)
+
+    def match(ch, hidden: bool) -> bool:
+        x, y = ch[5], ch[6]
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for i in cells.get((ch[0], math.floor(x) + dx, math.floor(y) + dy), ()):
+                    other = after[i]
+                    if not used[i] and other[7] == hidden and abs(other[5] - x) <= TEXT_PLACE_SLACK \
+                            and abs(other[6] - y) <= TEXT_PLACE_SLACK:
+                        used[i] = True
+                        return True
+        return False
+
+    changes = dict.fromkeys(TEXT_CHANGES, 0)
+    missed = [ch for ch in before if not match(ch, ch[7])]
+    # A letter at the edge of a box that the redaction left is not new; one
+    # that is not there any more is one the run removed.
+    removed = [ch for ch in under if not (match(ch, ch[7]) or match(ch, not ch[7]))]
+    lines = {(ch[8], ch[9]): [] for ch in removed if len(ch) > 10}
+    for ch in removed:
+        if len(ch) > 10:
+            lines[(ch[8], ch[9])].append(ch[10])
+
+    def along(ch) -> bool:
+        """Matched to the same letter further along its own line, which is
+        the line of a letter the run removed."""
+        if len(ch) <= 10 or not any(abs(ch[10] - at) <= TEXT_PLACE_SLACK
+                                    for at in lines.get((ch[8], ch[9]), ())):
+            return False
+        best = None
+        for i, other in enumerate(after):
+            if used[i] or other[0] != ch[0] or other[7] != ch[7] or len(other) <= 10 \
+                    or (other[8], other[9]) != (ch[8], ch[9]) \
+                    or abs(other[10] - ch[10]) > TEXT_PLACE_SLACK:
+                continue
+            gap = abs(other[5] - ch[5]) + abs(other[6] - ch[6])
+            if best is None or gap < best[0]:
+                best = (gap, i)
+        if best is None:
+            return False
+        used[best[1]] = True
+        return True
+
+    for ch in missed:
+        if match(ch, not ch[7]):
+            changes["started showing" if ch[7] else "stopped showing"] += 1
+        elif not (along_line and along(ch)):
+            changes[TEXT_CHANGES[2]] += 1
+    # A letter that moved is missing from where it was and new where it is:
+    # counted once.
+    new = sum(1 for i, ch in enumerate(after) if not used[i] and outside(ch))
+    changes[TEXT_CHANGES[2]] = max(changes[TEXT_CHANGES[2]], new)
+    return {way: n for way, n in changes.items() if n}
+
+
+def _text_outside_check(doc, text_before: dict, boxes: list,
+                        along_line: bool = False) -> VerificationCheck:
+    """``redaction.text_outside`` (#150): the text outside the boxes shows as
+    it did. *text_before* is redact_pdf's account of the pages, by 0-based
+    number: {"chars": drawn_characters of the page before} for a page a box
+    was on, {"digest": page_digest of it before} for one no box touched,
+    both for an untouched page whose digest the output does not match.
+    *boxes* are every box put on the pages, {"page", "x0", "y0", "x1",
+    "y1"} in page space: the user's, OCR's places and the search's.
+
+    A page no box touched passes when its digest is what it was; otherwise
+    its characters are compared, as on a page a box was on: every character
+    outside the boxes, each grown by TEXT_BOX_MARGIN, must still be there,
+    the same character within TEXT_PLACE_SLACK of where it was, shown or
+    hidden as before, and none may be there that was not (_text_changes).
+    With *along_line*, a letter that moved only along the line of one the
+    run removed is not counted (PyMuPDF 2.x, see _text_changes). Damage,
+    not a leak: turning the page into a picture would not put the text
+    back, so no flatten is offered."""
+    by_page: dict[int, list] = {}
+    for entry in boxes:
+        try:
+            by_page.setdefault(int(entry["page"]), []).append(fitz.Rect(
+                float(entry["x0"]), float(entry["y0"]), float(entry["x1"]), float(entry["y1"])))
+        except Exception:
+            continue
+    evidence: list[str] = []
+    unchecked: list[str] = []
+    for pno in sorted(int(p) for p in text_before):
+        entry = text_before.get(pno, text_before.get(str(pno))) or {}
+        on = f"on page {pno + 1}"
+        try:
+            if entry.get("digest") and page_digest(doc, pno) == entry["digest"]:
+                continue
+        except Exception:
+            pass
+        if entry.get("chars") is None:
+            unchecked.append(f"the text {on}, which no box touched, changed and could not be "
+                             f"compared, so it could not be checked" if entry.get("digest") else
+                             f"the text {on} could not be read before the redaction, so it could "
+                             f"not be checked")
+            continue
+        try:
+            now = drawn_characters(doc, pno)
+        except Exception:
+            unchecked.append(f"the text {on} could not be read, so it could not be checked")
+            continue
+        for way, n in _text_changes(entry["chars"], now, by_page.get(pno, []), along_line).items():
+            evidence.append(f"{n:,} character{'' if n == 1 else 's'} outside the boxes {on} {way}")
+    return VerificationCheck(
+        id="redaction.text_outside",
+        description="Text outside the boxes shows as it did",
+        passed=not evidence and not unchecked, evidence=evidence + unchecked,
+        unevaluated=bool(unchecked) and not evidence, flattenable=False)
+
+
+# ── What a box redacted, left behind (#150) ──────────────────────────
+#
+#  MuPDF redacts a picture or form a page draws by giving the page a
+#  redacted copy; the original stays in the file if anything else refers
+#  to it. Saving with clean=True used to drop every name a page lists and
+#  does not draw, and with it such an original; now a redaction drops
+#  those names itself (pdf_ops._drop_undrawn_xobjects) and this checks that
+#  nothing was left: a picture holds no text, so neither the page code
+#  check nor the whole-file search sees it.
+
+def xobject_digest(stream) -> str:
+    """A digest of a picture's or form's data as pikepdf reads it
+    (read_bytes: Flate and the like undone, a JPEG or JPEG 2000 left as it
+    is stored), so that an original stored again, compressed another way,
+    is still known; its stored bytes when it cannot be read."""
+    import hashlib
+    try:
+        data = b"D" + stream.read_bytes()
+    except Exception:
+        try:
+            data = b"R" + stream.read_raw_bytes()
+        except Exception:
+            data = b"?"
+    return hashlib.sha256(data).hexdigest()
+
+
+def operator_of(instruction) -> str:
+    """The operator of a parsed content-stream instruction, as text; "" for
+    one whose bytes are not text (a damaged stream has them), which is no
+    operator that draws or sets anything."""
+    try:
+        return str(instruction.operator)
+    except Exception:
+        return ""
+
+
+def _walk_drawn(holder, resources, found: dict, unread: list, visited: set,
+                extras: bool, depth: int = 0) -> None:
+    """Add to *found* {object id: stream} every image and form XObject the
+    content of *holder* (a page, a form, an appearance) draws with Do,
+    through the forms it draws. With *extras*, also what is drawn by the
+    patterns, soft masks and Type 3 fonts its resources hold. A content
+    stream that cannot be parsed goes into *unread*, with its resources."""
+    key = getattr(holder, "objgen", (0, 0))
+    if depth > 32 or (key != (0, 0) and (key, extras) in visited):
+        return
+    if key != (0, 0):
+        visited.add((key, extras))
+    try:
+        instructions = pikepdf.parse_content_stream(holder)
+    except Exception:
+        unread.append(resources)
+        return
+    xobjects = resources.get("/XObject") if isinstance(resources, pikepdf.Dictionary) else None
+    for instruction in instructions:
+        if operator_of(instruction) != "Do" or not instruction.operands \
+                or not isinstance(xobjects, pikepdf.Dictionary):
+            continue
+        xobject = xobjects.get(instruction.operands[0])
+        if not isinstance(xobject, pikepdf.Stream):
+            continue
+        kind = xobject.get("/Subtype")
+        if kind == "/Image":
+            found[xobject.objgen] = xobject
+        elif kind == "/Form":
+            found[xobject.objgen] = xobject
+            _walk_drawn(xobject, xobject.get("/Resources", resources), found, unread, visited,
+                        extras, depth + 1)
+    if extras and isinstance(resources, pikepdf.Dictionary):
+        _walk_extras(resources, found, unread, visited, depth)
+
+
+def _walk_extras(resources, found: dict, unread: list, visited: set, depth: int) -> None:
+    """What the patterns, soft masks and Type 3 fonts in *resources* draw."""
+    def each(kind):
+        value = resources.get(kind)
+        return list(value.values()) if isinstance(value, pikepdf.Dictionary) else []
+
+    for pattern in each("/Pattern"):
+        if isinstance(pattern, pikepdf.Stream):
+            _walk_drawn(pattern, pattern.get("/Resources", resources), found, unread, visited,
+                        True, depth + 1)
+    for state in each("/ExtGState"):
+        mask = state.get("/SMask") if isinstance(state, pikepdf.Dictionary) else None
+        group = mask.get("/G") if isinstance(mask, pikepdf.Dictionary) else None
+        if isinstance(group, pikepdf.Stream):
+            found[group.objgen] = group
+            _walk_drawn(group, group.get("/Resources", resources), found, unread, visited,
+                        True, depth + 1)
+    for font in each("/Font"):
+        if not isinstance(font, pikepdf.Dictionary) or font.get("/Subtype") != "/Type3":
+            continue
+        procs = font.get("/CharProcs")
+        for proc in (procs.values() if isinstance(procs, pikepdf.Dictionary) else []):
+            if isinstance(proc, pikepdf.Stream):
+                _walk_drawn(proc, font.get("/Resources", resources), found, unread, visited,
+                            True, depth + 1)
+
+
+def drawn_by_pages(pdf, pages=None, extras: bool = False) -> tuple[dict, list]:
+    """({object id: stream} of every image and form XObject drawn by the
+    pages of *pdf* (those numbered in *pages*, 0-based, or all), through
+    their forms; the resources of content that could not be parsed). With
+    *extras*, also what patterns, soft masks and Type 3 fonts draw, and
+    every annotation's appearance and what it draws."""
+    found: dict = {}
+    unread: list = []
+    visited: set = set()
+    for pno, page in enumerate(pdf.pages):
+        if pages is not None and pno not in pages:
+            continue
+        _walk_drawn(page.obj, _inherited(page.obj, "/Resources"), found, unread, visited, extras)
+        if not extras:
+            continue
+        annots = page.obj.get("/Annots")
+        for annot in (list(annots) if isinstance(annots, pikepdf.Array) else []):
+            looks = annot.get("/AP") if isinstance(annot, pikepdf.Dictionary) else None
+            for key in ("/N", "/R", "/D"):
+                look = looks.get(key) if isinstance(looks, pikepdf.Dictionary) else None
+                streams = ([look] if isinstance(look, pikepdf.Stream) else
+                           [s for s in look.values() if isinstance(s, pikepdf.Stream)]
+                           if isinstance(look, pikepdf.Dictionary) else [])
+                for stream in streams:
+                    found[stream.objgen] = stream
+                    _walk_drawn(stream, stream.get("/Resources", pikepdf.Dictionary()), found,
+                                unread, visited, True)
+    return found, unread
+
+
+def drawn_before(pdf, pages) -> dict:
+    """redact_pdf's account, for redaction.left_behind: {xobject_digest:
+    {"page": the first of *pages* (0-based) that drew it, "kind": "image"
+    or "form"}} of every image and form XObject the pages *pages* of *pdf*
+    draw with Do, through their forms."""
+    out: dict = {}
+    done: set = set()
+    for pno in sorted(pages):
+        found, _unread = drawn_by_pages(pdf, {pno})
+        for key, stream in found.items():
+            if key in done:
+                continue
+            done.add(key)
+            out.setdefault(xobject_digest(stream), {
+                "page": pno, "kind": "image" if stream.get("/Subtype") == "/Image" else "form"})
+    return out
+
+
+def _left_behind_check(output_path: str, before: dict, password: Optional[str] = None
+                       ) -> VerificationCheck:
+    """``redaction.left_behind`` (#150): no picture or form a page with a box
+    drew before the redaction is in the output where nothing draws it — no
+    page's content (through its forms, patterns, soft masks and Type 3
+    fonts) and no annotation's appearance. *before* is redact_pdf's account
+    (drawn_before), or {"unread": True} when it could not be taken. A leak,
+    and not of a page: it is in the file, so turning pages into pictures
+    would not take it out (document-level). A picture or form only content
+    that could not be parsed may draw is "could not be checked". One only
+    the structure tree keeps is left to redaction.structure_streams."""
+    evidence: list[str] = []
+    unchecked: list[str] = []
+    if before.get("unread"):
+        unchecked.append("what the pages with a box drew could not be read before the "
+                         "redaction, so it could not be checked (document-level)")
+    else:
+        try:
+            with pikepdf.open(output_path, password=password or "") as pdf:
+                found, unread = drawn_by_pages(pdf, extras=True)
+                # A stream only the structure tree keeps is
+                # redaction.structure_streams' to report: said once.
+                _holders, named, alive, _things = structure_refs(pdf)
+                tree_only = named - alive
+                maybe = set()
+                for resources in unread:
+                    xobjects = resources.get("/XObject") if isinstance(
+                        resources, pikepdf.Dictionary) else None
+                    if isinstance(xobjects, pikepdf.Dictionary):
+                        maybe.update(x.objgen for x in xobjects.values()
+                                     if isinstance(x, pikepdf.Stream))
+                for obj in pdf.objects:
+                    if not isinstance(obj, pikepdf.Stream) or obj.objgen in found \
+                            or tuple(obj.objgen) in tree_only \
+                            or obj.get("/Subtype") not in ("/Image", "/Form"):
+                        continue
+                    was = before.get(xobject_digest(obj))
+                    if not was:
+                        continue
+                    what = "a picture" if was.get("kind") == "image" else "content"
+                    line = (f"{what} drawn on page {int(was['page']) + 1} before the redaction is "
+                            f"still in the file")
+                    if obj.objgen in maybe:
+                        unchecked.append(f"{line}, and what may draw it could not be read, so "
+                                         f"it could not be checked (document-level)")
+                    else:
+                        evidence.append(f"{line}, and nothing draws it (document-level)")
+        except Exception as exc:
+            unchecked.append(f"the output could not be read for what it draws ({type(exc).__name__}), "
+                             f"so it could not be checked (document-level)")
+    return VerificationCheck(
+        id="redaction.left_behind",
+        description="Nothing a box redacted is left in the file undrawn",
+        passed=not evidence and not unchecked, evidence=_dedupe(evidence) + _dedupe(unchecked),
+        unevaluated=bool(unchecked) and not evidence)
+
+
 def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                      rects: Optional[list[dict]] = None,
                      case_sensitive: bool = False,
@@ -2321,7 +2830,10 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                      source_sha256: Optional[str] = None,
                      ocr_pages: Optional[list[dict]] = None,
                      tessdata: Optional[str] = None,
-                     search_boxes: Optional[list[dict]] = None) -> VerificationReport:
+                     search_boxes: Optional[list[dict]] = None,
+                     text_before: Optional[dict] = None,
+                     text_along_line: bool = False,
+                     drawn_before: Optional[dict] = None) -> VerificationReport:
     """Independently confirm a redacted output no longer carries its targets.
 
     Mirrors redact_pdf's selection model: *terms* (search-term redactions)
@@ -2342,6 +2854,18 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
     *search_boxes*, the boxes the search put on the pages (redact_pdf's
     account, the same shape as *rects*), add ``redaction.search_image``: the
     pictures under them are blanked there (#143). Given only with terms.
+
+    *text_before*, the pages as they were before (redact_pdf's account, see
+    :func:`_text_outside_check`), adds ``redaction.text_outside``: the text
+    outside every box, the user's and the search's, shows as it did (#150).
+    With *text_along_line* (PyMuPDF 2.x, which redact_pdf runs with a note
+    that text after a removed word can shift along its line), a letter that
+    moved only along the line of one the run removed is not counted.
+
+    *drawn_before*, the pictures and forms the pages with a box drew before
+    (redact_pdf's account, :func:`drawn_before`), adds
+    ``redaction.left_behind``: none of them is in the output where nothing
+    draws it (#150).
 
     Never returns a false pass: an output that cannot be opened or
     decrypted yields a report with a failed ``redaction.readable`` check
@@ -2394,8 +2918,14 @@ def verify_redaction(output_path: str, terms: Optional[list[str]] = None, *,
                                              tessdata, rects))
         if search_boxes and terms:
             report.checks.append(_search_image_check(doc, search_boxes, output_path, password))
+        if text_before is not None:
+            report.checks.append(_text_outside_check(doc, text_before,
+                                                     rects + list(search_boxes or []),
+                                                     text_along_line))
     finally:
         doc.close()
+    if drawn_before is not None:
+        report.checks.append(_left_behind_check(output_path, drawn_before, password))
     report.checks.extend(_whole_file_checks(output_path, password))
     if source_ids is not None:
         report.checks.append(_file_id_check(
@@ -3402,13 +3932,49 @@ def _refusal_lines(check: VerificationCheck, named: frozenset = frozenset()) -> 
     elif cid == "redaction.ocr_outside":
         lines.append(f"The picture of {where} would have changed outside the places that were "
                      f"blacked out.")
+    elif cid == "redaction.left_behind":
+        drawn: dict[str, list] = {"a picture": [], "content": []}
+        for e in seen:
+            m = re.match(r"^(a picture|content) drawn on page (\d+)", e)
+            if m:
+                drawn[m.group(1)].append(int(m.group(2)))
+        if drawn["a picture"]:
+            one = len(drawn["a picture"]) == 1
+            lines.append(f"{'A picture' if one else 'Pictures'} from "
+                         f"{pages_in_words(drawn['a picture'])} {'is' if one else 'are'} still in "
+                         f"the file, though no page shows {'it' if one else 'them'} any more. "
+                         f"{'It' if one else 'They'} could be taken out of the file.")
+        if drawn["content"]:
+            lines.append(f"Content from {pages_in_words(drawn['content'])} is still in the file, "
+                         f"though no page shows it any more. It could be taken out of the file.")
+    elif cid == "redaction.text_outside":
+        # One line a page: the first of the ways (TEXT_CHANGES) it changed.
+        ways: dict[int, int] = {}
+        for e in seen:
+            m = _ON_PAGE_RE.search(e)
+            way = next((i for i, w in enumerate(TEXT_CHANGES) if e.endswith(w)), None)
+            if m and way is not None:
+                ways[int(m.group(1))] = min(ways.get(int(m.group(1)), way), way)
+        for page, way in sorted(ways.items()):
+            lines.append(_TEXT_OUTSIDE_WORDS[way].format(page=page))
     else:
         lines.append("Something you asked to remove is still in the new file.")
     return lines
 
 
-#: The headline of a refusal whose only failure is redaction.ocr_outside:
-#: damage, not a leak (#128). pdf_ops' one-line message says the same.
+#: redaction.text_outside's lines, one a page, by TEXT_CHANGES (#150).
+_TEXT_OUTSIDE_WORDS = (
+    "Text on page {page} outside the black boxes would have stopped showing.",
+    "Hidden text on page {page} outside the black boxes would have started showing.",
+    "Text on page {page} outside the black boxes would have moved or gone.",
+)
+
+#: The checks whose failure is damage, not a leak: the page would have
+#: changed outside the places found (#128, #150).
+DAMAGE_CHECKS = frozenset({"redaction.ocr_outside", "redaction.text_outside"})
+
+#: The headline of a refusal whose only failures are DAMAGE_CHECKS (#128,
+#: #150). pdf_ops' one-line message says the same.
 DAMAGE_HEADLINE = ("Redaction refused: it would have changed more of the page than the places "
                    "found. Nothing was saved.")
 
@@ -3440,7 +4006,7 @@ def redaction_refusal_detail(report: VerificationReport, offer: Optional[list] =
     unread = bool(failed) and all(
         c.unevaluated or all("could not be" in e or "did not cover" in e for e in c.evidence)
         for c in failed)
-    damage = bool(failed) and all(c.id == "redaction.ocr_outside" for c in failed)
+    damage = bool(failed) and not unread and all(c.id in DAMAGE_CHECKS for c in failed)
     if identifier:
         headline = ("Redaction refused: the new file would still be linked to the original. "
                     "Nothing was saved.")

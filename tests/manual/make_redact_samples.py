@@ -1,5 +1,5 @@
 """Write the sample files for the Redact app checklist (#119, #128, #134,
-#140, #143).
+#140, #143, #150).
 
 Usage: python tests/manual/make_redact_samples.py <folder>
 
@@ -8,8 +8,10 @@ PyMuPDF, which the app already needs; nothing is downloaded or copied. Each
 page says what the sample is for; a scan (samples 18 to 23 and 25 to 27,
 for reading scanned pages with OCR) says it in its own picture. Sample 25
 is given its text layer by MuPDF's own OCR, so it needs the OCR language
-file (python setup_ocr.py --install); without it, it is skipped. The
-checklists that use them are in the pull requests for #119, #128 and #143.
+file (python setup_ocr.py --install); without it, it is skipped. Samples
+28 to 33 are for #150: text outside the boxes, and a picture on pages that
+share their resources. The checklists that use them are in the pull
+requests for #119, #128, #143 and #150.
 This is not a test: pytest collects only test_*.py files.
 """
 import io
@@ -558,6 +560,100 @@ def text_layer_over_a_stencil(folder):
     save(pdf, folder, "27_text_layer_over_a_stencil_mask.pdf")
 
 
+# ── Text the redaction must leave as it is, for #150 ─────────────────────
+
+def footer(pdf, words: str, y: float = 40):
+    """A form XObject that draws *words* near the foot of the page, in type."""
+    return pdf.make_stream(f"BT /F1 11 Tf 72 {y} Td ({words}) Tj ET".encode(),
+                           Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 612, 792],
+                           Resources=Dictionary(Font=Dictionary(F1=font(pdf))))
+
+
+def scan_with_a_footer(folder):
+    """The pdf.js file of #150: a searchable scan whose footer is a form,
+    drawn after the hidden layer has left the invisible mode set."""
+    rows = ["Sample 28: a searchable scan with a footer.", f"The account {TERM} is overdue.",
+            "The footer under this scan is drawn after the", "hidden layer. It must still show."]
+    pdf = pikepdf.Pdf.new()
+    scan_page(pdf, rows, layer=True)
+    page = pdf.pages[-1].obj
+    page["/Contents"].write(page["/Contents"].read_bytes() + b"\nq 0 Tr /Footer Do Q")
+    page["/Resources"]["/XObject"]["/Footer"] = footer(
+        pdf, "Sample 28 footer: drawn by a form after the hidden text layer. It must still show.")
+    save(pdf, folder, "28_scan_with_a_footer.pdf")
+
+
+def form_the_page_hides(folder):
+    pdf = pikepdf.Pdf.new()
+    page = add_page(pdf, text("Sample 29: the page hides the text of a form it draws.",
+                              f"The reference {TERM} is on this page.",
+                              "Under this line is a hidden line. It must stay hidden.")
+                    + b"\n3 Tr /Hidden Do 0 Tr")
+    page["/Resources"]["/XObject"] = Dictionary(Hidden=footer(
+        pdf, "If you can read this line, sample 29 has failed.", y=560))
+    save(pdf, folder, "29_form_the_page_hides.pdf")
+
+
+def font_set_by_a_graphics_state(folder):
+    pdf = pikepdf.Pdf.new()
+    courier = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1,
+                                           BaseFont=Name.Courier))
+    page = add_page(pdf, text("Sample 30: the last line's font, Courier, is set by a graphics",
+                              "state, not by the text. It must stay in Courier, in its place.",
+                              f"The reference {TERM} is on this page.")
+                    + b"\n/GS1 gs BT 72 560 Td (This line is in Courier.) Tj ET")
+    page["/Resources"]["/ExtGState"] = Dictionary(GS1=Dictionary(
+        Type=Name.ExtGState, Font=Array([courier, 14])))
+    save(pdf, folder, "30_font_set_by_a_graphics_state.pdf")
+
+
+def text_outside_a_text_object(folder):
+    pdf = pikepdf.Pdf.new()
+    add_page(pdf, text("Sample 31: the last line is written outside a text object. A PDF",
+                       "should not do that, but it is drawn, and redacting this page",
+                       "would move it: the redaction must be refused, nothing saved.",
+                       f"The reference {TERM} is on this page.")
+             + b"\n/F1 14 Tf 1 0 0 1 72 560 Tm (This line is outside a text object.) Tj")
+    save(pdf, folder, "31_text_outside_a_text_object.pdf")
+
+
+def footer_on_two_pages(folder):
+    """The same footer form on two pages, after hidden text on each. The term
+    is on the first page only: the second gets no box, and must come through
+    exactly as it was."""
+    pdf = pikepdf.Pdf.new()
+    shared = footer(pdf, "Sample 32 footer, on both pages: it must still show on both.")
+    for n, line in ((1, f"The reference {TERM} is on this page."),
+                    (2, "The reference is not on this page.")):
+        page = add_page(pdf, text(f"Sample 32, page {n}: a footer form on both pages, drawn",
+                                  "after a hidden note. The footer must still show on both.", line)
+                        + b"\nBT 3 Tr /F1 12 Tf 72 500 Td (a hidden note) Tj ET q 0 Tr /Footer Do Q")
+        page["/Resources"]["/XObject"] = Dictionary(Footer=shared)
+    save(pdf, folder, "32_footer_on_two_pages.pdf")
+
+
+def picture_on_pages_that_share_resources(folder):
+    """#150: two pages with one resources dictionary between them, as TCPDF
+    and OpenOffice write them. Page 1 draws a picture with the reference in
+    it; page 2 lists the picture and does not draw it. A box over the
+    picture must not leave the original in the file through page 2."""
+    pdf = pikepdf.Pdf.new()
+    picture = picture_of_words(["Sample 33: a picture on page 1 only.",
+                                f"The reference {TERM} is in this picture.",
+                                "Draw a box over the whole picture."])
+    shared = pdf.make_indirect(Dictionary(Font=Dictionary(F1=font(pdf)),
+                                          XObject=Dictionary(Scan=image(pdf, picture))))
+    x, y, width, height = SCAN
+    for content in (f"q {width} 0 0 {height} {x} {y} cm /Scan Do Q\n".encode()
+                    + text("Sample 33, page 1: the picture below shares its resources",
+                           "with page 2, which lists the picture and does not draw it."),
+                    text("Sample 33, page 2: this page lists the picture on page 1",
+                         "and does not draw it. Nothing here is redacted.")):
+        page = add_page(pdf, content)
+        page["/Resources"] = shared
+    save(pdf, folder, "33_picture_on_pages_that_share_resources.pdf")
+
+
 def main(folder: str) -> None:
     os.makedirs(folder, exist_ok=True)
     number_across_a_line(folder)
@@ -587,6 +683,12 @@ def main(folder: str) -> None:
     searchable_scan_with_a_misread(folder)
     sloppy_text_layer(folder)
     text_layer_over_a_stencil(folder)
+    scan_with_a_footer(folder)
+    form_the_page_hides(folder)
+    font_set_by_a_graphics_state(folder)
+    text_outside_a_text_object(folder)
+    footer_on_two_pages(folder)
+    picture_on_pages_that_share_resources(folder)
 
 
 if __name__ == "__main__":

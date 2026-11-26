@@ -196,10 +196,31 @@ links, the document's details, bookmarks, attachments, the structure tree,
 thumbnails, what is under each box you drew, the pictures the page draws
 under each place the search found (their pixels must be blanked there, so
 the word cannot be taken out of the file with the picture; see the known
-limits), and a search of every string and
-stream in the file. It is saved only if every check passes. Otherwise
-nothing is saved, and the original is untouched, even when redacting in
-place.
+limits), the text outside the boxes, that nothing a box redacted is left
+in the file, and a search of every string and stream in the file. It is
+saved only if every check passes. Otherwise nothing is saved, and the
+original is untouched, even when redacting in place.
+
+The text outside the boxes is checked because the PDF library rewrites
+the page it redacts, and on some pages that changed text it should leave
+alone (see the known limits). On every page with a box, every letter
+outside the boxes (and a point round them) must still be there: the same
+letter, within half a point of where it was, shown or hidden as before.
+Annotations and form fields are left out of this, and so is text off the
+visible page. On PyMuPDF 2.x only, a letter on the line of a word that was
+removed may have moved along that line (the run says that text can shift);
+off its line, or shown or hidden where it was not, it is refused there too.
+Every other page must come through drawing what it drew: its code and
+every picture and form it draws, byte for byte, or, if any of that changed,
+letter for letter.
+
+Nothing a box redacted may be left in the file. The PDF library gives a
+page it redacts its own copy of each picture and form under a box; when
+pages share one set of resources, the other pages still list the original.
+So each page without a box loses from its list every picture and form its
+own code does not draw (in a copy of its own, so nothing another page uses
+changes), and a check refuses the run if a picture or form a page with a
+box drew is still in the file with nothing drawing it.
 
 **What it reports.** When the run is saved, the Redact page says how many
 places on how many pages were redacted, what else was removed, and what is
@@ -213,9 +234,15 @@ the layer), attachments, which are
 searched as they are stored and never opened (a zip or a Word file is
 packed, so nothing inside it is searched), pages turned into pictures, a
 run by boxes alone, a form field under a box that is still shown in another
-place, and, on PyMuPDF 2.x, that text after a removed word may have moved.
+place, and, on PyMuPDF 2.x, that text after a removed word can shift along
+its line.
 When the run is refused, the page says what was found and where, and what
-can be done. When what is left is drawn on a page, that page can be turned
+can be done. A run that would have changed a page outside the places found
+(text there that would have stopped showing, hidden text that would have
+started showing, text that would have moved, or with OCR the picture) is
+refused as damage, page by page, and the file is left as it was. A picture
+or form from a page with a box that would have stayed in the file, with
+nothing drawing it, is named with its page. When what is left is drawn on a page, that page can be turned
 into a picture: it keeps its look, with what was found blacked out first,
 but its text can no longer be selected or searched. When it is not on a page
 (the document's details, the file's identifier), the page says that turning
@@ -334,8 +361,9 @@ described here.
   may still be in the picture.
 - A straight line written as a curve is treated as a curve: a box over it
   is refused and the page offered as a picture.
-- On PyMuPDF 2.x the text after a removed word can move along its line. The
-  run says so.
+- On PyMuPDF 2.x the text after a removed word can move along its line
+  (removing a one-letter word, or a word that ends where the PDF adjusts
+  the spacing). The run says so.
 - Words inside a picture are not read, unless OCR is ticked (see *Reading
   scanned pages*). Attachments are searched as stored and never opened. A few places have no rule yet (web-capture names, an
   output intent's strings, certificates in the document security store):
@@ -346,10 +374,29 @@ described here.
   text filled with one, a note's or stamp's own picture, and a picture that
   is part of a soft mask (a picture used to fade another) are left as they
   are and not checked. A word drawn only in one of those stays.
-- On a page whose text after a hidden OCR layer is drawn by a form, removing
-  a word can leave that text invisible (issue #150). With OCR ticked, the
-  run is refused, as it should be, if OCR found a place to black out on
-  that page. Otherwise, and always with OCR off, it is not noticed.
+- The PDF library rewrites the page it redacts, and on some pages that
+  changes text it should leave alone (#150). What it changed is now put
+  back: text a form draws after a hidden text layer (a searchable scan's
+  footer turned invisible), text a page hides when it draws a form (it
+  started showing), and a font set by a graphics state rather than by the
+  text (the line was drawn in another font). A page with no box is saved as
+  it was read. Two things are not put back, and the run is refused as
+  damage: text written outside a text object (a PDF should not have it, but
+  viewers draw it), and text after a step of spacing alone that follows a
+  change of font. Each moves.
+- Until #150 the file was cleaned as it was saved: every page's code was
+  rewritten, which also changed text on every page. Two things that
+  cleaning did are not done now. A search word in a comment in the code of
+  a page with no box stays, and the run is refused with that page offered
+  as a picture. A file whose pages are compressed with Brotli, which the
+  whole-file search cannot read, is refused as not checked.
+- A picture or form that a page with a box drew, which a form (not a page)
+  still lists, stays in the file: only pages' lists are cut. The run is
+  refused, and turning pages into pictures would not help.
+- Checking the text outside the boxes, and what the boxes left, takes time
+  on each page with a box, about 10 ms: a search that finds the word on 30
+  pages of a 352-page book took 5.2 seconds instead of 4.1, and a box on
+  every page of it 10 instead of 3.8.
 
 ---
 

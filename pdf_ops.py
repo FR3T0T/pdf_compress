@@ -12,7 +12,8 @@ import tempfile
 import threading
 import zlib
 from dataclasses import asdict, dataclass, field
-from typing import Callable
+from decimal import Decimal
+from typing import Callable, NamedTuple
 
 import fitz  # PyMuPDF
 import pikepdf
@@ -33,12 +34,18 @@ from pdf_analyze import (
 )
 from pdf_verify import (
     _MATCH_FLAGS,
+    DAMAGE_CHECKS,
     DAMAGE_HEADLINE,
     STRUCTURE_WAYS_OUT,
     PageText,
     TermFinder,
     WalkStatus,
+    _inherited,
     chars_under,
+    drawn_before,
+    drawn_characters,
+    operator_of,
+    page_digest,
     page_to_picture_matrix,
     pages_in_words,
     path_lines,
@@ -3292,7 +3299,9 @@ def _flatten_pages_to_image(src_path: str, dst_path: str,
                 np_.insert_image(np_.rect, pixmap=pix)
             else:
                 out.insert_pdf(src, from_page=i, to_page=i)
-        out.save(dst_path, garbage=4, deflate=True, clean=True)
+        # Not clean=True: the pages that stay pages are copied as they are
+        # (#150, see redact_pdf's save).
+        out.save(dst_path, garbage=4, deflate=True)
     finally:
         out.close()
         src.close()
@@ -3499,6 +3508,370 @@ def _links_on(page) -> tuple[set, int]:
     return xrefs, unnumbered
 
 
+# ── The text state around a redaction (#150) ─────────────────────────
+#
+#  MuPDF's content filter, which apply_redactions runs over the page it
+#  redacts, writes the text state (Tc Tw Tz TL Tr Ts Tf) only inside a text
+#  object (MuPDF 1.27.2 and 1.28.6). A change made outside BT before
+#  "/Fm Do" is never written, so the copy of the form MuPDF writes runs with
+#  whatever state was written last; and each form copy is rewritten as if
+#  it starts from the default text state, so a form's own "0 Tr" is
+#  dropped as already in force. A visible footer drawn by a form after a
+#  scan's hidden text layer turned invisible, and text a caller hid ("3 Tr
+#  /Fm0 Do") started showing. A font set by a graphics state ("/GS1 gs"
+#  with /Font) is lost, and the text is drawn in another font. So around
+#  every apply_redactions, on the page being redacted:
+#
+#  Before, the text state is followed through the content (q/Q, the six
+#  parameters, TD and ", Tf, and gs with /Font) and made explicit: after a
+#  gs that sets a font comes a Tf for that font and size, and a form drawn
+#  while the state is not the default is drawn from a copy whose content
+#  first sets that state. After, in the content MuPDF wrote and in every
+#  form copy it wrote, a form drawn while the state in force is not the
+#  default is drawn as "q 0 Tc 0 Tw 100 Tz 0 TL 0 Tr 0 Ts /Fm Do Q". MuPDF
+#  writes each form copy as if it starts from the default state, so that
+#  copy is right when it is drawn with the default state; before removed
+#  its need to inherit anything, and after puts the default back where it
+#  is drawn. A form is never changed where it is: other pages, annotations
+#  and other calls share it. Content that cannot be parsed is left as it
+#  is, and the verifier (redaction.text_outside) judges the page.
+
+#: The text state parameters a content stream sets with one number each.
+_TEXT_PARAMS = ("Tc", "Tw", "Tz", "TL", "Tr", "Ts")
+#: How deep forms drawn inside forms are followed.
+_FORM_DEPTH = 16
+_REF_RE = re.compile(r"(\d+)\s+(\d+)\s+R")
+_FONT_SET_RE = re.compile(r"^\[\s*(\d+)\s+(\d+)\s+R\s+([-+]?(?:\d+\.?\d*|\.\d+))\s*\]$")
+
+
+class _TextState(NamedTuple):
+    """The text state in force. *font* is (the name it was set by, the font
+    object as "n g R" or a dictionary's own source), or None."""
+    font: tuple | None
+    size: Decimal | None
+    Tc: Decimal
+    Tw: Decimal
+    Tz: Decimal
+    TL: Decimal
+    Tr: Decimal
+    Ts: Decimal
+
+    def params(self) -> tuple:
+        return (self.Tc, self.Tw, self.Tz, self.TL, self.Tr, self.Ts)
+
+
+_DEFAULT_TEXT_STATE = _TextState(None, None, *(Decimal(v) for v in (0, 0, 100, 0, 0, 0)))
+_DEFAULT_PARAMS = _DEFAULT_TEXT_STATE.params()
+
+
+def _number(value, default):
+    """An operand as a Decimal, or *default* when it is not a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return default
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return default
+
+
+def _op(operator: str, *operands):
+    return pikepdf.ContentStreamInstruction(list(operands), pikepdf.Operator(operator))
+
+
+class _Resources:
+    """The resources of a content stream, read through PyMuPDF: the
+    dictionary under *key* of object *holder* (a page, a page-tree node it
+    inherits them from, or a form). Before a name is added they are made
+    the own of the object *owner()* gives: an inline copy there, with the
+    one sub-dictionary that is added to copied too, so that nothing another
+    page or form shares is changed."""
+
+    def __init__(self, doc, holder, key: str = "Resources", owner=None):
+        self.doc, self.holder, self.key, self.owner = doc, holder, key, owner
+        self.added: dict = {}
+
+    def get(self, kind: str, name) -> tuple:
+        if self.holder is None:
+            return ("null", "null")
+        name = str(name).lstrip("/")
+        try:
+            return self.doc.xref_get_key(self.holder, f"{self.key}/{kind}/{name}")
+        except Exception:
+            return ("null", "null")
+
+    def source(self, kind: str | None = None) -> str:
+        """The resources' dictionary, or its *kind* sub-dictionary, as PDF
+        source ("<<>>" when there is none)."""
+        if self.holder is None:
+            return "<<>>"
+        path = self.key if kind is None else f"{self.key}/{kind}"
+        what, value = self.doc.xref_get_key(self.holder, path)
+        if what == "xref":
+            return self.doc.xref_object(int(value.split()[0]), compressed=True)
+        return value if what == "dict" else "<<>>"
+
+    def form(self, name):
+        """The object number of the form XObject *name*, or None."""
+        what, value = self.get("XObject", name)
+        if what != "xref":
+            return None
+        xref = int(value.split()[0])
+        try:
+            return xref if self.doc.xref_get_key(xref, "Subtype") == ("name", "/Form") else None
+        except Exception:
+            return None
+
+    def font(self, name) -> tuple:
+        what, value = self.get("Font", name)
+        return (str(name).lstrip("/"), value if what in ("xref", "dict") else None)
+
+    def font_from_state(self, name):
+        """(font object, size) a graphics state *name* sets with /Font, or None."""
+        what, value = self.get("ExtGState", name)
+        if what == "xref":
+            what, value = self.doc.xref_get_key(int(value.split()[0]), "Font")
+        elif what == "dict":
+            what, value = self.get("ExtGState", f"{str(name).lstrip('/')}/Font")
+        else:
+            return None
+        m = _FONT_SET_RE.match(value.strip()) if what == "array" else None
+        return (f"{m.group(1)} {m.group(2)} R", Decimal(m.group(3))) if m else None
+
+    def add(self, kind: str, value: str, base: str) -> str:
+        """A name that gives *value* under *kind*, added if there is none."""
+        if (kind, value) in self.added:
+            return self.added[(kind, value)]
+        owner = self.owner()
+        if self.holder != owner or self.key != "Resources" or \
+                self.doc.xref_get_key(owner, "Resources")[0] != "dict":
+            self.doc.xref_set_key(owner, "Resources", self.source())
+            self.holder, self.key = owner, "Resources"
+        what, sub = self.doc.xref_get_key(owner, f"Resources/{kind}")
+        if what == "xref":
+            self.doc.xref_set_key(owner, f"Resources/{kind}",
+                                  self.doc.xref_object(int(sub.split()[0]), compressed=True))
+        elif what != "dict":
+            self.doc.xref_set_key(owner, f"Resources/{kind}", "<<>>")
+        n = 1
+        while self.get(kind, f"{base}{n}")[0] != "null":
+            n += 1
+        self.doc.xref_set_key(owner, f"Resources/{kind}/{base}{n}", value)
+        self.added[(kind, value)] = f"{base}{n}"
+        return f"{base}{n}"
+
+    def draws_forms(self) -> bool:
+        return any(self.doc.xref_get_key(int(x), "Subtype") == ("name", "/Form")
+                   for x, _g in _REF_RE.findall(self.source("XObject")))
+
+    def sets_fonts(self) -> bool:
+        states = self.source("ExtGState")
+        return "/Font" in states or any(
+            "/Font" in self.doc.xref_object(int(x), compressed=True)
+            for x, _g in _REF_RE.findall(states))
+
+
+def _page_resources(page) -> _Resources:
+    """*page*'s resources: its own, or those of the nearest node above it."""
+    doc, node = page.parent, page.xref
+    for _ in range(64):
+        if doc.xref_get_key(node, "Resources")[0] in ("dict", "xref"):
+            return _Resources(doc, node, owner=lambda: page.xref)
+        what, value = doc.xref_get_key(node, "Parent")
+        if what != "xref":
+            break
+        node = int(value.split()[0])
+    return _Resources(doc, None, owner=lambda: page.xref)
+
+
+def _new_stream(doc, data: bytes, source: str = "<<>>") -> int:
+    """A new stream object with dictionary *source* (its own filters
+    dropped) and *data*."""
+    xref = doc.get_new_xref()
+    doc.update_object(xref, source)
+    for key in ("Filter", "DecodeParms", "Length"):
+        doc.xref_set_key(xref, key, "null")
+    doc.update_stream(xref, data)
+    return xref
+
+
+class _TextStateFix:
+    """The two steps round one apply_redactions on one page (see above)."""
+
+    def __init__(self, doc):
+        self.doc = doc
+        self.scratch = pikepdf.Pdf.new()
+        self.copies: dict = {}
+
+    def parse(self, data: bytes):
+        try:
+            return list(pikepdf.parse_content_stream(pikepdf.Stream(self.scratch, data)))
+        except Exception:
+            return None
+
+    @staticmethod
+    def follow(state: _TextState, op: str, operands, res: _Resources) -> _TextState:
+        """*state* after operator *op* (q and Q aside)."""
+        if op in _TEXT_PARAMS and len(operands) == 1:
+            return state._replace(**{op: _number(operands[0], getattr(state, op))})
+        if op == "TD" and len(operands) == 2:
+            ty = _number(operands[1], None)
+            return state if ty is None else state._replace(TL=-ty)
+        if op == '"' and len(operands) == 3:
+            return state._replace(Tw=_number(operands[0], state.Tw),
+                                  Tc=_number(operands[1], state.Tc))
+        if op == "Tf" and len(operands) == 2 and res is not None:
+            return state._replace(font=res.font(operands[0]),
+                                  size=_number(operands[1], state.size))
+        return state
+
+    def explicit(self, data: bytes, res: _Resources, state: _TextState, chain: tuple):
+        """*data* with the text state made explicit at every gs that sets a
+        font and every form drawn while it is not the default; None if
+        nothing changes or it cannot be parsed."""
+        instructions = self.parse(data)
+        if instructions is None:
+            return None
+        out, stack, changed = [], [], False
+        for ins in instructions:
+            op = operator_of(ins)
+            operands = ins.operands if op != "INLINE IMAGE" else []
+            if op == "q":
+                stack.append(state)
+            elif op == "Q":
+                state = stack.pop() if stack else state
+            elif op == "gs" and len(operands) == 1:
+                font = res.font_from_state(operands[0])
+                if font is not None:
+                    name = res.add("Font", font[0], "TSF")
+                    state = state._replace(font=(name, font[0]), size=font[1])
+                    out += [ins, _op("Tf", pikepdf.Name("/" + name), font[1])]
+                    changed = True
+                    continue
+            elif op == "Do" and len(operands) == 1:
+                form = res.form(operands[0])
+                copy = self.copy_of(form, state, res, chain) if form is not None else None
+                if copy is not None:
+                    out.append(_op("Do", pikepdf.Name("/" + res.add("XObject", f"{copy} 0 R", "TSX"))))
+                    changed = True
+                    continue
+            else:
+                state = self.follow(state, op, operands, res)
+            out.append(ins)
+        return pikepdf.unparse_content_stream(out) if changed else None
+
+    def copy_of(self, form: int, state: _TextState, caller: _Resources, chain: tuple):
+        """A copy of *form* that sets *state* first and has the text state
+        made explicit inside it, or None when *form* needs none (the state
+        is the default and nothing inside it changes)."""
+        if form in chain or len(chain) >= _FORM_DEPTH:
+            return None
+        doc = self.doc
+        own = doc.xref_get_key(form, "Resources")[0] in ("dict", "xref")
+        key = (form, state, None if own else (caller.holder, caller.key))
+        if key in self.copies:
+            return self.copies[key]
+        self.copies[key] = None
+        data = doc.xref_stream(form)
+        if data is None:
+            return None
+        made: list = []
+
+        def owner() -> int:
+            if not made:
+                made.append(_new_stream(doc, b"", doc.xref_object(form, compressed=True)))
+            return made[0]
+
+        res = (_Resources(doc, form, owner=owner) if own else
+               _Resources(doc, caller.holder, caller.key, owner=owner))
+        body = self.explicit(data, res, state, chain + (form,))
+        if body is None and state == _DEFAULT_TEXT_STATE:
+            return None
+        setting = []
+        if state.font is not None and state.font[1] is not None and state.size is not None:
+            name, font = state.font
+            if res.get("Font", name)[1] != font:
+                name = res.add("Font", font, "TSF")
+            setting.append(_op("Tf", pikepdf.Name("/" + name), state.size))
+        setting += [_op(p, v) for p, v, d in zip(_TEXT_PARAMS, state.params(), _DEFAULT_PARAMS,
+                                                 strict=True) if v != d]
+        xref = owner()
+        doc.update_stream(xref, pikepdf.unparse_content_stream(setting) + b"\n"
+                          + (body if body is not None else data))
+        self.copies[key] = xref
+        return xref
+
+    def defaults(self, data: bytes, res: _Resources, new_from: int, done: set, chain: tuple):
+        """*data* (content MuPDF wrote) with every form drawn while the text
+        state is not the default drawn with the default state; the forms
+        MuPDF wrote (object numbers from *new_from* on) changed the same way
+        where they are. None if nothing changes or it cannot be parsed."""
+        instructions = self.parse(data)
+        if instructions is None:
+            return None
+        out, stack, changed, state = [], [], False, _DEFAULT_TEXT_STATE
+        for ins in instructions:
+            op = operator_of(ins)
+            operands = ins.operands if op != "INLINE IMAGE" else []
+            if op == "q":
+                stack.append(state)
+            elif op == "Q":
+                state = stack.pop() if stack else state
+            elif op == "Do" and len(operands) == 1:
+                form = res.form(operands[0])
+                if form is not None:
+                    if form >= new_from and form not in done and form not in chain \
+                            and len(chain) < _FORM_DEPTH:
+                        done.add(form)
+                        self.defaults_in(form, res, new_from, done, chain)
+                    if state.params() != _DEFAULT_PARAMS:
+                        out += [_op("q"), *(_op(p, d) for p, d in zip(_TEXT_PARAMS, _DEFAULT_PARAMS,
+                                                                      strict=True)),
+                                ins, _op("Q")]
+                        changed = True
+                        continue
+            else:
+                state = self.follow(state, op, operands, None)
+            out.append(ins)
+        return pikepdf.unparse_content_stream(out) if changed else None
+
+    def defaults_in(self, form: int, caller: _Resources, new_from: int, done: set, chain: tuple):
+        doc = self.doc
+        own = doc.xref_get_key(form, "Resources")[0] in ("dict", "xref")
+        res = _Resources(doc, form) if own else caller
+        data = doc.xref_stream(form)
+        new = self.defaults(data, res, new_from, done, chain + (form,)) if data is not None else None
+        if new is not None:
+            for key in ("Filter", "DecodeParms"):
+                doc.xref_set_key(form, key, "null")
+            doc.update_stream(form, new)
+
+
+def _page_content(page) -> bytes:
+    doc = page.parent
+    return b"\n".join(doc.xref_stream(x) or b"" for x in page.get_contents())
+
+
+def _text_state_before(page) -> None:
+    """The "before" step (see above) on *page*."""
+    res = _page_resources(page)
+    if res.holder is None or not (res.draws_forms() or res.sets_fonts()):
+        return
+    new = _TextStateFix(page.parent).explicit(_page_content(page), res, _DEFAULT_TEXT_STATE, ())
+    if new is not None:
+        page.parent.xref_set_key(page.xref, "Contents", f"{_new_stream(page.parent, new)} 0 R")
+
+
+def _text_state_after(page, new_from: int) -> None:
+    """The "after" step (see above) on *page*; MuPDF's objects are those
+    numbered *new_from* and on."""
+    res = _page_resources(page)
+    if res.holder is None or not res.draws_forms():
+        return
+    new = _TextStateFix(page.parent).defaults(_page_content(page), res, new_from, set(), ())
+    if new is not None:
+        page.parent.xref_set_key(page.xref, "Contents", f"{_new_stream(page.parent, new)} 0 R")
+
+
 def _apply(page, tally: dict | None = None, **options) -> None:
     """page.apply_redactions(**options), adding to *tally* what left the
     page with it: "annotations" and "links".
@@ -3509,18 +3882,32 @@ def _apply(page, tally: dict | None = None, **options) -> None:
     kind stays). A free-text note is counted like one this code takes off,
     and whatever replied to it goes too and is counted — left behind, it
     would be a reply to nothing. A link is counted apart.
+
+    The text state is made explicit before, and put back to the default
+    where a form is drawn after (_text_state_before, _text_state_after,
+    #150): MuPDF's filter loses it there. A step that fails leaves the page
+    as it is, for the verifier to judge.
     """
     try:
         before, unnumbered = _annotations_on(page)
         links, unnumbered_links = _links_on(page)
     except Exception:
         before, unnumbered, links, unnumbered_links = set(), 0, set(), 0
+    try:
+        _text_state_before(page)
+    except Exception:
+        pass
+    new_from = page.parent.xref_length()
     # Upright while it redacts: PyMuPDF draws the black fill with the
     # matrix that is wrong on a turned page whose page box does not start
     # at 0 0 (pdf_verify.upright). The text is removed in the right place
     # either way.
     with upright(page):
         page.apply_redactions(**options)
+    try:
+        _text_state_after(page, new_from)
+    except Exception:
+        pass
     if tally is None:
         tally = {"annotations": 0, "links": 0}
     try:
@@ -4564,6 +4951,185 @@ def redact_result_payload(result: "RedactResult") -> dict:
     return {**asdict(result), "summary": redaction_summary(result)}
 
 
+def _names_drawn(page, resources, xobjects) -> set:
+    """The /XObject names *page* draws with Do from its own *resources*: in
+    its content, and in what draws with those same resources — a form it
+    draws that has no /Resources of its own (it takes the page's), and the
+    glyphs of a Type 3 font in them with none either. Raises when any of
+    that content cannot be parsed."""
+    names: set = set()
+    seen: set = set()
+
+    def walk(holder, depth: int) -> None:
+        for ins in pikepdf.parse_content_stream(holder):
+            if operator_of(ins) != "Do" or not ins.operands:
+                continue
+            name = str(ins.operands[0])
+            names.add(name)
+            form = xobjects.get(name)
+            if isinstance(form, pikepdf.Stream) and form.get("/Subtype") == "/Form" \
+                    and "/Resources" not in form and form.objgen not in seen and depth < 16:
+                seen.add(form.objgen)
+                walk(form, depth + 1)
+
+    walk(page, 0)
+    fonts = resources.get("/Font")
+    for font in (fonts.values() if isinstance(fonts, pikepdf.Dictionary) else []):
+        if isinstance(font, pikepdf.Dictionary) and font.get("/Subtype") == "/Type3" \
+                and "/Resources" not in font:
+            procs = font.get("/CharProcs")
+            for proc in (procs.values() if isinstance(procs, pikepdf.Dictionary) else []):
+                if isinstance(proc, pikepdf.Stream):
+                    walk(proc, 1)
+    return names
+
+
+def _drop_undrawn_xobjects(pdf, boxed: set) -> int:
+    """On every page of *pdf* (a pikepdf.Pdf) that is not in *boxed* (0-based
+    page numbers of the pages a box was put on), take off the page's
+    /XObject every name it does not draw (an operand of Do in the page's
+    content, or in a form or Type 3 glyph that draws with the page's own
+    resources: _names_drawn), and return how many pages changed (#150).
+
+    MuPDF gives a page it redacts a redacted copy of each picture and form
+    the page draws, and resources of its own. When pages share one
+    resources dictionary — one object, or the page tree's — every other
+    page still lists the original, and the original stays in the file with
+    what the box was put over in it. Saving with clean=True used to drop
+    what a page lists and does not draw on every page, and with it the
+    original; but it also ran MuPDF's content filter over every page, which
+    changes text it should leave alone (#150). This drops the listings, and
+    nothing else:
+
+    - a page's resources are replaced by a copy of its own (from the page
+      itself, or the page tree) with the names taken out; the dictionary
+      it shared, the page's content and every form are left as they are;
+    - a page whose content cannot be parsed is left as it is;
+    - a page-tree node's /Resources is dropped once no page below it takes
+      its resources from it;
+    - only XObjects: Do is the only way to draw one, so nothing the page
+      shows is lost. What a page draws is what it drew, byte for byte
+      (pdf_verify.page_digest).
+
+    A picture or form that is still only listed somewhere else (in a form's
+    resources, say) is the verifier's to refuse (redaction.left_behind)."""
+    changed = 0
+    for pno, page in enumerate(pdf.pages):
+        if pno in boxed:
+            continue
+        obj = page.obj
+        resources = _inherited(obj, "/Resources")
+        xobjects = resources.get("/XObject") if isinstance(resources, pikepdf.Dictionary) else None
+        if not isinstance(xobjects, pikepdf.Dictionary) or not len(xobjects.keys()):
+            continue
+        try:
+            drawn = _names_drawn(obj, resources, xobjects)
+        except Exception:
+            continue
+        listed = set(xobjects.keys())
+        if listed <= drawn:
+            continue
+        own = pikepdf.Dictionary({key: resources[key] for key in resources.keys()})
+        own["/XObject"] = pikepdf.Dictionary({key: xobjects[key] for key in sorted(listed & drawn)})
+        obj["/Resources"] = own
+        changed += 1
+
+    # A page takes its resources from the nearest node above it that has
+    # them; a node no page takes them from any more lets them go.
+    holders: dict = {}
+    used: set = set()
+
+    def visit(node, provider, depth: int) -> None:
+        kids = node.get("/Kids")
+        if node.get("/Type") == "/Page" or not isinstance(kids, pikepdf.Array) or depth > 64:
+            if "/Resources" not in node and provider is not None:
+                used.add(provider.objgen)
+            return
+        if "/Resources" in node:
+            holders[node.objgen] = node
+            provider = node
+        for kid in kids:
+            if isinstance(kid, pikepdf.Dictionary):
+                visit(kid, provider, depth + 1)
+
+    try:
+        visit(pdf.Root["/Pages"], None, 0)
+        for key, node in holders.items():
+            if key not in used:
+                del node["/Resources"]
+    except Exception:
+        pass
+    return changed
+
+
+def _pristine_copy(doc, input_path: str, password: str | None, folder: str) -> str | None:
+    """None when pikepdf opens *input_path*; otherwise the path of a copy of
+    *doc* (the input as MuPDF opened it, nothing changed yet) written into
+    *folder*, for redaction.left_behind to read with pikepdf (#150). MuPDF
+    mends files pikepdf cannot open ("unable to find /Root dictionary").
+    The copy keeps the file's encryption, so it opens with the file's
+    password and the unredacted file is never on disk without it, even if
+    the run stops short of deleting it. None too when the copy cannot be
+    written: the check then says it could not be checked."""
+    try:
+        pikepdf.open(input_path, password=password or "").close()
+        return None
+    except Exception:
+        pass
+    path = None
+    try:
+        fd, path = tempfile.mkstemp(suffix=".pdf", dir=folder)
+        os.close(fd)
+        # As the redaction is saved: an object nothing reaches is not read.
+        doc.save(path, garbage=4, encryption=fitz.PDF_ENCRYPT_KEEP)
+        return path
+    except Exception:
+        if path and os.path.exists(path):
+            try: os.unlink(path)
+            except Exception: pass
+        return None
+
+
+def _text_before(seen: dict, flattened: list, candidate: str, source: str,
+                 password: str | None) -> dict:
+    """redact_pdf's account of the pages as they were, for
+    redaction.text_outside (#150), by 0-based page number: the characters a
+    page drew before a box was put on it; the digest of a page no box
+    touched (pdf_verify.page_digest), and, should *candidate* not match it,
+    that page's characters too, read from *source* (the input, or the copy
+    of it MuPDF repaired). A page turned into a picture on request is left
+    out: it has changed everywhere, by request."""
+    pictures = {p - 1 for p in flattened}
+    entries = {pno: {"chars": chars} for pno, chars in seen["text_before"].items()
+               if pno not in pictures}
+    rest = {pno: digest for pno, digest in seen["digests"].items()
+            if pno not in seen["text_before"] and pno not in pictures}
+    changed = []
+    try:
+        with fitz.open(candidate) as out:
+            for pno, digest in rest.items():
+                try:
+                    same = digest is not None and page_digest(out, pno) == digest
+                except Exception:
+                    same = False
+                entries[pno] = {"digest": digest}
+                if not same:
+                    changed.append(pno)
+    except Exception:
+        changed = list(rest)
+        entries.update({pno: {"digest": digest} for pno, digest in rest.items()})
+    if changed:
+        try:
+            with fitz.open(source) as src:
+                if password and src.needs_pass:
+                    src.authenticate(password)
+                for pno in changed:
+                    entries[pno]["chars"] = drawn_characters(src, pno)
+        except Exception:
+            pass                       # the verifier says it could not compare them
+    return entries
+
+
 def _refusal_message(failed) -> str:
     """One-line reason for a refused redaction, from its failed checks."""
     if failed and all(c.id == "redaction.file_id" for c in failed):
@@ -4574,9 +5140,9 @@ def _refusal_message(failed) -> str:
         # different thing to tell the user (#119).
         return ("Redaction could not be verified: part of the output could "
                 "not be read, so it could not be checked.")
-    if failed and all(c.id == "redaction.ocr_outside" for c in failed):
+    if failed and all(c.id in DAMAGE_CHECKS for c in failed):
         # Damage, not a leak: the page would have changed outside the
-        # places OCR found (#128). As redaction_refusal_detail says it.
+        # places found (#128, #150). As redaction_refusal_detail says it.
         return DAMAGE_HEADLINE
     return ("Redaction could not be verified: sensitive content is still "
             "present in the output.")
@@ -4784,8 +5350,17 @@ def redact_pdf(
         total, drawn, touched = len(doc), 0, set()
         seen: dict = {"annotations": 0, "fields": 0, "links": 0, "no_text": [],
                       "mostly_picture": [], "text_layer": {}, "covered": set(),
-                      "still_shown": [], "ocr": {}, "ocr_found": 0, "search_boxes": {}}
+                      "still_shown": [], "ocr": {}, "ocr_found": 0, "search_boxes": {},
+                      "text_before": {}, "digests": {}}
         hand_boxes.clear()
+        # What every page draws with, before anything is changed: a page no
+        # box touches must come through as it was (redaction.text_outside,
+        # #150).
+        for pno in range(total):
+            try:
+                seen["digests"][pno] = page_digest(doc, pno)
+            except Exception:
+                seen["digests"][pno] = None
         for i, pno in enumerate(target):
             if cancel and cancel.is_set():
                 doc.close()
@@ -4830,6 +5405,13 @@ def redact_pdf(
                 if not rect.is_empty and rect.is_valid:
                     drawn_by_hand.append(rect)
             were_under = _under_keys(page, drawn_by_hand + ocr_boxes)
+            # The text the page draws before a box is put on it: outside the
+            # boxes it must show as it did (redaction.text_outside, #150).
+            if hits or drawn_by_hand or ocr_boxes:
+                try:
+                    seen["text_before"][pno] = drawn_characters(doc, pno)
+                except Exception:
+                    seen["text_before"][pno] = None
 
             # A term box takes only its own characters.
             added = found = _redact_term_boxes(page, hits, seen)
@@ -4921,15 +5503,26 @@ def redact_pdf(
     # ("repairing PDF document") — and what had been changed in memory is
     # gone, without a word. If that happens between here and the end of the
     # save below, the redaction is what is gone.
+    out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    # What the pages with a box drew is read from the input with pikepdf
+    # (redaction.left_behind, #150). A file pikepdf cannot open, which
+    # MuPDF mended as it opened it, is read from a copy MuPDF writes of it
+    # now, before anything is changed.
+    pristine = _pristine_copy(doc, input_path, password, out_dir)
     repaired_at_start = bool(doc.is_repaired)
-    hit_count, pages_touched, seen = redact_pages(doc)
+    try:
+        hit_count, pages_touched, seen = redact_pages(doc)
+    except BaseException:
+        if pristine:
+            try: os.unlink(pristine)
+            except Exception: pass
+        raise
 
     # The page-content redaction is done; now widen the scrub and write the
     # output atomically. Saved even when hit_count == 0 -- a term can live
     # only in a document-level surface (e.g. the /Title), which still counts
     # as something to remove (#99, §3).
-    out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
-    temps: list[str] = []
+    temps: list[str] = [pristine] if pristine else []
     surface_counts: dict[str, int] = {}
     flattened: list[int] = []
     flattened_areas: dict[int, int] = {}
@@ -4952,19 +5545,31 @@ def redact_pdf(
         # document-level surface is scrubbed via pikepdf on the saved temp.
         emb_gone = _scrub_embedded_file_names(doc, scrub_terms, case_sensitive)
         work = _mktmp()
-        doc.save(work, garbage=4, deflate=True, clean=True)
+        # Not clean=True: that runs MuPDF's content filter over every page
+        # of the file, redacted or not, and the filter changes text it
+        # should leave alone (#150, see _apply). A page no box touched is
+        # written as it was read.
+        doc.save(work, garbage=4, deflate=True)
         lost = bool(doc.is_repaired) and not repaired_at_start
         doc.close()
+        # Where the text of a page no box touched is read from, should the
+        # output not match its digest (_text_before).
+        source, source_password = input_path, password
+        # Where what the pages with a box drew is read from (drawn_before).
+        # The copy is encrypted as the input is: the same password opens it.
+        drawn_source, drawn_password = (pristine or input_path), password
         if lost:
             # Repaired on the way (see above): what was just written is the
             # source, mended, with nothing redacted. It is a sound file now,
             # so the same work done on it holds. Once: it cannot be repaired
             # twice.
+            source, source_password = work, None
+            drawn_source, drawn_password = work, None
             doc = fitz.open(work)
             hit_count, pages_touched, seen = redact_pages(doc)
             emb_gone = _scrub_embedded_file_names(doc, scrub_terms, case_sensitive)
             work = _mktmp()
-            doc.save(work, garbage=4, deflate=True, clean=True)
+            doc.save(work, garbage=4, deflate=True)
             doc.close()
         emb_hits = len(emb_gone)
         ocr_count = seen["ocr_found"]
@@ -5025,6 +5630,10 @@ def redact_pdf(
         # this pass the output stays linkable to the original.
         candidate = _mktmp()
         with pikepdf.open(final_src) as pdf:
+            # The originals of what the boxes redacted, still listed by
+            # pages that shared resources with a redacted one, go with the
+            # listing (#150).
+            _drop_undrawn_xobjects(pdf, set(seen["text_before"]))
             # The original of a form or an image the pages now have a
             # redacted copy of must not ride along on the structure tree.
             # Here, not in the scrub: a box drawn by hand leaves one too.
@@ -5063,6 +5672,17 @@ def redact_pdf(
         # are blanked there (#143).
         searched = [{"page": pno, "x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3]}
                     for pno, boxes in sorted(seen["search_boxes"].items()) for b in boxes]
+        # The pages as they were, for the check that the text outside the
+        # boxes shows as it did (#150); a page turned into a picture on
+        # request is left out.
+        text_before = _text_before(seen, flattened, candidate, source, source_password)
+        # What the pages with a box drew, for the check that none of it is
+        # left in the file undrawn (#150).
+        try:
+            with pikepdf.open(drawn_source, password=drawn_password or "") as src:
+                before_drawn = drawn_before(src, sorted(seen["text_before"]))
+        except Exception:
+            before_drawn = {"unread": True}
         report = verify_redaction(
             candidate,
             terms=scrub_terms or None,
@@ -5074,6 +5694,11 @@ def redact_pdf(
             ocr_pages=ocr_pages or None,
             tessdata=tessdata,
             search_boxes=searched or None,
+            text_before=text_before,
+            # The version that runs with the text_may_move note may move
+            # text along its line; that is said, and not refused.
+            text_along_line=any(n.get("kind") == "text_may_move" for n in library_notes),
+            drawn_before=before_drawn,
         )
         report.retarget(output_path)
         if not report.verified:

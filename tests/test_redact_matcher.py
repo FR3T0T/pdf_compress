@@ -347,7 +347,9 @@ class TestSearchForBesideTheMatcher:
         _res, out = _redact(tmp_path, src, "APPROVED")
         assert _words(out) == ["body", "text"]
         with pikepdf.open(out) as pdf:
-            assert b"APPROVED" not in pdf.pages[0].obj["/Contents"].read_bytes()
+            contents = pdf.pages[0].obj["/Contents"]
+            streams = [contents] if isinstance(contents, pikepdf.Stream) else list(contents)
+            assert streams and all(b"APPROVED" not in s.read_bytes() for s in streams)
 
     def test_two_hits_side_by_side_are_two_rectangles(self, tmp_path):
         """search_for gives one rectangle for both; the matcher finds each."""

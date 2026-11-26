@@ -639,6 +639,84 @@ class TestWhatCanBeDone:
                                  "turned 0 degrees (1 place)")]
         assert "still present" in pdf_ops._refusal_message(both)
 
+    @pytest.mark.parametrize("evidence, line", [
+        ("31 characters outside the boxes on page 3 stopped showing",
+         "Text on page 3 outside the black boxes would have stopped showing."),
+        ("1 character outside the boxes on page 3 started showing",
+         "Hidden text on page 3 outside the black boxes would have started showing."),
+        ("4 characters outside the boxes on page 3 moved or went missing",
+         "Text on page 3 outside the black boxes would have moved or gone."),
+    ])
+    def test_text_outside_the_boxes(self, evidence, line):
+        """Damage too (#150): the headline is the damage one, one line a
+        page, and nothing is offered, by the window or the one-line message."""
+        failed = [_failed("redaction.text_outside", evidence)]
+        d = _detail(*failed)
+        assert d == {"headline": pdf_verify.DAMAGE_HEADLINE, "found": [line],
+                     "nextStep": "The file was left as it was."}
+        assert pdf_ops._refusal_message(failed) == pdf_verify.DAMAGE_HEADLINE
+
+    def test_text_outside_the_boxes_one_line_a_page(self):
+        """A page that changed in more than one way is named once, by the
+        first of stopped showing, started showing, moved or gone; pages in
+        order. With the picture of a page changed too, it is still damage."""
+        failed = [_failed("redaction.text_outside",
+                          "2 characters outside the boxes on page 5 moved or went missing",
+                          "3 characters outside the boxes on page 5 started showing",
+                          "9 characters outside the boxes on page 2 moved or went missing",
+                          "1 character outside the boxes on page 2 stopped showing"),
+                  _failed("redaction.ocr_outside", "792 pixels changed outside the boxes on page 4")]
+        d = _detail(*failed)
+        assert d["headline"] == pdf_verify.DAMAGE_HEADLINE
+        assert d["found"] == [
+            "Text on page 2 outside the black boxes would have stopped showing.",
+            "Hidden text on page 5 outside the black boxes would have started showing.",
+            "The picture of page 4 would have changed outside the places that were blacked out."]
+        assert pdf_ops._refusal_message(failed) == pdf_verify.DAMAGE_HEADLINE
+
+    def test_text_outside_the_boxes_with_a_leak_is_a_leak(self):
+        failed = [_failed("redaction.text_outside",
+                          "2 characters outside the boxes on page 1 moved or went missing"),
+                  _failed("redaction.page_text",
+                           "term 'x' is still extractable from page text on page 1")]
+        assert _detail(*failed)["headline"].startswith("Redaction refused: some of what you")
+        assert "still present" in pdf_ops._refusal_message(failed)
+
+    @pytest.mark.parametrize("evidence, line", [
+        (["a picture drawn on page 1 before the redaction is still in the file, and nothing "
+          "draws it (document-level)"],
+         "A picture from page 1 is still in the file, though no page shows it any more. It could "
+         "be taken out of the file."),
+        (["a picture drawn on page 1 before the redaction is still in the file, and nothing "
+          "draws it (document-level)",
+          "a picture drawn on page 3 before the redaction is still in the file, and nothing "
+          "draws it (document-level)"],
+         "Pictures from pages 1 and 3 are still in the file, though no page shows them any more. "
+         "They could be taken out of the file."),
+        (["content drawn on page 2 before the redaction is still in the file, and nothing draws "
+          "it (document-level)"],
+         "Content from page 2 is still in the file, though no page shows it any more. It could "
+         "be taken out of the file."),
+    ])
+    def test_what_a_box_redacted_left_behind(self, evidence, line):
+        """A leak, and in the file, not on a page (#150): turning pages into
+        pictures is not offered."""
+        d = _detail(_failed("redaction.left_behind", *evidence))
+        assert d == {"headline": "Redaction refused: some of what you asked to remove is still "
+                                 "in the new file. Nothing was saved.",
+                     "found": [line],
+                     "nextStep": "It is not drawn on a page, so turning pages into pictures would "
+                                 "not remove it."}
+
+    def test_text_outside_the_boxes_that_could_not_be_compared(self):
+        failed = [_failed("redaction.text_outside", "the text on page 2, which no box touched, "
+                          "changed and could not be compared, so it could not be checked",
+                          unevaluated=True)]
+        d = _detail(*failed)
+        assert d["headline"] == ("Redaction refused: part of the new file could not be read, "
+                                 "so it could not be checked. Nothing was saved.")
+        assert d["found"] == ["Part of page 2 could not be read, so it could not be checked."]
+
     def test_no_promise_anywhere(self):
         """The old words promised a fix ("the scrubber should have removed
         it"). None of these do."""

@@ -900,6 +900,87 @@
   code with no remaining callers.
 
 ### Fixed
+- **Redaction no longer changes text outside the boxes (#150).** MuPDF's
+  content filter, which a redaction runs over the page it redacts, writes
+  the text state only inside a text object (MuPDF 1.27.2 and 1.28.6): a
+  state set outside one before a form is drawn was lost, and each form was
+  rewritten as if it started from the default state. And the file was
+  saved with `clean=True`, which ran that filter over every page, boxed or
+  not. So a visible footer drawn by a form after a searchable scan's hidden
+  text layer turned invisible, on every page of the file; text a page hid
+  as it drew a form started showing; a form with no font of its own lost its
+  text; a font set by a graphics state was lost, and the line drawn in
+  another font, moved; text shown outside a text object, and (on 1.27) text
+  after a TJ of spacing alone that follows a change of font, moved. Every
+  such run verified. On pdf.js's `issue12963.pdf`, pages 2 to 5 in a file of
+  their own, a word found on the first of them left the 49-letter footer
+  invisible on all four. Now:
+  - the file is saved without `clean=True`, and so is the copy that turns
+    pages into pictures: a page no box touches is written as it was read;
+  - around every `apply_redactions` (`pdf_ops._apply`), on the page being
+    redacted, the text state is followed through the content and made
+    explicit: after a graphics state that sets a font comes a `Tf` for that
+    font (under a new name, in the page's own copy of its resources), and a
+    form drawn while the state is not the default is drawn from a copy that
+    sets that state first; and in what MuPDF wrote, every form drawn while
+    the state is not the default is drawn as
+    `q 0 Tc 0 Tw 100 Tz 0 TL 0 Tr 0 Ts /Fm Do Q`. Forms inside forms the
+    same; no form or shared resources dictionary is changed where it is;
+  - a new check, `redaction.text_outside`, "Text outside the boxes shows as
+    it did", on every run: on each page with a box, every character outside
+    the boxes (grown 1 pt), on the visible page and not part of an
+    annotation or form field, must still be there, the same character within
+    half a point of where it was, shown or hidden as before; every other
+    page must have the same content and forms, byte for byte after
+    decompression, or failing that the same characters. A failure is damage,
+    not a leak: the damage headline, one line a page ("Text on page 3
+    outside the black boxes would have stopped showing.", "Hidden text on
+    page 3 … would have started showing.", "… would have moved or gone."),
+    no pages offered as pictures. `verify_redaction(text_before=...)`,
+    filled by `redact_pdf`; `pdf_verify.DAMAGE_CHECKS`. On PyMuPDF 2.x
+    only, which runs with the note that text after a removed word can
+    shift along its line, a letter on the line of one the run removed that
+    moved only along that line is not counted (`text_along_line`); one
+    shown, hidden, gone or moved off its line still is;
+  - every page without a box loses from its /XObject each name its own
+    content does not draw (`pdf_ops._drop_undrawn_xobjects`), in a copy of
+    its own: no shared dictionary, page content or form is changed, and a
+    page-tree node's /Resources goes once no page takes it. MuPDF gives a
+    page it redacts a redacted copy of each picture and form; where pages
+    share one resources dictionary (TCPDF and OpenOffice write them so),
+    the other pages still listed the original, which stayed in the file
+    with what the box covered: a box over a picture on page 1 left the
+    whole picture in the file through page 2's list, and the run verified
+    (saving with `clean=True` used to drop it). A word in a form that pages
+    share, or that a page only lists, goes the same way, and those runs
+    save again;
+  - a new check, `redaction.left_behind`, "Nothing a box redacted is left in
+    the file undrawn": no picture or form a page with a box drew (its data
+    as pikepdf reads it, so one stored again compressed another way is
+    still known) may be in the output with nothing drawing it, through
+    pages, forms, patterns, soft masks, Type 3 fonts or annotations'
+    appearances. A leak, document-level, so no pages are offered as
+    pictures: "A picture from page 1 is still in the file, though no page
+    shows it any more. It could be taken out of the file."
+    `verify_redaction(drawn_before=...)`, `pdf_verify.drawn_before`.
+  Text outside a text object and the spacing-only TJ are not put back: those
+  runs are refused. Of pdf.js's test files and pypdf's sample files (1,139),
+  with a box that covers nothing on each of the first ten pages, main saved
+  8 whose text outside the box changed; now 4 come through as they were
+  (freeculture, extgstate and two copies of GeoTopo), and the other 4
+  (bug946506 and the three with text outside a text object) are refused.
+  Three kinds of run that were saved are now refused (see the README's
+  known limits): one with the word in a comment in the code of a page with
+  no box; one whose pages are compressed with Brotli, which the whole-file
+  search cannot read (saving with `clean=True` used to rewrite such pages);
+  and one where a form, not a page, still lists the original of what a box
+  redacted (pdf.js's file_pdfjs_form, whose forms share TCPDF's resources).
+  The check costs time on each page with a box, about 10 ms: a run with a
+  box on every page of a long file took up to two and a half times as long
+  (10 seconds against 3.8 on a 352-page book), a search that found the word
+  on 30 of its pages 5.2 against 4.1.
+  Samples 28 to 33 in `tests/manual/make_redact_samples.py`. Tests:
+  `tests/test_redact_text_outside.py`, `tests/test_redact_left_behind.py`.
 - **Redaction: a word the picture shows past the search's box is blacked
   out too (#143).** A search's box blanks the pixels of a picture under it,
   and always did: in every kind of picture tried (PNG, JPEG in colour, grey
